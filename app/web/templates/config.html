@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}配置 · MediaPush{% endblock %}
+{% block content %}
+<h1>配置管理</h1>
+{% for m in messages %}<div class="msg ok">{{ m }}</div>{% endfor %}
+<form method="post" action="/config">
+  {% for group, fields in groups.items() %}
+  <h2>{{ group }}</h2>
+  <div class="card">
+    {% for f in fields %}
+    <div class="row">
+      <label for="{{ f.key }}">{{ f.label }}</label>
+      {% if f.type == 'textarea' %}
+        <textarea id="{{ f.key }}" name="{{ f.key }}">{{ f.value }}</textarea>
+      {% elif f.type == 'select' %}
+        <select id="{{ f.key }}" name="{{ f.key }}">
+          {% for opt in f.options %}
+          <option value="{{ opt }}" {% if opt == f.value %}selected{% endif %}>{{ opt }}</option>
+          {% endfor %}
+        </select>
+      {% elif f.type == 'checkbox' %}
+        <input type="checkbox" id="{{ f.key }}" name="{{ f.key }}" value="on" {% if f.value == 'true' %}checked{% endif %}>
+      {% elif f.type == 'password' %}
+        <input type="password" id="{{ f.key }}" name="{{ f.key }}" placeholder="{% if f.configured %}已配置（留空不修改）{% else %}未配置{% endif %}" autocomplete="new-password">
+      {% elif f.type == 'number' %}
+        <input type="number" id="{{ f.key }}" name="{{ f.key }}" value="{{ f.value }}">
+      {% else %}
+        <input type="text" id="{{ f.key }}" name="{{ f.key }}" value="{{ f.value }}">
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  {% endfor %}
+  <button type="submit">保存</button>
+</form>
+{% endblock %}

@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}仪表盘 · MediaPush{% endblock %}
+{% block content %}
+<h1>仪表盘</h1>
+<div class="grid">
+  <div class="stat"><div class="num">{{ new_today }}</div><div class="lbl">今日新增分享</div></div>
+  <div class="stat"><div class="num">{{ pushed_today }}</div><div class="lbl">今日推送</div></div>
+  <div class="stat"><div class="num">{{ status.unpushed }}</div><div class="lbl">待推送</div></div>
+  <div class="stat">
+    <div class="num">
+      <span class="pill {{ 'ok' if status.bot_running else 'err' }}">{{ '在线' if status.bot_running else '离线' }}</span>
+    </div>
+    <div class="lbl">Telegram Bot</div>
+  </div>
+</div>
+
+<h2>运行状态</h2>
+<div class="card">
+  <table>
+    <tr><td>流水线状态</td><td>
+      <span class="pill {{ 'warn' if status.pipeline_running else 'muted' }}">{{ '运行中' if status.pipeline_running else '空闲' }}</span>
+    </td></tr>
+    <tr><td>上次调度执行</td><td class="mono">{{ last_run or '—' }}</td></tr>
+    <tr><td>调度间隔</td><td class="mono">{{ status.config_health.schedule_interval }} 分钟</td></tr>
+  </table>
+</div>
+
+<h2>配置健康</h2>
+<div class="card">
+  <table>
+    <tr><td>TG Bot Token</td><td>{% if status.config_health.tg_token %}<span class="pill ok">已配置</span>{% else %}<span class="pill err">未配置</span>{% endif %}</td></tr>
+    <tr><td>115 Cookie</td><td>{% if status.config_health.pan115_cookie %}<span class="pill ok">已配置</span>{% else %}<span class="pill err">未配置</span>{% endif %}</td></tr>
+    <tr><td>TMDB Key</td><td>{% if status.config_health.tmdb_key %}<span class="pill ok">已配置</span>{% else %}<span class="pill err">未配置</span>{% endif %}</td></tr>
+    <tr><td>代理</td><td>{% if status.config_health.proxy %}<span class="pill ok">已启用</span>{% else %}<span class="pill warn">未启用</span>{% endif %}</td></tr>
+  </table>
+</div>
+
+<h2>最近任务</h2>
+<div class="card">
+  {% if recent_tasks %}
+  <table>
+    <tr><th>ID</th><th>类型</th><th>状态</th><th>触发</th><th>新增</th><th>推送</th><th>开始</th></tr>
+    {% for t in recent_tasks %}
+    <tr>
+      <td>{{ t.id }}</td>
+      <td>{{ t.task_type }}</td>
+      <td><span class="pill {% if t.status == 'success' %}ok{% elif t.status == 'failed' %}err{% elif t.status == 'cancelled' %}warn{% else %}muted{% endif %}">{{ t.status }}</span></td>
+      <td>{{ t.trigger }}</td>
+      <td>{{ t.shares_new }}</td>
+      <td>{{ t.shares_pushed }}</td>
+      <td class="mono">{{ t.started_at }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">暂无任务记录</p>{% endif %}
+</div>
+{% endblock %}

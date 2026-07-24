@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}日志 · MediaPush{% endblock %}
+{% block content %}
+<h1>日志</h1>
+<form class="actions" method="get" action="/logs">
+  <select name="level">
+    {% for lv in levels %}
+    <option value="{{ lv }}" {% if lv == level %}selected{% endif %}>{{ lv or '全部级别' }}</option>
+    {% endfor %}
+  </select>
+  <input type="text" name="q" value="{{ q }}" placeholder="关键词">
+  <button type="submit">过滤</button>
+</form>
+<div class="card">
+  {% if lines %}
+  <pre class="log">{% for ln in lines %}{{ ln }}
+{% endfor %}</pre>
+  {% else %}<p class="muted">无匹配日志</p>{% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,39 @@
+# MediaPush systemd unit 模板。
+# 由 deploy/install.sh 渲染占位符（__INSTALL_DIR__ / __USER__）后安装到
+# /etc/systemd/system/mediapush.service。请勿直接 cp 此文件使用。
+[Unit]
+Description=MediaPush (115 share -> TMDB -> Telegram push)
+Documentation=https://github.com/mediapush/mediapush
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+WorkingDirectory=__INSTALL_DIR__
+UMask=0027
+
+# 最小启动集（非敏感）；业务配置全在 Web 后台管理
+Environment=DATABASE_URL=sqlite+aiosqlite:////__INSTALL_DIR__/data/mediapush.db
+Environment=WEB_HOST=0.0.0.0
+Environment=WEB_PORT=8088
+Environment=LOG_FILE=__INSTALL_DIR__/data/mediapush.log
+
+ExecStart=__INSTALL_DIR__/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8088
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGINT
+SendSIGKILL=no
+
+# 加固：仅允许写安装目录
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=__INSTALL_DIR__
+
+[Install]
+WantedBy=multi-user.target

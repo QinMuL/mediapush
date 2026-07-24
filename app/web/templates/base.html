@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}MediaPush{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
+</head>
+<body>
+{% if request.cookies.get('mediapush_session') %}
+<nav class="navbar">
+  <a class="brand" href="/dashboard">MediaPush</a>
+  <a href="/dashboard">仪表盘</a>
+  <a href="/config">配置</a>
+  <a href="/tasks">任务</a>
+  <a href="/shares">分享</a>
+  <a href="/tmdb_cache">TMDB 缓存</a>
+  <a href="/logs">日志</a>
+  <form class="logout" method="post" action="/logout">
+    <button type="submit">退出</button>
+  </form>
+</nav>
+{% endif %}
+<main class="container">
+  {% block content %}{% endblock %}
+</main>
+</body>
+</html>

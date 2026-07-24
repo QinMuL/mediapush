@@ -1,0 +1,17 @@
+services:
+  mediapush:
+    build: .
+    container_name: mediapush
+    restart: unless-stopped
+    ports:
+      - "8088:8088"
+    environment:
+      # 仅最小启动集（非敏感，可入库）；其余业务配置全在 Web 后台管理
+      - DATABASE_URL=sqlite+aiosqlite:////app/data/mediapush.db
+      - WEB_HOST=0.0.0.0
+      - WEB_PORT=8088
+    volumes:
+      - ./data:/app/data
+    extra_hosts:
+      # 让容器内可通过 host.docker.internal 访问宿主机代理
+      - "host.docker.internal:host-gateway"

@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}TMDB 缓存 · MediaPush{% endblock %}
+{% block content %}
+<h1>TMDB 缓存 <span class="muted">（共 {{ total }} 条）</span></h1>
+<div class="card">
+  {% if caches %}
+  <table>
+    <tr><th>TMDB ID</th><th>类型</th><th>连载中</th><th>缓存时间</th><th>过期时间</th><th>操作</th></tr>
+    {% for c in caches %}
+    <tr>
+      <td class="mono">{{ c.tmdb_id }}</td>
+      <td>{{ c.media_type }}</td>
+      <td>{% if c.ongoing %}<span class="pill ok">是</span>{% else %}<span class="pill muted">否</span>{% endif %}</td>
+      <td class="mono">{{ c.cached_at }}</td>
+      <td class="mono">{{ c.expires_at }}</td>
+      <td>
+        <form method="post" action="/tmdb_cache/{{ c.tmdb_id }}/refresh" style="display:inline">
+          <button type="submit" class="secondary">刷新</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% if pages > 1 %}
+  <div class="pager">
+    {% for p in range(1, pages + 1) %}
+    <a class="{% if p == page %}cur{% endif %}" href="/tmdb_cache?page={{ p }}">{{ p }}</a>
+    {% endfor %}
+  </div>
+  {% endif %}
+  {% else %}<p class="muted">无缓存记录</p>{% endif %}
+</div>
+{% endblock %}
