@@ -162,3 +162,22 @@ ruff check .
 - **115 读取失败**：访问码错误（确认链接带 `?password=`）；分享已失效；或匿名接口被限流（稍后重试）。注意读取分享**不需要 cookie**，cookie 仅 `/status` 健康检查用。
 - **TMDB 匹配不到**：文件名太乱时，可手动 `/115` 带更规范的链接；或检查 `TMDB_LANGUAGE`。
 - **频道收不到**：确认 Bot 已是频道管理员且有发送权限；确认 `TG_CHAT_ID` 正确。
+
+---
+
+## 八、CI/CD（自动版本迭代 + 镜像发布）
+
+推送到 `main` 即自动发布，无需本地构建镜像：
+
+- **自动打 tag**：读取最新 `vX.Y.Z` git tag，patch+1（首次 `v0.1.0`）
+- **自动镜像构建**：构建并推送 GHCR，标签 `vX.Y.Z` / `X.Y.Z` / `latest`
+- **镜像地址**：`ghcr.io/qinmul/mediapush:latest`
+- **升 minor/major**：Actions → Release → Run workflow，选 `minor`/`major`
+- **版本溯源**：git tag 为唯一来源，无 VERSION 文件，GITHUB_TOKEN 推 tag 不触发本工作流（无循环）
+
+任意机器直接拉取使用：
+
+```bash
+docker pull ghcr.io/qinmul/mediapush:latest
+```
+
