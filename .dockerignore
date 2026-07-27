@@ -1,0 +1,15 @@
+.env
+data/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.trae/
+.idea/
+.vscode/
+.git/
+tests/
+*.md
+!README.md
