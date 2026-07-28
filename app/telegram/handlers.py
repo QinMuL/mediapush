@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -240,6 +240,35 @@ async def _process_batch(update: Update, context, shares) -> None:
     if fail_count:
         header += f"，⚠️ 失败 {fail_count}"
     await _edit(placeholder, _build_batch_summary(header, lines))
+
+
+# ---------------------------------------------------------------------- #
+# 快捷菜单命令（启动时通过 setMyCommands 注册，覆盖旧项目残留）
+# 顺序即菜单显示顺序；描述简短，Telegram 会作为 "/" 命令提示展示
+_BOT_COMMANDS: list[BotCommand] = [
+    BotCommand("start", "开始使用"),
+    BotCommand("help", "用法说明"),
+    BotCommand("115", "推送 115/ed2k 链接"),
+    BotCommand("status", "查看配置与健康"),
+    BotCommand("refresh", "清除 TMDB 缓存"),
+]
+
+
+async def setup_commands(application: Application) -> None:
+    """启动时注册快捷菜单命令（post_init 钩子）。
+
+    先 delete_my_commands 清除上个项目残留的菜单，再 set_my_commands 设置新菜单。
+    默认 scope（对所有用户生效）。失败不阻断启动。
+    """
+    try:
+        await application.bot.delete_my_commands()
+        await application.bot.set_my_commands(_BOT_COMMANDS)
+        logger.info(
+            "已注册 Bot 命令菜单：%s",
+            ", ".join(c.command for c in _BOT_COMMANDS),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("注册命令菜单失败：%s", exc)
 
 
 # ---------------------------------------------------------------------- #

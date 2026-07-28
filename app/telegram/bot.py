@@ -36,16 +36,21 @@ class TelegramService:
     def build(self) -> None:
         from telegram.ext import ApplicationBuilder
 
-        builder = ApplicationBuilder().token(self.settings.tg_bot_token).concurrent_updates(True)
+        from app.telegram.handlers import register, setup_commands
+        from app.telegram.pusher import Pusher
+
+        builder = (
+            ApplicationBuilder()
+            .token(self.settings.tg_bot_token)
+            .concurrent_updates(True)
+            .post_init(setup_commands)  # 启动时清除旧菜单并注册新命令
+        )
         if self.settings.proxy_url:
             builder = builder.proxy(self.settings.proxy_url).get_updates_proxy(
                 self.settings.proxy_url
             )
         app = builder.build()
         app.bot_data["container"] = self.container
-
-        from app.telegram.handlers import register
-        from app.telegram.pusher import Pusher
 
         register(app)
         self._pusher = Pusher(app.bot, self.settings.tg_chat_id)
