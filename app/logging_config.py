@@ -15,10 +15,16 @@ from __future__ import annotations
 import logging
 import sys
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 # 日志时间戳固定用中国时区（容器 TZ 与本机无关，保证可读）
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+# 本地文件轮转：单文件 10MB，保留 5 份（共 ≤50MB）
+_FILE_MAX_BYTES = 10 * 1024 * 1024
+_FILE_BACKUP_COUNT = 5
 
 # ANSI 颜色
 _RESET = "\x1b[0m"
@@ -70,24 +76,53 @@ class _ConsoleFormatter(logging.Formatter):
         return f"{ts} {tag} [{short}] {msg}"
 
 
-def setup_logging(level: str = "INFO", *, use_color: bool | None = None) -> None:
+def setup_logging(
+    level: str = "INFO",
+    *,
+    use_color: bool | None = None,
+    log_file: str | None = None,
+) -> None:
     """配置根日志。
 
     Args:
         level: 日志级别字符串（DEBUG/INFO/WARNING/...），来自 LOG_LEVEL。
-        use_color: 是否启用 ANSI 彩色。None=按 stderr 是否 tty 自动判断。
+        use_color: 是否启用 ANSI 彩色（stdout）。None=按 stderr 是否 tty 自动判断。
+        log_file: 本地日志文件路径，启用文件持久化 + 按大小轮转。
+                  传 None 或空串则只输出 stdout。来自 LOG_FILE。
     """
     root = logging.getLogger()
     # 清理已有 handler，避免容器重启/重复调用时叠加
     for h in list(root.handlers):
         root.removeHandler(h)
+        try:
+            h.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     if use_color is None:
         use_color = sys.stderr.isatty()
 
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(_ConsoleFormatter(use_color=use_color))
-    root.addHandler(handler)
+    # 1) stdout handler（彩色，Docker 走 json-file 驱动捕获）
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(_ConsoleFormatter(use_color=use_color))
+    root.addHandler(sh)
+
+    # 2) 本地文件 handler（纯文本无颜色，按大小轮转，持久化到挂载卷）
+    if log_file:
+        try:
+            Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+            fh = RotatingFileHandler(
+                log_file,
+                maxBytes=_FILE_MAX_BYTES,
+                backupCount=_FILE_BACKUP_COUNT,
+                encoding="utf-8",
+            )
+            fh.setFormatter(_ConsoleFormatter(use_color=False))
+            root.addHandler(fh)
+        except Exception as exc:  # noqa: BLE001 - 文件不可写不阻断启动
+            # 退化：只 stdout，不写文件
+            logging.getLogger(__name__).warning("本地日志文件不可写 %s：%s", log_file, exc)
+
     root.setLevel(level.upper())
 
     for name, lvl in _NOISY_LOGGERS.items():

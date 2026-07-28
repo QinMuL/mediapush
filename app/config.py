@@ -42,6 +42,7 @@ class Settings:
     proxy_url: str = ""
     log_level: str = "INFO"
     log_color: bool = True
+    log_file: str = "./data/logs/mediapush.log"
     db_path: str = "./data/cache.db"
 
     @classmethod
@@ -65,6 +66,7 @@ class Settings:
             proxy_url=os.getenv("PROXY_URL", "").strip(),
             log_level=(os.getenv("LOG_LEVEL", "INFO").strip() or "INFO").upper(),
             log_color=_env_bool("LOG_COLOR", True),
+            log_file=os.getenv("LOG_FILE", "./data/logs/mediapush.log").strip(),
             db_path=os.getenv("DB_PATH", "./data/cache.db").strip() or "./data/cache.db",
         )
         settings._ensure_dirs()
@@ -72,6 +74,8 @@ class Settings:
 
     def _ensure_dirs(self) -> None:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        if self.log_file:
+            Path(self.log_file).parent.mkdir(parents=True, exist_ok=True)
 
     def validate(self) -> list[str]:
         """返回告警列表（不抛错，缺失项由 Container 决定是否阻塞启动）。"""

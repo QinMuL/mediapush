@@ -69,3 +69,26 @@ def test_formatter_uses_china_timezone():
     ts_str = " ".join(out.split(" ")[:2])  # "2026-07-28 13:06:15"
     expected = datetime.fromtimestamp(rec.created, tz=_SHANGHAI).strftime("%Y-%m-%d %H:%M:%S")
     assert ts_str == expected
+
+
+def test_setup_logging_writes_local_file(tmp_path):
+    """log_file 启用后，日志写入本地文件，纯文本无 ANSI 颜色。"""
+    log_file = tmp_path / "logs" / "app.log"
+    setup_logging("INFO", use_color=False, log_file=str(log_file))
+    logging.getLogger("test.file").info("hello-local-file")
+    # flush 所有 handler
+    for h in logging.getLogger().handlers:
+        h.flush()
+    assert log_file.exists()
+    content = log_file.read_text(encoding="utf-8")
+    assert "hello-local-file" in content
+    assert "\x1b[" not in content  # 文件不含 ANSI 颜色码
+    # 恢复
+    setup_logging("INFO", use_color=False)
+
+
+def test_setup_logging_no_file_when_disabled(tmp_path):
+    """log_file=None 时只 stdout，不创建文件。"""
+    setup_logging("INFO", use_color=False, log_file=None)
+    assert len(logging.getLogger().handlers) == 1  # 仅 stdout
+

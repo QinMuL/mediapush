@@ -12,8 +12,12 @@ from app.logging_config import setup_logging
 
 def main() -> None:
     settings = Settings.load()
-    # 集中式日志配置：彩色控制台 + 缩短模块名 + 噪声库降级（见 app/logging_config.py）
-    setup_logging(settings.log_level, use_color=settings.log_color)
+    # 集中式日志配置：彩色控制台 + 缩短模块名 + 噪声库降级 + 本地文件轮转（见 app/logging_config.py）
+    setup_logging(
+        settings.log_level,
+        use_color=settings.log_color,
+        log_file=settings.log_file,
+    )
 
     logger = logging.getLogger("app")
     logger.info("配置加载完成，DB=%s", settings.db_path)
