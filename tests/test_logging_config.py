@@ -1,8 +1,12 @@
 """日志配置测试。"""
 
 import logging
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from app.logging_config import _ConsoleFormatter, setup_logging
+
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 def _make_record(name: str, level: int, msg: str) -> logging.LogRecord:
@@ -55,3 +59,13 @@ def test_setup_logging_replaces_handlers():
     setup_logging("INFO", use_color=False)
     n2 = len(logging.getLogger().handlers)
     assert n1 == n2 == 1
+
+
+def test_formatter_uses_china_timezone():
+    """时间戳为中国时区（Asia/Shanghai），与容器 TZ 无关。"""
+    fmt = _ConsoleFormatter(use_color=False)
+    rec = _make_record("app", logging.INFO, "x")
+    out = fmt.format(rec)
+    ts_str = " ".join(out.split(" ")[:2])  # "2026-07-28 13:06:15"
+    expected = datetime.fromtimestamp(rec.created, tz=_SHANGHAI).strftime("%Y-%m-%d %H:%M:%S")
+    assert ts_str == expected

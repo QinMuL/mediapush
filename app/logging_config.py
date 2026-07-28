@@ -14,6 +14,11 @@ from __future__ import annotations
 
 import logging
 import sys
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+# 日志时间戳固定用中国时区（容器 TZ 与本机无关，保证可读）
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 # ANSI 颜色
 _RESET = "\x1b[0m"
@@ -59,7 +64,9 @@ class _ConsoleFormatter(logging.Formatter):
         msg = record.getMessage()
         if record.exc_info:
             msg = msg + "\n" + self.formatException(record.exc_info)
-        ts = self.formatTime(record, "%Y-%m-%d %H:%M:%S")
+        ts = datetime.fromtimestamp(record.created, tz=_SHANGHAI).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
         return f"{ts} {tag} [{short}] {msg}"
 
 

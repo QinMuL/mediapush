@@ -6,7 +6,15 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      TZ: Asia/Shanghai   # 容器时区，日志/时间相关一致用中国时区
     # host 网络：代理只监听 127.0.0.1，host 模式让容器直连宿主机 loopback
     network_mode: host
+    # Docker 日志轮转：stdout 走 json-file 驱动，限制单文件 10MB、保留 3 份（共 ≤30MB）
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       - ./data:/app/data
