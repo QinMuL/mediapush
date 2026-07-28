@@ -41,6 +41,7 @@ class Settings:
     pan115_use_proxy: bool = False
     proxy_url: str = ""
     log_level: str = "INFO"
+    log_color: bool = True
     db_path: str = "./data/cache.db"
 
     @classmethod
@@ -63,6 +64,7 @@ class Settings:
             pan115_use_proxy=_env_bool("PAN115_USE_PROXY", False),
             proxy_url=os.getenv("PROXY_URL", "").strip(),
             log_level=(os.getenv("LOG_LEVEL", "INFO").strip() or "INFO").upper(),
+            log_color=_env_bool("LOG_COLOR", True),
             db_path=os.getenv("DB_PATH", "./data/cache.db").strip() or "./data/cache.db",
         )
         settings._ensure_dirs()

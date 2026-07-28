@@ -7,17 +7,13 @@ import signal
 
 from app.config import Settings
 from app.core.container import Container
+from app.logging_config import setup_logging
 
 
 def main() -> None:
     settings = Settings.load()
-    logging.basicConfig(
-        level=settings.log_level,
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    )
-    # 静默 PTB 过于啰嗦的日志
-    logging.getLogger("telegram").setLevel(logging.WARNING)
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    # 集中式日志配置：彩色控制台 + 缩短模块名 + 噪声库降级（见 app/logging_config.py）
+    setup_logging(settings.log_level, use_color=settings.log_color)
 
     logger = logging.getLogger("app")
     logger.info("配置加载完成，DB=%s", settings.db_path)

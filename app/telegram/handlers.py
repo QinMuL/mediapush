@@ -96,6 +96,7 @@ async def cmd_115(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not parsed:
         await update.message.reply_text("❌ 无法识别链接，请发送 115 分享链接、8+ 位裸码或 ed2k 链接。")
         return
+    logger.info("收到 /115 命令：%s", parsed.provider)
     await _process(update, context, parsed)
 
 
@@ -124,8 +125,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not shares:
         return
     if len(shares) == 1:
+        logger.info("收到链接：%s", shares[0].provider)
         await _process(update, context, shares[0])
     else:
+        logger.info("收到 %d 个链接，开始批处理", len(shares))
         await _process_batch(update, context, shares)
 
 

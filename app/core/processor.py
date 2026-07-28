@@ -50,7 +50,7 @@ class ShareProcessor:
 
         # 2. 读取分享内容（ed2k 为纯字符串解析，115 为联网读取）
         files = await provider.list_share(parsed.code, parsed.password)
-        logger.info("分享 %s 读取到 %d 个条目", parsed.code, len(files))
+        logger.info("读取分享：%d 个条目（%s）", len(files), parsed.provider)
 
         # 3. 文件名聚合
         media = analyze_share(files)
@@ -74,6 +74,10 @@ class ShareProcessor:
 
         # 5. 详情
         details = await self.tmdb.get_details(tmdb_id, mtype)
+        logger.info(
+            "TMDB 命中：%s（id=%s，%s）",
+            details.get("title") or media.title, tmdb_id, mtype,
+        )
 
         # 6. 推送
         pusher = self.container.pusher
@@ -84,6 +88,11 @@ class ShareProcessor:
         ok, msg = await pusher.push_share(
             details, media, parsed.code, parsed.password, files, provider=parsed.provider
         )
+        title = details.get("title") or media.title
+        if ok:
+            logger.info("推送频道成功：%s", title)
+        else:
+            logger.warning("推送频道失败：%s — %s", title, msg)
 
         # 7. 标记已推送
         if ok:
