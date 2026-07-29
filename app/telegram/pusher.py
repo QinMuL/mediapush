@@ -605,7 +605,7 @@ class Pusher:
         from app.tmdb.client import TMDBHelper
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-        poster_url = TMDBHelper.poster_url(details.get("poster_path"))
+        image_url = TMDBHelper.image_url(details)
         tmdb_url = _tmdb_url(details)
         reply_markup = None
         if tmdb_url:
@@ -613,7 +613,7 @@ class Pusher:
                 [[InlineKeyboardButton("📚 TMDB 详情", url=tmdb_url)]]
             )
 
-        if poster_url:
+        if image_url:
             caption = render_caption(
                 details, media, code, password, files, provider,
                 quality_extra=quality_extra, is_premium=is_premium,
@@ -621,7 +621,7 @@ class Pusher:
             try:
                 await self.bot.send_photo(
                     chat_id=self.chat_id,
-                    photo=poster_url,
+                    photo=image_url,
                     caption=caption,
                     parse_mode="HTML",
                     reply_markup=reply_markup,

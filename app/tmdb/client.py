@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 _API_BASE = "https://api.themoviedb.org/3"
 _IMG_BASE = "https://image.tmdb.org/t/p/w500"
+# 横屏剧照（backdrop，16:9）：w780 清晰度与体积平衡，适合 TG 卡片
+_BACKDROP_BASE = "https://image.tmdb.org/t/p/w780"
 _TTL_ONGOING = 3
 _TTL_FINISHED = 30
 
@@ -222,6 +224,21 @@ class TMDBHelper:
         if not poster_path:
             return None
         return f"{_IMG_BASE}{poster_path}"
+
+    @staticmethod
+    def backdrop_url(backdrop_path: str | None) -> str | None:
+        """横屏剧照（16:9），无 backdrop 返回 None（由调用方回退 poster）。"""
+        if not backdrop_path:
+            return None
+        return f"{_BACKDROP_BASE}{backdrop_path}"
+
+    @staticmethod
+    def image_url(details: dict) -> str | None:
+        """卡片配图：优先横屏 backdrop，回退竖屏 poster，再无则 None。"""
+        return (
+            TMDBHelper.backdrop_url(details.get("backdrop_path"))
+            or TMDBHelper.poster_url(details.get("poster_path"))
+        )
 
     async def close(self) -> None:
         await self._aclose_client()

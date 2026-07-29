@@ -386,25 +386,25 @@ async def _send_preview(
     provider = session.provider
     keyboard = _edit_keyboard(session)
 
-    poster_url = TMDBHelper.poster_url(details.get("poster_path"))
-    if poster_url:
+    image_url = TMDBHelper.image_url(details)
+    if image_url:
         caption = render_caption(
             details, media, code, password, files, provider,
             quality_extra=session.quality_extra, is_premium=session.is_premium,
         )
         try:
             msg = await update.message.reply_photo(
-                photo=poster_url,
+                photo=image_url,
                 caption=caption,
                 parse_mode="HTML",
                 reply_markup=keyboard,
             )
             session.preview_is_photo = True
-        except Exception as exc:  # noqa: BLE001 - 海报发送失败回退文本
+        except Exception as exc:  # noqa: BLE001 - 配图发送失败回退文本
             logger.warning("预览 reply_photo 失败，回退文本：%s", exc)
-            poster_url = None
+            image_url = None
 
-    if not poster_url:
+    if not image_url:
         text = render_text(
             details, media, code, password, files, provider,
             quality_extra=session.quality_extra, is_premium=session.is_premium,
