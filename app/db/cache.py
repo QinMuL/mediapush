@@ -1,8 +1,9 @@
 """SQLite 轻量缓存：TMDB 元数据缓存 + 已推送分享去重。
 
 承接前序经验：
-- ongoing 剧集缓存 3 天，已完结 30 天
+- TMDB 缓存统一 24 小时（ttl_days=1），不区分连载/完结
 - upsert 时刷新 fetched_at（前序 bug：缓存时间戳不刷新导致不过期）
+- get_tmdb 读到过期行时物理删除（自动清除，非惰性残留）
 """
 
 from __future__ import annotations
@@ -63,7 +64,12 @@ class Cache:
             return None
         payload, fetched_at, ttl_days = row
         if (time.time() - fetched_at) > ttl_days * 86400:
-            return None  # 过期
+            # 过期：物理删除该行（自动清除），下次访问重拉
+            await self._execute(
+                "DELETE FROM tmdb_cache WHERE tmdb_id=? AND media_type=?",
+                (tmdb_id, media_type),
+            )
+            return None
         try:
             return json.loads(payload)
         except json.JSONDecodeError:

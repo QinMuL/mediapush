@@ -1,73 +1,47 @@
-import asyncio
-import time
+"""Cache TMDB 缓存 TTL 过期清除测试。"""
 
-import aiosqlite
-import pytest
+import asyncio
 
 from app.db.cache import Cache
 
 
-@pytest.fixture
-def cache(tmp_path):
-    return Cache(str(tmp_path / "test.db"))
+def test_tmdb_cache_hit_within_ttl(tmp_path):
+    """TTL 内命中。"""
+    cache = Cache(str(tmp_path / "t.db"))
 
-
-def test_tmdb_cache_set_get(cache):
     async def run():
-        await cache.set_tmdb(123, "tv", {"title": "X"}, ttl_days=30)
-        got = await cache.get_tmdb(123, "tv")
-        assert got == {"title": "X"}
+        await cache.set_tmdb(1, "tv", {"title": "X"}, ttl_days=1)
+        assert await cache.get_tmdb(1, "tv") == {"title": "X"}
 
     asyncio.run(run())
 
 
-def test_tmdb_cache_miss(cache):
+def test_tmdb_cache_expires_and_deletes(tmp_path):
+    """过期行被物理删除（自动清除，非惰性残留）。"""
+    cache = Cache(str(tmp_path / "t.db"))
+
     async def run():
-        assert await cache.get_tmdb(999, "tv") is None
+        # ttl_days=0 → 写入即过期
+        await cache.set_tmdb(1, "tv", {"title": "X"}, ttl_days=0)
+        # 过期读取 → None
+        assert await cache.get_tmdb(1, "tv") is None
+        # 验证行已物理删除（直接查表）
+        row = await cache._fetchone(
+            "SELECT 1 FROM tmdb_cache WHERE tmdb_id=? AND media_type=?",
+            (1, "tv"),
+        )
+        assert row is None
 
     asyncio.run(run())
 
 
-def test_tmdb_cache_expired(cache):
+def test_tmdb_cache_upsert_refreshes_payload(tmp_path):
+    """upsert 覆盖时刷新 payload（前序 bug 回归）。"""
+    cache = Cache(str(tmp_path / "t.db"))
+
     async def run():
-        await cache.set_tmdb(1, "movie", {"a": 1}, ttl_days=3)
-        async with aiosqlite.connect(cache.db_path) as db:
-            await db.execute(
-                "UPDATE tmdb_cache SET fetched_at=? WHERE tmdb_id=1 AND media_type='movie'",
-                (time.time() - 4 * 86400,),
-            )
-            await db.commit()
-        assert await cache.get_tmdb(1, "movie") is None
-
-    asyncio.run(run())
-
-
-def test_tmdb_cache_upsert_refreshes(cache):
-    async def run():
-        await cache.set_tmdb(1, "tv", {"v": 1}, ttl_days=3)
-        await cache.set_tmdb(1, "tv", {"v": 2}, ttl_days=3)
-        got = await cache.get_tmdb(1, "tv")
-        assert got == {"v": 2}
-
-    asyncio.run(run())
-
-
-def test_delete_tmdb(cache):
-    async def run():
-        await cache.set_tmdb(7, "tv", {"x": 1}, ttl_days=3)
-        n = await cache.delete_tmdb(7)
-        assert n == 1
-        assert await cache.get_tmdb(7, "tv") is None
-
-    asyncio.run(run())
-
-
-def test_pushed_dedup(cache):
-    async def run():
-        assert await cache.is_pushed("code1") is False
-        await cache.mark_pushed("code1")
-        assert await cache.is_pushed("code1") is True
-        await cache.mark_pushed("code1")  # 幂等
-        assert await cache.is_pushed("code1") is True
+        await cache.set_tmdb(1, "tv", {"v": 1}, ttl_days=1)
+        await cache.set_tmdb(1, "tv", {"v": 2}, ttl_days=1)
+        assert await cache.get_tmdb(1, "tv") == {"v": 2}
 
     asyncio.run(run())

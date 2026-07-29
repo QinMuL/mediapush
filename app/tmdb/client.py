@@ -24,8 +24,8 @@ _API_BASE = "https://api.themoviedb.org/3"
 _IMG_BASE = "https://image.tmdb.org/t/p/w500"
 # 横屏剧照（backdrop，16:9）：w780 清晰度与体积平衡，适合 TG 卡片
 _BACKDROP_BASE = "https://image.tmdb.org/t/p/w780"
-_TTL_ONGOING = 3
-_TTL_FINISHED = 30
+# TMDB 缓存统一 24 小时（定时刷新，及时捕捉 TMDB 数据修正，如地区/季集变更）
+_TTL_DAYS = 1
 
 
 class TMDBError(Exception):
@@ -144,16 +144,8 @@ class TMDBHelper:
         normalized = self._normalize(data, media_type)
 
         if self.cache:
-            ttl = _TTL_ONGOING if self._is_ongoing(normalized, media_type) else _TTL_FINISHED
-            await self.cache.set_tmdb(tmdb_id, media_type, normalized, ttl_days=ttl)
+            await self.cache.set_tmdb(tmdb_id, media_type, normalized, ttl_days=_TTL_DAYS)
         return normalized
-
-    @staticmethod
-    def _is_ongoing(info: dict, media_type: str) -> bool:
-        if media_type != "tv":
-            return False
-        status = (info.get("status") or "").lower()
-        return status not in {"ended", "canceled", "cancelled"}
 
     def _normalize(self, data: dict, media_type: str) -> dict:
         if media_type == "movie":
