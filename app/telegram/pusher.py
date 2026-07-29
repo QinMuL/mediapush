@@ -169,12 +169,34 @@ def _reallocate_by_tmdb(
     return result
 
 
-def _render_quality_block(media: AggregatedMedia) -> str:
-    """画质模块：<blockquote>💿 画质：...</blockquote>"""
+# 推荐语/精品说明最大长度（caption ≤1024 限额兜底，无海报路径 ≤4096 余量大）
+_QUALITY_EXTRA_LIMIT = 200
+
+
+def _render_quality_block(
+    media: AggregatedMedia,
+    *,
+    quality_extra: str = "",
+    is_premium: bool = False,
+) -> str:
+    """画质模块：<blockquote>：可选 💎精品 + 💿画质（自动 8 维度）+ 📝推荐语。
+
+    - is_premium：追加「💎 精品资源」行（普通/精品资源视觉区分）
+    - 自动 quality_info（_quality_line）保留，作为「💿 画质：...」行
+    - quality_extra：用户手动追加的推荐语/精品说明，esc + 截断防注入与超长
+    三者同处一个 blockquote；全空返回 ""（与原行为一致，自动直推路径不受影响）。
+    """
+    lines: list[str] = []
+    if is_premium:
+        lines.append("💎 精品资源")
     q = _quality_line(media)
-    if not q or q == "未知":
+    if q and q != "未知":
+        lines.append(f"💿 画质：{_esc(q)}")
+    if quality_extra:
+        lines.append(f"📝 {_esc(_truncate(quality_extra.strip(), _QUALITY_EXTRA_LIMIT))}")
+    if not lines:
         return ""
-    return f"<blockquote>💿 画质：{_esc(q)}</blockquote>"
+    return "<blockquote>" + "\n".join(lines) + "</blockquote>"
 
 
 def _render_season_block(details: dict, media: AggregatedMedia) -> str:
@@ -502,13 +524,18 @@ def render_caption(
     password: str | None,
     files: list[ShareFile] | None = None,
     provider: str = "115",
+    *,
+    quality_extra: str = "",
+    is_premium: bool = False,
 ) -> str:
     """海报下方 caption（≤1024）：标题区 + 季集模块 + 文件清单模块 + 简介模块 + 链接。
 
-    超限智能截断。
+    超限智能截断。quality_extra/is_premium 透传给画质模块（编辑模式用）。
     """
     head = _render_head(details, media, files)
-    quality_block = _render_quality_block(media)
+    quality_block = _render_quality_block(
+        media, quality_extra=quality_extra, is_premium=is_premium
+    )
     season_block = _render_season_block(details, media)
     footer = _render_footer(code, password, provider)
     overview = _esc(details.get("overview") or "")
@@ -524,10 +551,15 @@ def render_text(
     password: str | None,
     files: list[ShareFile] | None = None,
     provider: str = "115",
+    *,
+    quality_extra: str = "",
+    is_premium: bool = False,
 ) -> str:
     """无海报时的完整消息（≤4096）：标题区 + 画质模块 + 季集模块 + 文件清单模块 + 简介模块 + 链接。"""
     head = _render_head(details, media, files)
-    quality_block = _render_quality_block(media)
+    quality_block = _render_quality_block(
+        media, quality_extra=quality_extra, is_premium=is_premium
+    )
     season_block = _render_season_block(details, media)
     footer = _render_footer(code, password, provider)
     overview = _esc(details.get("overview") or "")
@@ -560,11 +592,15 @@ class Pusher:
         password: str | None,
         files: list[ShareFile] | None = None,
         provider: str = "115",
+        *,
+        quality_extra: str = "",
+        is_premium: bool = False,
     ) -> tuple[bool, str]:
         """推送卡片到频道（单消息）。
 
         有海报：send_photo + caption（≤1024，智能截断）
         无海报或发送失败：send_message + text（≤4096，完整）
+        quality_extra/is_premium 透传给渲染（编辑模式精品标记/推荐语）。
         """
         from app.tmdb.client import TMDBHelper
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -578,7 +614,10 @@ class Pusher:
             )
 
         if poster_url:
-            caption = render_caption(details, media, code, password, files, provider)
+            caption = render_caption(
+                details, media, code, password, files, provider,
+                quality_extra=quality_extra, is_premium=is_premium,
+            )
             try:
                 await self.bot.send_photo(
                     chat_id=self.chat_id,
@@ -592,7 +631,10 @@ class Pusher:
                 logger.warning("send_photo 失败，回退 send_message：%s", exc)
 
         # 无海报或海报发送失败：send_message（≤4096）
-        text = render_text(details, media, code, password, files, provider)
+        text = render_text(
+            details, media, code, password, files, provider,
+            quality_extra=quality_extra, is_premium=is_premium,
+        )
         await self.bot.send_message(
             chat_id=self.chat_id,
             text=text,

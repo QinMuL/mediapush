@@ -295,3 +295,111 @@ def test_tmdb_tag_fallback_on_failure():
         assert r.title == "搜索结果"
 
     asyncio.run(run())
+
+
+# -------------------- prepare（编辑模式准备阶段） -------------------- #
+def test_prepare_success_returns_details_media_files():
+    """prepare 成功：返回 details/media/files/media_type，不推送不标记。"""
+    details = {"tmdb_id": 1, "media_type": "tv", "title": "Show", "year": 2020,
+               "poster_path": None, "seasons": [{"season": 1, "episode_count": 2}]}
+    cache = FakeCache()
+    proc = ShareProcessor(
+        FakePan115(_tv_files()), None, FakeTMDB(best=(1, "tv"), details=details),
+        cache, FakeContainer(FakePusher()),
+    )
+
+    async def run():
+        pr = await proc.prepare(ParsedShare("115", "CODE", "pwd"))
+        assert pr.ok
+        assert pr.media_type == "tv"
+        assert pr.details is details
+        assert pr.media is not None
+        assert pr.files is not None and len(pr.files) == 2
+        assert pr.title == "Show"
+        assert pr.year == 2020
+        assert pr.file_count == 2
+        # 不标记、不推送
+        assert cache.marked == []
+
+    asyncio.run(run())
+
+
+def test_prepare_dedup_skips():
+    """prepare 去重命中：ok=False，不读文件不匹配。"""
+    cache = FakeCache(pushed_codes=["CODE"])
+    proc = ShareProcessor(
+        FakePan115(_tv_files()), None, FakeTMDB(), cache, FakeContainer(FakePusher()),
+    )
+
+    async def run():
+        pr = await proc.prepare(ParsedShare("115", "CODE", None))
+        assert not pr.ok
+        assert "已推送过" in pr.message
+        assert pr.details is None
+        assert pr.media is None
+
+    asyncio.run(run())
+
+
+def test_prepare_no_tmdb_match():
+    """prepare TMDB 未匹配：ok=False，file_count 仍返回。"""
+    cache = FakeCache()
+    proc = ShareProcessor(
+        FakePan115(_tv_files()), None, FakeTMDB(best=None), cache,
+        FakeContainer(FakePusher()),
+    )
+
+    async def run():
+        pr = await proc.prepare(ParsedShare("115", "CODE", None))
+        assert not pr.ok
+        assert "未匹配" in pr.message
+        assert pr.file_count == 2
+        assert pr.details is None
+
+    asyncio.run(run())
+
+
+def test_prepare_pan115_not_configured():
+    cache = FakeCache()
+    proc = ShareProcessor(None, None, FakeTMDB(), cache, FakeContainer(FakePusher()))
+
+    async def run():
+        pr = await proc.prepare(ParsedShare("115", "CODE", None))
+        assert not pr.ok
+        assert "115" in pr.message
+
+    asyncio.run(run())
+
+
+def test_prepare_tmdb_not_configured():
+    cache = FakeCache()
+    proc = ShareProcessor(
+        FakePan115(_tv_files()), None, None, cache, FakeContainer(FakePusher()),
+    )
+
+    async def run():
+        pr = await proc.prepare(ParsedShare("115", "CODE", None))
+        assert not pr.ok
+        assert "TMDB" in pr.message
+
+    asyncio.run(run())
+
+
+def test_prepare_isolates_from_process_side_effects():
+    """prepare 不调 pusher、不 mark（与 process 区分）。"""
+    details = {"tmdb_id": 1, "media_type": "tv", "title": "Show", "year": 2020,
+               "poster_path": None, "seasons": [{"season": 1, "episode_count": 2}]}
+    cache = FakeCache()
+    pusher = FakePusher()
+    proc = ShareProcessor(
+        FakePan115(_tv_files()), None, FakeTMDB(best=(1, "tv"), details=details),
+        cache, FakeContainer(pusher),
+    )
+
+    async def run():
+        pr = await proc.prepare(ParsedShare("115", "CODE", None))
+        assert pr.ok
+        assert pusher.pushed == []  # 未推送
+        assert cache.marked == []  # 未标记
+
+    asyncio.run(run())

@@ -1,6 +1,7 @@
 """Telegram Bot 命令处理。
 
 - /start /help /status /115 <链接> [密码] /refresh <tmdb_id>
+- /edit <链接> — 预览编辑模式（追加推荐语/精品标记后推送）/cancel 取消
 - 裸链接消息自动当 /115 处理
 - 仅 TG_ADMIN_IDS 可用
 - Pan115Error 顶部容错导入（p115client 装坏不拖垮 bot）
@@ -11,9 +12,10 @@ from __future__ import annotations
 
 import logging
 
-from telegram import BotCommand, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -21,6 +23,12 @@ from telegram.ext import (
 )
 
 from app.core.link_parser import parse_share, parse_shares
+from app.telegram.edit_session import (
+    MAX_QUALITY_EXTRA,
+    EditSession,
+    EditState,
+)
+from app.telegram.pusher import render_caption, render_text
 
 # Pan115Error 容错导入：p115client 装坏时退化为 Exception，保留 except 语义
 try:
@@ -29,6 +37,8 @@ except Exception:  # noqa: BLE001
     Pan115Error = Exception  # type: ignore[misc,assignment]
 
 logger = logging.getLogger(__name__)
+
+_SESSION_KEY = "edit_session"
 
 
 def _container(context: ContextTypes.DEFAULT_TYPE):
@@ -41,6 +51,37 @@ def _is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 
 # ---------------------------------------------------------------------- #
+# 编辑会话状态辅助（单键存 context.user_data，避免散落）
+# ---------------------------------------------------------------------- #
+def _get_session(context: ContextTypes.DEFAULT_TYPE) -> EditSession | None:
+    return context.user_data.get(_SESSION_KEY)
+
+
+def _set_session(context: ContextTypes.DEFAULT_TYPE, session: EditSession) -> None:
+    context.user_data[_SESSION_KEY] = session
+
+
+def _clear_session(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop(_SESSION_KEY, None)
+
+
+def _edit_keyboard(session: EditSession) -> InlineKeyboardMarkup:
+    """编辑模式预览键盘：追加画质 / 切换精品 / 确认推送 / 取消。"""
+    premium_label = "💎 精品:开" if session.is_premium else "💎 精品:关"
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✏️ 追加画质", callback_data="edit_quality"),
+                InlineKeyboardButton(premium_label, callback_data="toggle_premium"),
+            ],
+            [
+                InlineKeyboardButton("✅ 确认推送", callback_data="confirm_push"),
+                InlineKeyboardButton("❌ 取消", callback_data="cancel_edit"),
+            ],
+        ]
+    )
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 我是网盘影视资源推送 Bot。\n"
@@ -58,6 +99,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• 发送 ed2k 单文件链接，例如：\n"
         "  ed2k://|file|片名.mkv|大小|hash|/\n"
         "• /115 <链接> [访问码] — 显式触发\n"
+        "• /edit <链接> — 预览编辑模式：追加推荐语/精品标记后推送（精品资源区分）\n"
+        "• /cancel — 取消当前编辑\n"
         "• /refresh <tmdb_id> — 清除该 TMDB 缓存后重拉\n"
         "• /status — 查看配置与 115 健康状态"
     )
@@ -117,8 +160,16 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """裸链接消息自动触发处理（支持单链接 / 多链接批处理）。"""
+    """裸链接消息自动触发处理（支持单链接 / 多链接批处理）。
+
+    顶部优先处理编辑模式 AWAITING_QUALITY 状态：把文本作为推荐语输入，
+    不走链接解析（避免独立 handler 遮蔽 on_text）。
+    """
     if not _is_admin(update, context):
+        return
+    session = _get_session(context)
+    if session is not None and session.state == EditState.AWAITING_QUALITY:
+        await _handle_quality_input(update, context, session)
         return
     text = update.message.text or ""
     shares = parse_shares(text)
@@ -246,12 +297,296 @@ async def _process_batch(update: Update, context, shares) -> None:
 
 
 # ---------------------------------------------------------------------- #
+# 编辑模式：/edit 预览 → 编辑画质模块 → 确认推送
+# ---------------------------------------------------------------------- #
+async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/edit <链接>：进入预览编辑模式（不直接推送频道）。
+
+    流程：prepare（去重+读取+TMDB）→ 预览卡片+编辑键盘 → 按钮编辑 → 确认推送。
+    去重检查在 prepare；标记已推送在确认推送成功后（取消不标记）。
+    """
+    if not _is_admin(update, context):
+        await update.message.reply_text("⛔ 无权限")
+        return
+    text = " ".join(context.args) if context.args else (update.message.text or "")
+    parsed = parse_share(text)
+    if not parsed:
+        await update.message.reply_text(
+            "❌ 无法识别链接。用法：/edit <115 分享链接 / 裸码 / ed2k 链接>"
+        )
+        return
+
+    container = _container(context)
+    # 已有 session：覆盖前先清理（旧预览按钮因 preview_message_id 校验而失效）
+    if _get_session(context) is not None:
+        _clear_session(context)
+
+    loading = (
+        "⏳ 正在解析 ed2k 资源 ..."
+        if parsed.provider == "ed2k"
+        else f"⏳ 正在读取分享 `{parsed.code}` ..."
+    )
+    placeholder = await update.message.reply_text(loading, parse_mode="Markdown")
+    try:
+        pr = await container.processor.prepare(parsed)
+    except Pan115Error as exc:
+        await _edit(placeholder, f"❌ 115 错误：{exc}")
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("prepare 失败")
+        await _edit(placeholder, f"❌ 处理失败：{exc}")
+        return
+
+    if not pr.ok:
+        await _edit(placeholder, f"⚠️ {pr.message}")
+        return
+
+    session = EditSession(
+        parsed=parsed,
+        details=pr.details,
+        media=pr.media,
+        files=pr.files,
+        provider=parsed.provider,
+    )
+    await _send_preview(update, context, session)
+    await _edit(
+        placeholder,
+        "👆 预览已生成，点上方卡片按钮编辑画质模块后确认推送。\n"
+        "• ✏️ 追加画质：发送推荐语/精品说明\n"
+        "• 💎 精品：切换精品资源标记\n"
+        "• /cancel 或 ❌ 取消",
+    )
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/cancel：取消当前编辑会话（不推送、不标记已推送）。"""
+    if not _is_admin(update, context):
+        await update.message.reply_text("⛔ 无权限")
+        return
+    session = _get_session(context)
+    if session is None:
+        await update.message.reply_text("当前没有进行中的编辑。")
+        return
+    _clear_session(context)
+    await _edit_preview_text(context.bot, session, "已取消编辑，未推送频道。")
+    await update.message.reply_text("已取消编辑。")
+
+
+async def _send_preview(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, session: EditSession
+) -> None:
+    """发送预览卡片（带编辑键盘），记录预览消息引用到 session。"""
+    from app.tmdb.client import TMDBHelper
+
+    details = session.details
+    media = session.media
+    code = session.parsed.code
+    password = session.parsed.password
+    files = session.files
+    provider = session.provider
+    keyboard = _edit_keyboard(session)
+
+    poster_url = TMDBHelper.poster_url(details.get("poster_path"))
+    if poster_url:
+        caption = render_caption(
+            details, media, code, password, files, provider,
+            quality_extra=session.quality_extra, is_premium=session.is_premium,
+        )
+        try:
+            msg = await update.message.reply_photo(
+                photo=poster_url,
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+            session.preview_is_photo = True
+        except Exception as exc:  # noqa: BLE001 - 海报发送失败回退文本
+            logger.warning("预览 reply_photo 失败，回退文本：%s", exc)
+            poster_url = None
+
+    if not poster_url:
+        text = render_text(
+            details, media, code, password, files, provider,
+            quality_extra=session.quality_extra, is_premium=session.is_premium,
+        )
+        msg = await update.message.reply_text(
+            text, parse_mode="HTML", reply_markup=keyboard,
+        )
+        session.preview_is_photo = False
+
+    session.preview_chat_id = msg.chat_id
+    session.preview_message_id = msg.message_id
+    _set_session(context, session)
+
+
+async def _refresh_preview(bot, session: EditSession) -> None:
+    """重新渲染并 edit 预览消息（内容+键盘）。吞 not-modified/限流。"""
+    details = session.details
+    media = session.media
+    code = session.parsed.code
+    password = session.parsed.password
+    files = session.files
+    provider = session.provider
+    keyboard = _edit_keyboard(session)
+
+    try:
+        if session.preview_is_photo:
+            caption = render_caption(
+                details, media, code, password, files, provider,
+                quality_extra=session.quality_extra, is_premium=session.is_premium,
+            )
+            await bot.edit_message_caption(
+                chat_id=session.preview_chat_id,
+                message_id=session.preview_message_id,
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        else:
+            text = render_text(
+                details, media, code, password, files, provider,
+                quality_extra=session.quality_extra, is_premium=session.is_premium,
+            )
+            await bot.edit_message_text(
+                chat_id=session.preview_chat_id,
+                message_id=session.preview_message_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+    except Exception as exc:  # noqa: BLE001 - "message is not modified"/限流兜底
+        logger.debug("刷新预览失败（可忽略）：%s", exc)
+
+
+async def _edit_preview_text(bot, session: EditSession, text: str) -> None:
+    """把预览消息 edit 成纯文本（无键盘）。用于编辑等待/取消/推送完成。"""
+    try:
+        if session.preview_is_photo:
+            await bot.edit_message_caption(
+                chat_id=session.preview_chat_id,
+                message_id=session.preview_message_id,
+                caption=text,
+            )
+        else:
+            await bot.edit_message_text(
+                chat_id=session.preview_chat_id,
+                message_id=session.preview_message_id,
+                text=text,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("edit 预览文本失败（可忽略）：%s", exc)
+
+
+async def on_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """编辑键盘回调：edit_quality / toggle_premium / confirm_push / cancel_edit。"""
+    q = update.callback_query
+    await q.answer()
+    if not _is_admin(update, context):
+        await q.answer("⛔ 无权限", show_alert=True)
+        return
+
+    session = _get_session(context)
+    # 陈旧按钮拦截：session 不存在或按钮不属于当前预览消息
+    if session is None or session.preview_message_id != q.message.message_id:
+        await q.answer("会话已失效，请重新 /edit", show_alert=True)
+        return
+
+    bot = context.bot
+    data = q.data
+
+    if data == "edit_quality":
+        session.state = EditState.AWAITING_QUALITY
+        _set_session(context, session)
+        await _edit_preview_text(
+            bot,
+            session,
+            "✏️ 请直接发送要追加到画质模块的推荐语/精品说明文本。\n"
+            "（发送的文本将作为推荐语；如需推送新链接请先 /cancel）",
+        )
+        return
+
+    if data == "toggle_premium":
+        session.is_premium = not session.is_premium
+        _set_session(context, session)
+        await _refresh_preview(bot, session)
+        return
+
+    if data == "cancel_edit":
+        _clear_session(context)
+        await _edit_preview_text(bot, session, "已取消编辑，未推送频道。")
+        return
+
+    if data == "confirm_push":
+        await _confirm_push(context, session)
+
+
+async def _confirm_push(
+    context: ContextTypes.DEFAULT_TYPE, session: EditSession
+) -> None:
+    """确认推送：二次去重 → push_share（带编辑覆写）→ mark_pushed。"""
+    container = _container(context)
+    bot = context.bot
+    parsed = session.parsed
+
+    # 二次去重：防 prepare→confirm 期间被并发推送
+    if await container.cache.is_pushed(parsed.code):
+        _clear_session(context)
+        await _edit_preview_text(bot, session, "⚠️ 该链接已被推送过，已取消。")
+        return
+
+    pusher = container.pusher
+    if pusher is None:
+        await _edit_preview_text(bot, session, "⚠️ 推送器未就绪")
+        return
+
+    try:
+        ok, msg = await pusher.push_share(
+            session.details, session.media, parsed.code, parsed.password,
+            session.files, provider=session.provider,
+            quality_extra=session.quality_extra, is_premium=session.is_premium,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("确认推送失败")
+        await _edit_preview_text(bot, session, f"⚠️ 推送失败：{exc}")
+        return
+
+    title = session.details.get("title") or session.media.title
+    if ok:
+        await container.cache.mark_pushed(parsed.code)
+        logger.info("编辑模式推送成功：%s", title)
+        _clear_session(context)
+        await _edit_preview_text(bot, session, f"✅ 已推送：{title}")
+    else:
+        await _edit_preview_text(bot, session, f"⚠️ 推送失败：{msg}")
+
+
+async def _handle_quality_input(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, session: EditSession
+) -> None:
+    """AWAITING_QUALITY 状态：把用户文本作为推荐语，回到预览并刷新。"""
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+    session.quality_extra = text[:MAX_QUALITY_EXTRA]
+    session.state = EditState.PREVIEW
+    _set_session(context, session)
+    # 删除用户输入消息保持整洁（无权限则忽略）
+    try:
+        await update.message.delete()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("删除用户输入消息失败（可忽略）：%s", exc)
+    await _refresh_preview(context.bot, session)
+
+
+# ---------------------------------------------------------------------- #
 # 快捷菜单命令（启动时通过 setMyCommands 注册，覆盖旧项目残留）
 # 顺序即菜单显示顺序；描述简短，Telegram 会作为 "/" 命令提示展示
 _BOT_COMMANDS: list[BotCommand] = [
     BotCommand("start", "开始使用"),
     BotCommand("help", "用法说明"),
     BotCommand("115", "推送 115/ed2k 链接"),
+    BotCommand("edit", "编辑画质后推送"),
+    BotCommand("cancel", "取消当前编辑"),
     BotCommand("status", "查看配置与健康"),
     BotCommand("refresh", "清除 TMDB 缓存"),
 ]
@@ -297,7 +632,15 @@ def register(application: Application) -> None:
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("115", cmd_115))
+    application.add_handler(CommandHandler("edit", cmd_edit))
+    application.add_handler(CommandHandler("cancel", cmd_cancel))
     application.add_handler(CommandHandler("refresh", cmd_refresh))
+    application.add_handler(
+        CallbackQueryHandler(
+            on_edit_callback,
+            pattern="^(edit_quality|toggle_premium|confirm_push|cancel_edit)$",
+        )
+    )
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, on_text)
     )

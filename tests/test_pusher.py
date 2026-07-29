@@ -640,3 +640,87 @@ def test_season_block_s00_no_tmdb_season0():
     # 无 TMDB season 0 集数 → 只显示文件数
     assert "S00 特别篇（1个文件）" in block
     assert "📋 集数：S00 E01" in block
+
+
+# -------------------- 编辑模式：画质模块覆写（精品/推荐语） -------------------- #
+def test_quality_block_premium_and_extra():
+    """精品标记 + 自动画质 + 推荐语同处一个 blockquote，顺序：精品→画质→推荐语。"""
+    from app.parser.media_parser import get_quality_info
+
+    media = AggregatedMedia(
+        title="X", media_type="movie",
+        quality_info=get_quality_info("X.2024.2160p.WEB-DL.DoVi P7.H.265.10-bit.mkv"),
+    )
+    block = _render_quality_block(
+        media, quality_extra="原盘内封中字 · 国配音轨", is_premium=True
+    )
+    assert block.startswith("<blockquote>") and block.endswith("</blockquote>")
+    assert "💎 精品资源" in block
+    assert "💿 画质：" in block
+    assert "DoVi P7" in block  # 自动 8 维度保留
+    assert "📝 原盘内封中字 · 国配音轨" in block
+    assert block.index("💎 精品资源") < block.index("💿 画质：")
+    assert block.index("💿 画质：") < block.index("📝")
+
+
+def test_quality_block_default_unchanged():
+    """不传新参时与改造前一致（回归保护）。"""
+    media = AggregatedMedia(quality="4K / 2160P", source="WEB-DL", hdr="HDR10")
+    block = _render_quality_block(media)
+    assert block == "<blockquote>💿 画质：4K / 2160P HDR10 WEB-DL</blockquote>"
+
+
+def test_quality_block_empty_when_nothing():
+    """无画质/无精品/无推荐语时返回空串（与原行为一致）。"""
+    media = AggregatedMedia(media_type="movie")  # quality_info 空，quality 空
+    assert _render_quality_block(media) == ""
+
+
+def test_quality_block_only_premium():
+    """仅精品标记（无画质信息）：仍输出 blockquote 含 💎 行。"""
+    media = AggregatedMedia(media_type="movie")
+    block = _render_quality_block(media, is_premium=True)
+    assert "💎 精品资源" in block
+    assert "💿 画质：" not in block
+    assert block.startswith("<blockquote>")
+
+
+def test_quality_block_extra_escaped():
+    """推荐语 HTML 特殊字符转义防注入。"""
+    media = AggregatedMedia(quality="1080P")
+    block = _render_quality_block(media, quality_extra="<b>bold</b> & <i>")
+    assert "<b>bold</b>" not in block
+    assert "&lt;b&gt;bold&lt;/b&gt;" in block
+    assert "&amp;" in block
+
+
+def test_quality_block_extra_truncated():
+    """推荐语超长截断（≤ _QUALITY_EXTRA_LIMIT + 省略号）。"""
+    from app.telegram.pusher import _QUALITY_EXTRA_LIMIT
+
+    media = AggregatedMedia(quality="1080P")
+    long_text = "语" * (_QUALITY_EXTRA_LIMIT + 50)
+    block = _render_quality_block(media, quality_extra=long_text)
+    assert "…" in block
+    assert ("语" * (_QUALITY_EXTRA_LIMIT + 50)) not in block
+
+
+def test_render_caption_passes_extra():
+    """caption 透传 quality_extra/is_premium 到画质模块。"""
+    cap = render_caption(
+        _tv_details(), _tv_media(), "sw8k9m2", "ab12", _sample_files(),
+        quality_extra="精品推荐语", is_premium=True,
+    )
+    assert "💎 精品资源" in cap
+    assert "📝 精品推荐语" in cap
+    assert len(cap) <= 1024
+
+
+def test_render_text_passes_extra():
+    """无海报 text 透传 quality_extra/is_premium。"""
+    txt = render_text(
+        _tv_details(), _tv_media(), "sw8k9m2", "ab12", _sample_files(),
+        quality_extra="精品推荐语", is_premium=True,
+    )
+    assert "💎 精品资源" in txt
+    assert "📝 精品推荐语" in txt
