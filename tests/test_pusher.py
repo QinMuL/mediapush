@@ -588,3 +588,55 @@ def test_ed2k_text_render():
     assert "ed2k 资源" in txt
     assert _ED2K_URL in txt
     assert "126.58 GB" in txt  # 135915637476 / 1024^3 ≈ 126.58 GB（二进制）
+
+
+# -------------------- S00 特别篇 -------------------- #
+def test_season_block_s00_special():
+    """S00 特别篇：显示「特别篇」，用 TMDB season 0 的集数，不回退整剧总集数。"""
+    media = AggregatedMedia(
+        title="妖精的尾巴", year=2009, media_type="tv", season=0,
+        seasons=[0],
+        season_episodes={0: [1]},
+        episode_start=1, episode_end=1,
+        quality="4K / 2160P", source="WEB-DL", file_count=1,
+    )
+    details = {
+        "media_type": "tv", "status": "Ended",
+        "number_of_seasons": 9, "number_of_episodes": 328,
+        "seasons": [
+            {"season": 0, "episode_count": 32, "name": "特别篇"},
+            {"season": 1, "episode_count": 48, "name": "第一季"},
+        ],
+    }
+    block = _render_season_block(details, media)
+    # 季范围显示「S00 特别篇」而非「S00」
+    assert "S00 特别篇" in block
+    assert "S00 共328集" not in block  # 不回退整剧总集数
+    # 用 season 0 的 episode_count
+    assert "共32集（1个文件）" in block
+    # 集数行保持 S00，不被重分配到 S01
+    assert "📋 集数：S00 E01" in block
+    assert "S01 E01" not in block
+
+
+def test_season_block_s00_no_tmdb_season0():
+    """S00 文件但 TMDB 无 season 0 数据：不回退整剧总集数，仅显示文件数。"""
+    media = AggregatedMedia(
+        title="妖精的尾巴", year=2009, media_type="tv", season=0,
+        seasons=[0],
+        season_episodes={0: [1]},
+        episode_start=1, episode_end=1,
+        file_count=1,
+    )
+    # 旧缓存场景：TMDB 数据里没有 season 0（曾被跳过）
+    details = {
+        "media_type": "tv", "status": "Ended",
+        "number_of_seasons": 9, "number_of_episodes": 328,
+        "seasons": [{"season": 1, "episode_count": 48, "name": "第一季"}],
+    }
+    block = _render_season_block(details, media)
+    assert "S00 特别篇" in block
+    assert "共328集" not in block  # 不回退
+    # 无 TMDB season 0 集数 → 只显示文件数
+    assert "S00 特别篇（1个文件）" in block
+    assert "📋 集数：S00 E01" in block

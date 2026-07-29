@@ -3,7 +3,7 @@
 承接前序策略：
 - 搜索带年无果回退无年（文件名年份可能是资源年）
 - get_details：电影/剧集详情 + 演职员 + 季集数
-- 整季文件夹从 TMDB 季 episode_count 补集数（跳过 season 0）
+- 整季文件夹从 TMDB 季 episode_count 补集数（保留 season 0 特别篇）
 - HTTP：429/5xx/超时指数退避重试，4xx 立即抛出不重试
 - 缓存：ongoing 剧 3 天 / 已完结 30 天；upsert 刷新时间戳
 - TMDB API 走代理
@@ -180,8 +180,7 @@ class TMDBHelper:
         # tv
         seasons = []
         for s in data.get("seasons", []):
-            if s.get("season_number") == 0:
-                continue  # 跳过特别篇
+            # 保留 season 0（特别篇/specials），让 S00 文件能正确匹配
             seasons.append({
                 "season": s.get("season_number"),
                 "episode_count": s.get("episode_count") or 0,

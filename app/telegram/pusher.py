@@ -199,7 +199,8 @@ def _render_season_block(details: dict, media: AggregatedMedia) -> str:
     if len(seasons_list) > 1:
         season_str = f"S{seasons_list[0]:02d}-S{seasons_list[-1]:02d}"
     elif media.season is not None:
-        season_str = f"S{media.season:02d}"
+        # season 0 = 特别篇/specials
+        season_str = "S00 特别篇" if media.season == 0 else f"S{media.season:02d}"
     elif seasons_list:
         season_str = f"S{seasons_list[0]:02d}"
     else:
@@ -214,7 +215,8 @@ def _render_season_block(details: dict, media: AggregatedMedia) -> str:
             if s.get("season") == media.season:
                 tmdb_eps = s.get("episode_count") or 0
                 break
-        if not tmdb_eps:
+        # S00（特别篇）无 TMDB 数据时不回退整剧总集数（避免误显 328 集）
+        if not tmdb_eps and media.season != 0:
             tmdb_eps = details.get("number_of_episodes") or 0
 
     lines: list[str] = []
@@ -230,7 +232,8 @@ def _render_season_block(details: dict, media: AggregatedMedia) -> str:
     # 集数行：按季渲染实际集数范围
     final_eps = file_season_eps
     # 文件名单季但 TMDB 多季 → 用 TMDB 季范围重新分配全局集号
-    if len(file_season_eps) == 1 and len(tmdb_seasons) > 1:
+    # 但 S00（特别篇）不参与重分配：文件名已显式标注 season 0
+    if len(file_season_eps) == 1 and 0 not in file_season_eps and len(tmdb_seasons) > 1:
         all_eps = next(iter(file_season_eps.values()))
         reallocated = _reallocate_by_tmdb(all_eps, tmdb_seasons)
         if reallocated:
