@@ -177,7 +177,8 @@ class TMDBHelper:
                     c["name"] for c in data.get("credits", {}).get("crew", [])
                     if c.get("job") == "Director"
                 ][:3],
-                "countries": [c["iso_3166_1"] for c in data.get("production_countries", [])],
+                "countries": data.get("origin_country")
+                or [c["iso_3166_1"] for c in data.get("production_countries", [])],
             }
         # tv
         seasons = []
@@ -207,7 +208,8 @@ class TMDBHelper:
             "seasons": seasons,
             "cast": [c["name"] for c in (data.get("credits", {}).get("cast", []))[:5]],
             "creators": [c["name"] for c in data.get("created_by", [])][:3],
-            "countries": [c["iso_3166_1"] for c in data.get("production_countries", [])],
+            "countries": data.get("origin_country")
+            or [c["iso_3166_1"] for c in data.get("production_countries", [])],
         }
 
     @staticmethod
