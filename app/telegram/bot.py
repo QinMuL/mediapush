@@ -81,7 +81,8 @@ class TelegramService:
         """阻塞运行（main 调用）。run_polling 内部管理 initialize/start/stop。"""
         self.build()
         logger.info("Telegram Bot 启动 polling ...")
-        self._app.run_polling(close_loop=False)
+        # bootstrap_retries=-1: 启动期 getMe 无限重试（代理波动时不放弃启动）
+        self._app.run_polling(close_loop=False, bootstrap_retries=-1)
 
     async def stop(self) -> None:
         if self._app is None:

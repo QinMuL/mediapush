@@ -262,6 +262,9 @@ async def setup_commands(application: Application) -> None:
 
     先 delete_my_commands 清除上个项目残留的菜单，再 set_my_commands 设置新菜单。
     默认 scope（对所有用户生效）。失败不阻断启动。
+
+    额外：发一次短超时 get_updates 抢占会话，终止上一实例残留的长轮询
+    （容器重启时代理可能保持旧连接，导致 Conflict 循环 → CPU 飙高 + 断联）。
     """
     try:
         await application.bot.delete_my_commands()
@@ -272,6 +275,15 @@ async def setup_commands(application: Application) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("注册命令菜单失败：%s", exc)
+
+    # 清理上一实例残留的 getUpdates 长轮询会话
+    # 代理保活旧连接时 TG 仍认为旧 getUpdates 活跃，新实例每次 getUpdates 都 Conflict
+    # 这里主动发一次短超时请求抢占会话（TG 会终止旧的），失败不阻断启动
+    try:
+        await application.bot.get_updates(timeout=1)
+        logger.info("getUpdates 会话已就绪")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("清理残留 getUpdates 会话（可忽略，轮询循环会自动重试）：%s", exc)
 
 
 async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
