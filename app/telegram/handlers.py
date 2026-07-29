@@ -321,6 +321,9 @@ async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _get_session(context) is not None:
         _clear_session(context)
 
+    # /edit 允许重推：查已推送状态仅用于预览提示，prepare 跳过去重
+    already_pushed = await container.cache.is_pushed(parsed.code)
+
     loading = (
         "⏳ 正在解析 ed2k 资源 ..."
         if parsed.provider == "ed2k"
@@ -328,7 +331,7 @@ async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     placeholder = await update.message.reply_text(loading, parse_mode="Markdown")
     try:
-        pr = await container.processor.prepare(parsed)
+        pr = await container.processor.prepare(parsed, skip_dedup=True)
     except Pan115Error as exc:
         await _edit(placeholder, f"❌ 115 错误：{exc}")
         return
@@ -347,15 +350,19 @@ async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         media=pr.media,
         files=pr.files,
         provider=parsed.provider,
+        already_pushed=already_pushed,
     )
     await _send_preview(update, context, session)
-    await _edit(
-        placeholder,
+    hint = (
+        "⚠️ 此资源已推送过，本次为重新推送。\n" if already_pushed else ""
+    )
+    hint += (
         "👆 预览已生成，点上方卡片按钮编辑画质模块后确认推送。\n"
         "• ✏️ 追加画质：发送推荐语/精品说明\n"
         "• 💎 精品：切换精品资源标记\n"
-        "• /cancel 或 ❌ 取消",
+        "• /cancel 或 ❌ 取消"
     )
+    await _edit(placeholder, hint)
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -528,8 +535,8 @@ async def _confirm_push(
     bot = context.bot
     parsed = session.parsed
 
-    # 二次去重：防 prepare→confirm 期间被并发推送
-    if await container.cache.is_pushed(parsed.code):
+    # 二次去重：仅首次推送防并发；重推（already_pushed）跳过
+    if not session.already_pushed and await container.cache.is_pushed(parsed.code):
         _clear_session(context)
         await _edit_preview_text(bot, session, "⚠️ 该链接已被推送过，已取消。")
         return

@@ -29,6 +29,7 @@ class EditSession:
 
     - parsed/details/media/files/provider：prepare 阶段产物（不可变）
     - quality_extra/is_premium：用户编辑覆写（渲染到画质模块）
+    - already_pushed：该链接此前是否已推送过（/edit 重推场景，用于预览提示与跳过二次去重）
     - state：交互状态机
     - preview_*：预览消息引用，用于 edit_message 更新预览内容与键盘
     """
@@ -40,6 +41,7 @@ class EditSession:
     provider: str
     quality_extra: str = ""
     is_premium: bool = False
+    already_pushed: bool = False
     state: EditState = EditState.PREVIEW
     preview_chat_id: int | None = None
     preview_message_id: int | None = None

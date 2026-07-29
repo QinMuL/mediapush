@@ -84,6 +84,30 @@ def test_dedup_skips_pushed():
     asyncio.run(run())
 
 
+def test_prepare_skip_dedup_allows_republish():
+    """skip_dedup=True 跳过去重（/edit 重推已推送过的资源）。"""
+    details = {"tmdb_id": 1, "media_type": "tv", "title": "Show", "year": 2020,
+               "poster_path": None, "seasons": [{"season": 1, "episode_count": 2}]}
+    cache = FakeCache(pushed_codes=["CODE"])  # 已推送
+    proc = ShareProcessor(
+        FakePan115(_tv_files()), None,
+        FakeTMDB(best=(1, "tv"), details=details),
+        cache, FakeContainer(FakePusher()),
+    )
+
+    async def run():
+        # 默认 skip_dedup=False → 被去重拦截
+        r1 = await proc.prepare(ParsedShare("115", "CODE", None))
+        assert not r1.ok
+        assert "已推送过" in r1.message
+        # skip_dedup=True → 跳过去重，继续处理成功
+        r2 = await proc.prepare(ParsedShare("115", "CODE", None), skip_dedup=True)
+        assert r2.ok
+        assert r2.media_type == "tv"
+
+    asyncio.run(run())
+
+
 def test_no_tmdb_match():
     cache = FakeCache()
     proc = ShareProcessor(FakePan115(_tv_files()), None, FakeTMDB(best=None), cache, FakeContainer(FakePusher()))

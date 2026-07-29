@@ -57,11 +57,12 @@ class ShareProcessor:
             return self.ed2k
         return self.pan115
 
-    async def prepare(self, parsed) -> PrepareResult:
+    async def prepare(self, parsed, *, skip_dedup: bool = False) -> PrepareResult:
         """准备阶段：去重检查 → 读取 → 解析 → TMDB 匹配。
 
         不推送、不标记已推送。编辑模式（/edit）用它拿到 details/media/files
         预览编辑，确认推送时由 handler 调 pusher.push_share + cache.mark_pushed。
+        skip_dedup=True 跳过去重（/edit 重推已推送过的资源）；自动直推保持去重。
         各失败分支 message 与 process 语义一致。
         """
         provider = self._select_provider(parsed.provider)
@@ -70,8 +71,8 @@ class ShareProcessor:
         if self.tmdb is None:
             return PrepareResult(False, "TMDB 未配置（TMDB_API_KEY）")
 
-        # 1. 去重
-        if await self.cache.is_pushed(parsed.code):
+        # 1. 去重（/edit 重推 skip_dedup=True 跳过）
+        if not skip_dedup and await self.cache.is_pushed(parsed.code):
             return PrepareResult(False, f"分享 {parsed.code} 已推送过，跳过")
 
         # 2. 读取分享内容（ed2k 为纯字符串解析，115 为联网读取）

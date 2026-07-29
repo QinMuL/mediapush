@@ -71,7 +71,7 @@ class _FakeProcessor:
         self.prepare_calls: list = []
         self.process_calls: list = []
 
-    async def prepare(self, parsed):
+    async def prepare(self, parsed, *, skip_dedup: bool = False):
         self.prepare_calls.append(parsed)
         return self._pr
 
@@ -106,7 +106,7 @@ class _FakeContainer:
     def __init__(self, processor=None, pusher=None, cache=None) -> None:
         self.processor = processor
         self._pusher = pusher
-        self.cache = cache
+        self.cache = cache if cache is not None else _FakeCache()
         self.settings = _FakeSettings()
 
     @property
@@ -204,8 +204,8 @@ def test_cmd_edit_success_builds_session():
 
 
 def test_cmd_edit_prepare_fails_no_session():
-    """prepare 失败（已推送）→ 不建 session，placeholder 显示 ⚠️。"""
-    pr = PrepareResult(False, "分享 abc 已推送过，跳过")
+    """prepare 失败（如 TMDB 未匹配）→ 不建 session，placeholder 显示 ⚠️。"""
+    pr = PrepareResult(False, "❌ TMDB 未匹配到：X")
     proc = _FakeProcessor(pr)
     container = _FakeContainer(processor=proc)
     ctx = _make_context(container)
@@ -217,6 +217,28 @@ def test_cmd_edit_prepare_fails_no_session():
 
     assert _get_session(ctx) is None
     msg.edit_text.assert_called()  # placeholder edit 显示 ⚠️
+
+
+def test_cmd_edit_repush_already_pushed():
+    """已推送过的链接 /edit 仍能进入预览（重推：跳过去重，标记 already_pushed）。"""
+    pr = PrepareResult(
+        True, "", file_count=1, title="X", year=2020, media_type="movie",
+        details=_movie_details(), media=_movie_media(), files=_movie_files(),
+    )
+    proc = _FakeProcessor(pr)
+    cache = _FakeCache(pushed=True)  # 已推送过
+    container = _FakeContainer(processor=proc, cache=cache)
+    ctx = _make_context(container)
+    ctx.args = ["https://115.com/s/abc12345"]
+    msg = _make_message()
+    update = _make_update(message=msg)
+
+    asyncio.run(cmd_edit(update, ctx))
+
+    session = _get_session(ctx)
+    assert session is not None  # 仍建 session（未被去重拦截）
+    assert session.already_pushed is True
+    assert len(proc.prepare_calls) == 1  # prepare 被调（skip_dedup）
 
 
 # -------------------- on_edit_callback -------------------- #
