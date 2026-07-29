@@ -1,6 +1,7 @@
 from app.parser.media_parser import (
     analyze_share,
     extract_season_episode,
+    extract_tmdb_id,
     get_hdr,
     get_quality,
     get_source,
@@ -100,3 +101,39 @@ def test_analyze_share_movie_single():
 
 def test_analyze_empty():
     assert analyze_share([]) is None
+
+
+# -------------------- {tmdb-XXX} 标注提取 -------------------- #
+def test_extract_tmdb_id_from_dir():
+    """目录名带 {tmdb-1311031} 标注时优先提取。"""
+    files = [
+        ShareFile("Demon Slayer: Infinity Castle (2025) {tmdb-1311031}", 0, True),
+        ShareFile("Demon Slayer (2025) - 1080p.BluRay.mkv", 42_000_000_000, False),
+    ]
+    a = analyze_share(files)
+    assert a is not None
+    assert a.tmdb_id == 1311031
+
+
+def test_extract_tmdb_id_from_filename():
+    """目录无标注时从文件名提取。"""
+    files = [
+        ShareFile("Movie.2024.{tmdb-999}.mkv", 1_000_000, False),
+    ]
+    a = analyze_share(files)
+    assert a is not None
+    assert a.tmdb_id == 999
+
+
+def test_extract_tmdb_id_none():
+    """无标注时 tmdb_id 为 None。"""
+    files = [ShareFile("Inception.2010.1080p.mkv", 0, False)]
+    a = analyze_share(files)
+    assert a is not None
+    assert a.tmdb_id is None
+
+
+def test_extract_tmdb_id_case_insensitive():
+    """{TMDB-xxx} 大小写不敏感。"""
+    assert extract_tmdb_id(["file.{TMDB-12345}.mkv"]) == 12345
+    assert extract_tmdb_id(["no match"]) is None

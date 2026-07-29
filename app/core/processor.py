@@ -60,20 +60,32 @@ class ShareProcessor:
             )
 
         # 4. TMDB 匹配
-        best = await self.tmdb.search_best(media.title, media.year, media.media_type)
-        if not best:
-            return ProcessResult(
-                False,
-                f"TMDB 未匹配到：{media.title}"
-                + (f" ({media.year})" if media.year else ""),
-                file_count=len(files),
-                title=media.title,
-                year=media.year,
-            )
-        tmdb_id, mtype = best
+        # 优先用文件名/目录名标注的 {tmdb-XXX}（分享者明确指定，最可靠）
+        tmdb_id = None
+        mtype = media.media_type
+        details = None
+        if media.tmdb_id:
+            try:
+                details = await self.tmdb.get_details(media.tmdb_id, mtype)
+                tmdb_id = media.tmdb_id
+                logger.info("命中标注 TMDB ID：%s（%s）", tmdb_id, mtype)
+            except Exception as exc:  # noqa: BLE001 - 标注 ID 失效时回退搜索
+                logger.warning("标注 TMDB ID %s 获取失败，回退搜索：%s", media.tmdb_id, exc)
 
-        # 5. 详情
-        details = await self.tmdb.get_details(tmdb_id, mtype)
+        if tmdb_id is None:
+            best = await self.tmdb.search_best(media.title, media.year, media.media_type)
+            if not best:
+                return ProcessResult(
+                    False,
+                    f"TMDB 未匹配到：{media.title}"
+                    + (f" ({media.year})" if media.year else ""),
+                    file_count=len(files),
+                    title=media.title,
+                    year=media.year,
+                )
+            tmdb_id, mtype = best
+            details = await self.tmdb.get_details(tmdb_id, mtype)
+
         logger.info(
             "TMDB 命中：%s（id=%s，%s）",
             details.get("title") or media.title, tmdb_id, mtype,

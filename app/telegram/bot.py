@@ -44,6 +44,15 @@ class TelegramService:
             .token(self.settings.tg_bot_token)
             .concurrent_updates(True)
             .post_init(setup_commands)  # 启动时清除旧菜单并注册新命令
+            # 代理场景下默认超时（read=2s）太短，长轮询/发送容易超时拖死轮询循环
+            .read_timeout(30)
+            .write_timeout(30)
+            .connect_timeout(30)
+            .pool_timeout(30)
+            .get_updates_read_timeout(30)
+            .get_updates_connect_timeout(30)
+            .get_updates_write_timeout(30)
+            .get_updates_pool_timeout(30)
         )
         if self.settings.proxy_url:
             builder = builder.proxy(self.settings.proxy_url).get_updates_proxy(

@@ -14,14 +14,24 @@ class FakePan115:
 
 
 class FakeTMDB:
-    def __init__(self, best=None, details=None):
+    def __init__(self, best=None, details=None, details_by_id=None):
         self._best = best
         self._details = details
+        self._details_by_id = details_by_id or {}
+        self.search_calls = []
+        self.details_calls = []
 
     async def search_best(self, title, year, media_type):
+        self.search_calls.append((title, year, media_type))
         return self._best
 
     async def get_details(self, tmdb_id, media_type):
+        self.details_calls.append((tmdb_id, media_type))
+        if tmdb_id in self._details_by_id:
+            d = self._details_by_id[tmdb_id]
+            if isinstance(d, Exception):
+                raise d
+            return d
         return self._details
 
 
@@ -214,5 +224,74 @@ def test_ed2k_not_configured():
         r = await proc.process(ParsedShare("ed2k", _ED2K_URL, None))
         assert not r.ok
         assert "ed2k" in r.message
+
+    asyncio.run(run())
+
+
+# -------------------- {tmdb-XXX} 标注路由 -------------------- #
+def _movie_files_with_tmdb_tag():
+    """文件含 {tmdb-1311031} 目录标注的电影分享。"""
+    return [
+        ShareFile("Demon Slayer Infinity Castle (2025) {tmdb-1311031}", 0, True),
+        ShareFile("Demon Slayer (2025) - 1080p.BluRay.mkv", 42_000_000_000, False),
+    ]
+
+
+def test_tmdb_tag_skips_search():
+    """有 {tmdb-XXX} 标注时直接用该 ID 取详情，不调 search_best。"""
+    details = {
+        "tmdb_id": 1311031, "media_type": "movie", "title": "鬼灭之刃：无限城篇",
+        "year": 2025, "poster_path": None, "genres": ["动画"], "cast": [],
+        "countries": ["JP"], "status": "Released", "release_date": "2025-01-01",
+    }
+    tmdb = FakeTMDB(
+        best=(999, "movie"),  # 故意给错的 search 结果，验证不会被用到
+        details_by_id={1311031: details},
+    )
+    cache = FakeCache()
+    pusher = FakePusher()
+    proc = ShareProcessor(
+        FakePan115(_movie_files_with_tmdb_tag()), None, tmdb, cache, FakeContainer(pusher),
+    )
+
+    async def run():
+        r = await proc.process(ParsedShare("115", "CODE", None))
+        assert r.ok, r.message
+        # 直接用标注 ID，未走搜索
+        assert tmdb.search_calls == []
+        assert tmdb.details_calls == [(1311031, "movie")]
+        assert r.title == "鬼灭之刃：无限城篇"
+
+    asyncio.run(run())
+
+
+def test_tmdb_tag_fallback_on_failure():
+    """标注 TMDB ID 获取失败时回退到 search_best。"""
+    details = {
+        "tmdb_id": 999, "media_type": "movie", "title": "搜索结果",
+        "year": 2025, "poster_path": None, "genres": [], "cast": [],
+        "countries": [], "status": "Released", "release_date": "2025-01-01",
+    }
+    tmdb = FakeTMDB(
+        best=(999, "movie"),
+        details_by_id={
+            1311031: Exception("404 not found"),  # 标注 ID 失效
+            999: details,  # 搜索回退命中
+        },
+    )
+    cache = FakeCache()
+    pusher = FakePusher()
+    proc = ShareProcessor(
+        FakePan115(_movie_files_with_tmdb_tag()), None, tmdb, cache, FakeContainer(pusher),
+    )
+
+    async def run():
+        r = await proc.process(ParsedShare("115", "CODE", None))
+        assert r.ok, r.message
+        # 先试标注 ID（失败），再走搜索
+        assert len(tmdb.search_calls) == 1
+        assert (1311031, "movie") in tmdb.details_calls
+        assert (999, "movie") in tmdb.details_calls
+        assert r.title == "搜索结果"
 
     asyncio.run(run())

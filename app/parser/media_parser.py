@@ -47,6 +47,20 @@ class AggregatedMedia:
     quality_info: list[str] = field(default_factory=list)
     file_count: int = 0
     total_episodes: int | None = None
+    tmdb_id: int | None = None  # 文件名/目录名标注的 TMDB ID（{tmdb-XXX}）
+
+
+# TMDB ID 标注：{tmdb-1311031}（媒体管理工具/分享者标注，最可靠的匹配来源）
+_TMDB_ID_RE = re.compile(r"\{tmdb-(\d+)\}", re.IGNORECASE)
+
+
+def extract_tmdb_id(names: list[str]) -> int | None:
+    """从名称列表中提取第一个 {tmdb-XXX} 标注。无则 None。"""
+    for name in names:
+        m = _TMDB_ID_RE.search(name)
+        if m:
+            return int(m.group(1))
+    return None
 
 
 # ---------------------------------------------------------------------- #
@@ -382,6 +396,11 @@ def analyze_share(files: list[ShareFile]) -> AggregatedMedia | None:
 
     total_eps = len({p.episode for p in parsed if p.episode is not None}) or None
 
+    # TMDB ID 标注：优先从目录名提取（分享者/媒体工具标注，最可靠），再从文件名
+    tmdb_id = extract_tmdb_id([d.name for d in dirs]) or extract_tmdb_id(
+        [f.name for f in files]
+    )
+
     return AggregatedMedia(
         title=title,
         year=year,
@@ -397,4 +416,5 @@ def analyze_share(files: list[ShareFile]) -> AggregatedMedia | None:
         quality_info=quality_info,
         file_count=len(videos),
         total_episodes=total_eps,
+        tmdb_id=tmdb_id,
     )

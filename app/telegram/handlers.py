@@ -274,6 +274,11 @@ async def setup_commands(application: Application) -> None:
         logger.warning("注册命令菜单失败：%s", exc)
 
 
+async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """全局错误处理：记录异常日志，避免静默失败导致 Bot 无响应。"""
+    logger.error("处理异常：%s", context.error, exc_info=context.error)
+
+
 # ---------------------------------------------------------------------- #
 def register(application: Application) -> None:
     application.add_handler(CommandHandler("start", cmd_start))
@@ -284,3 +289,4 @@ def register(application: Application) -> None:
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, on_text)
     )
+    application.add_error_handler(_error_handler)
