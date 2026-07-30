@@ -164,12 +164,23 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(f"🗑 已清除 TMDB 缓存 {tmdb_id}（{n} 条）。下次匹配将重新拉取。")
 
 
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """裸链接消息自动触发处理（支持单链接 / 多链接批处理）。
+# 多链接消息聚合：TG 长消息自动拆分时，缓冲短时间内的多链接消息合并处理
+_pending_shares: list[ParsedShare] = []
+_pending_timer: asyncio.Task | None = None
+_pending_update: Update | None = None
+_pending_context = None
+_AGGREGATE_WINDOW = 3  # 聚合窗口（秒）
 
-    顶部优先处理编辑模式 AWAITING_QUALITY 状态：把文本作为推荐语输入，
-    不走链接解析（避免独立 handler 遮蔽 on_text）。
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """裸链接消息自动触发处理（单链接直推 / 多链接聚合批处理）。
+
+    单链接且无聚合中 → 立即直推（保持原 UX）。
+    多链接或聚合中 → 缓冲聚合：TG 会把超长消息拆成多条，此处等 3s 合并
+    成一个批量，统一按集数排序推送，避免拆分破坏顺序。
+    顶部优先处理编辑模式 AWAITING_QUALITY 状态。
     """
+    global _pending_update, _pending_context, _pending_timer
     if not _is_admin(update, context):
         return
     session = _get_session(context)
@@ -180,12 +191,45 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     shares = parse_shares(text)
     if not shares:
         return
-    if len(shares) == 1:
+    # 单链接且无聚合中 → 立即直推
+    if len(shares) == 1 and not _pending_shares:
         logger.info("收到链接：%s", shares[0].provider)
         await _process(update, context, shares[0])
-    else:
-        logger.info("收到 %d 个链接，开始批处理", len(shares))
-        await _process_batch(update, context, shares)
+        return
+    # 多链接或聚合中 → 缓冲聚合
+    _pending_shares.extend(shares)
+    if _pending_update is None:
+        _pending_update = update
+        _pending_context = context
+    logger.info("聚合 +%d（累计 %d）", len(shares), len(_pending_shares))
+    if _pending_timer is not None and not _pending_timer.done():
+        _pending_timer.cancel()
+    _pending_timer = asyncio.create_task(_flush_pending())
+
+
+async def _flush_pending() -> None:
+    """聚合窗口到期：跨消息去重后批量推送。"""
+    global _pending_shares, _pending_update, _pending_context, _pending_timer
+    await asyncio.sleep(_AGGREGATE_WINDOW)
+    shares = _pending_shares
+    update, context = _pending_update, _pending_context
+    _pending_shares = []
+    _pending_update = None
+    _pending_context = None
+    _pending_timer = None
+    seen: set[tuple[str, str]] = set()
+    unique: list[ParsedShare] = []
+    for p in shares:
+        k = (p.provider, p.code)
+        if k in seen:
+            continue
+        seen.add(k)
+        unique.append(p)
+    logger.info("聚合完成 %d 个链接，开始批处理", len(unique))
+    try:
+        await _process_batch(update, context, unique)
+    except Exception:  # noqa: BLE001
+        logger.exception("聚合批处理失败")
 
 
 # ---------------------------------------------------------------------- #
