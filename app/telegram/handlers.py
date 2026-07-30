@@ -113,7 +113,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     s = container.settings
     lines = [
         f"TG Bot：{'✅ 已配置' if s.tg_bot_token else '❌ 未配置'}",
-        f"推送频道：{s.tg_chat_id or '❌ 未配置'}",
+        f"默认频道：{s.tg_chat_id or '❌ 未配置'}",
+        f"网盘频道：{s.tg_chat_id_115 or '⬇️ 同默认'}",
+        f"ed2k 频道：{s.tg_chat_id_ed2k or '⬇️ 同默认'}",
         f"TMDB Key：{'✅' if s.tmdb_api_key else '❌ 未配置'}",
         f"115 Cookie：{'✅ 已配置（可选）' if s.pan115_cookie else '未配置（匿名读取，可用）'}",
         f"代理：{s.proxy_url or '未配置'}",

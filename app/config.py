@@ -34,6 +34,8 @@ def _env_int_list(name: str) -> list[int]:
 class Settings:
     tg_bot_token: str = ""
     tg_chat_id: str = ""
+    tg_chat_id_115: str = ""
+    tg_chat_id_ed2k: str = ""
     tg_admin_ids: list[int] = field(default_factory=list)
     tmdb_api_key: str = ""
     tmdb_language: str = "zh-CN"
@@ -58,6 +60,8 @@ class Settings:
         settings = cls(
             tg_bot_token=os.getenv("TG_BOT_TOKEN", "").strip(),
             tg_chat_id=os.getenv("TG_CHAT_ID", "").strip(),
+            tg_chat_id_115=os.getenv("TG_CHAT_ID_115", "").strip(),
+            tg_chat_id_ed2k=os.getenv("TG_CHAT_ID_ED2K", "").strip(),
             tg_admin_ids=_env_int_list("TG_ADMIN_IDS"),
             tmdb_api_key=os.getenv("TMDB_API_KEY", "").strip(),
             tmdb_language=os.getenv("TMDB_LANGUAGE", "zh-CN").strip() or "zh-CN",

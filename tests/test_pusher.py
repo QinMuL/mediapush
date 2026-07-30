@@ -724,3 +724,24 @@ def test_render_text_passes_extra():
     )
     assert "💎 精品资源" in txt
     assert "📝 精品推荐语" in txt
+
+
+def test_select_chat_id_routes_by_provider():
+    """按 provider 分流：ed2k → ed2k 频道，115/其他 → 115 频道；未配置回退默认。"""
+    from app.telegram.pusher import Pusher
+
+    # 两个分流频道都配置
+    p = Pusher(bot=None, chat_id="default", chat_id_115="ch115", chat_id_ed2k="ched2k")
+    assert p._select_chat_id("115") == "ch115"
+    assert p._select_chat_id("ed2k") == "ched2k"
+    assert p._select_chat_id("unknown") == "ch115"  # 非 ed2k 统一走 115
+
+    # 都未配置 → 回退默认
+    p2 = Pusher(bot=None, chat_id="default")
+    assert p2._select_chat_id("115") == "default"
+    assert p2._select_chat_id("ed2k") == "default"
+
+    # 仅配置 115，ed2k 回退默认
+    p3 = Pusher(bot=None, chat_id="default", chat_id_115="ch115")
+    assert p3._select_chat_id("115") == "ch115"
+    assert p3._select_chat_id("ed2k") == "default"

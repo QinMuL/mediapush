@@ -580,9 +580,23 @@ def render_text(
 
 # ---------------------------------------------------------------------- #
 class Pusher:
-    def __init__(self, bot, chat_id: str) -> None:
+    def __init__(
+        self,
+        bot,
+        chat_id: str,
+        chat_id_115: str = "",
+        chat_id_ed2k: str = "",
+    ) -> None:
         self.bot = bot
-        self.chat_id = chat_id
+        self.chat_id = chat_id  # 默认频道（未分流时回退）
+        self.chat_id_115 = chat_id_115
+        self.chat_id_ed2k = chat_id_ed2k
+
+    def _select_chat_id(self, provider: str) -> str:
+        """按 provider 分流频道：ed2k → ed2k 频道，115/其他 → 115 频道；未配置回退默认。"""
+        if provider == "ed2k":
+            return self.chat_id_ed2k or self.chat_id
+        return self.chat_id_115 or self.chat_id
 
     async def push_share(
         self,
@@ -605,6 +619,7 @@ class Pusher:
         from app.tmdb.client import TMDBHelper
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+        chat_id = self._select_chat_id(provider)
         image_url = TMDBHelper.image_url(details)
         tmdb_url = _tmdb_url(details)
         reply_markup = None
@@ -620,7 +635,7 @@ class Pusher:
             )
             try:
                 await self.bot.send_photo(
-                    chat_id=self.chat_id,
+                    chat_id=chat_id,
                     photo=image_url,
                     caption=caption,
                     parse_mode="HTML",
@@ -636,7 +651,7 @@ class Pusher:
             quality_extra=quality_extra, is_premium=is_premium,
         )
         await self.bot.send_message(
-            chat_id=self.chat_id,
+            chat_id=chat_id,
             text=text,
             parse_mode="HTML",
             disable_web_page_preview=False,

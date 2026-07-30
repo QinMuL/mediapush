@@ -62,7 +62,12 @@ class TelegramService:
         app.bot_data["container"] = self.container
 
         register(app)
-        self._pusher = Pusher(app.bot, self.settings.tg_chat_id)
+        self._pusher = Pusher(
+            app.bot,
+            self.settings.tg_chat_id,
+            self.settings.tg_chat_id_115,
+            self.settings.tg_chat_id_ed2k,
+        )
         self._app = app
 
     async def get_me(self):
