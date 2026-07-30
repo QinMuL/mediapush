@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 
@@ -24,6 +25,7 @@ from telegram.ext import (
 )
 
 from app.core.link_parser import parse_share, parse_shares
+from app.telegram.pusher import _send_with_retry
 from app.telegram.edit_session import (
     MAX_QUALITY_EXTRA,
     EditSession,
@@ -218,10 +220,10 @@ async def _process(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed) -
 
 async def _edit(message, text: str) -> None:
     try:
-        await message.edit_text(text)
-    except Exception:  # noqa: BLE001 - 编辑失败兜底重发
+        await _send_with_retry(lambda: message.edit_text(text))
+    except Exception:  # noqa: BLE001 - 编辑失败（非 flood）兜底重发
         try:
-            await message.reply_text(text)
+            await _send_with_retry(lambda: message.reply_text(text))
         except Exception:  # noqa: BLE001
             logger.warning("回复失败")
 
@@ -280,6 +282,9 @@ def _episode_sort_key(parsed) -> tuple:
     return (1, 0, 0)
 
 
+_batch_lock = asyncio.Lock()  # 串行化批量推送，避免多消息并发加剧 TG flood
+
+
 async def _process_batch(update: Update, context, shares) -> None:
     """多链接串行处理：逐个推送，单条汇总消息实时更新，失败继续。"""
     container = _container(context)
@@ -290,21 +295,24 @@ async def _process_batch(update: Update, context, shares) -> None:
     )
     lines: list[str] = []
     done = 0
-    for parsed in shares:
-        done += 1
-        try:
-            result = await container.processor.process(parsed)
-        except Pan115Error as exc:
-            lines.append(f"⚠️ {_short_id(parsed)}：{exc}".replace("\n", " "))
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("处理分享失败")
-            lines.append(f"⚠️ {_short_id(parsed)}：{exc}".replace("\n", " "))
-        else:
-            lines.append(_summarize_line(parsed, result))
-        await _edit(
-            placeholder,
-            _build_batch_summary(f"⏳ 处理中 ({done}/{total})", lines),
-        )
+    async with _batch_lock:  # 串行化批量，避免多消息并发推送加剧 flood
+        for parsed in shares:
+            done += 1
+            try:
+                result = await container.processor.process(parsed)
+            except Pan115Error as exc:
+                lines.append(f"⚠️ {_short_id(parsed)}：{exc}".replace("\n", " "))
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("处理分享失败")
+                lines.append(f"⚠️ {_short_id(parsed)}：{exc}".replace("\n", " "))
+            else:
+                lines.append(_summarize_line(parsed, result))
+            await _edit(
+                placeholder,
+                _build_batch_summary(f"⏳ 处理中 ({done}/{total})", lines),
+            )
+            if done < total:
+                await asyncio.sleep(2)  # 限速避免 TG 频道 flood control
 
     ok_count = sum(1 for ln in lines if ln.startswith("✅"))
     skip_count = sum(1 for ln in lines if ln.startswith("⏭️"))

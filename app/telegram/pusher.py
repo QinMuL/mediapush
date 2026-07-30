@@ -10,6 +10,7 @@ caption 内容：标题区 + 文件清单模块 + 简介模块 + 链接
 
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import re
@@ -579,6 +580,20 @@ def render_text(
 
 
 # ---------------------------------------------------------------------- #
+async def _send_with_retry(sender):
+    """发送消息，遇 RetryAfter（flood control）等待后重试，最多 3 次。"""
+    from telegram.error import RetryAfter
+
+    for attempt in range(3):
+        try:
+            return await sender()
+        except RetryAfter as exc:
+            if attempt == 2:
+                raise
+            logger.warning("Flood control，%ss 后重试（第 %d 次）", exc.retry_after, attempt + 1)
+            await asyncio.sleep(exc.retry_after + 1)
+
+
 class Pusher:
     def __init__(
         self,
@@ -634,13 +649,14 @@ class Pusher:
                 quality_extra=quality_extra, is_premium=is_premium,
             )
             try:
-                await self.bot.send_photo(
+                await _send_with_retry(lambda: self.bot.send_photo(
                     chat_id=chat_id,
                     photo=image_url,
                     caption=caption,
                     parse_mode="HTML",
                     reply_markup=reply_markup,
-                )
+                ))
+                logger.info("推送 → 频道 %s（海报+详情）", chat_id)
                 return True, "已推送（海报+详情）"
             except Exception as exc:  # noqa: BLE001
                 logger.warning("send_photo 失败，回退 send_message：%s", exc)
@@ -650,11 +666,12 @@ class Pusher:
             details, media, code, password, files, provider,
             quality_extra=quality_extra, is_premium=is_premium,
         )
-        await self.bot.send_message(
+        await _send_with_retry(lambda: self.bot.send_message(
             chat_id=chat_id,
             text=text,
             parse_mode="HTML",
             disable_web_page_preview=False,
             reply_markup=reply_markup,
-        )
+        ))
+        logger.info("推送 → 频道 %s（纯文本+详情）", chat_id)
         return True, "已推送（纯文本+详情）"
