@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -262,9 +263,27 @@ def _build_batch_summary(header: str, lines: list[str]) -> str:
     return f"{header}\n\n" + "\n".join(kept) + "\n…（更多已截断）"
 
 
+_EP_RE = re.compile(r"[Ss](\d+)[Ee](\d+)")
+
+
+def _episode_sort_key(parsed) -> tuple:
+    """按季集排序 ed2k 链接：从文件名提取 SxxExx；无法提取的排最后（保持原序）。
+
+    115 分享码不含文件名，无法预排序，统一排后并保持原文顺序。
+    """
+    if parsed.provider == "ed2k":
+        parts = parsed.code.split("|")
+        if len(parts) > 2:
+            m = _EP_RE.search(parts[2])
+            if m:
+                return (0, int(m.group(1)), int(m.group(2)))
+    return (1, 0, 0)
+
+
 async def _process_batch(update: Update, context, shares) -> None:
     """多链接串行处理：逐个推送，单条汇总消息实时更新，失败继续。"""
     container = _container(context)
+    shares = sorted(shares, key=_episode_sort_key)
     total = len(shares)
     placeholder = await update.message.reply_text(
         f"⏳ 正在处理 {total} 个链接，逐个推送中 ..."

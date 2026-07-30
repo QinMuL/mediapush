@@ -394,3 +394,36 @@ def test_edit_session_import():
     assert s.quality_extra == ""
     assert s.is_premium is False
     assert s.state == EditState.PREVIEW
+
+
+def _ed2k(name: str) -> ParsedShare:
+    return ParsedShare("ed2k", f"ed2k://|file|{name}|123|0123456789ABCDEF0123456789ABCDEF|/", None)
+
+
+def test_episode_sort_key_orders_by_season_episode():
+    """ed2k 链接按 SxxExy 排序：乱序输入 → E01..E25 有序输出。"""
+    from app.telegram.handlers import _episode_sort_key
+
+    shares = [
+        _ed2k("Show.2026.S01E25.2160p.mp4"),
+        _ed2k("Show.2026.S01E03.2160p.mp4"),
+        _ed2k("Show.2026.S01E10.2160p.mp4"),
+        _ed2k("Show.2026.S01E02.2160p.mp4"),
+        _ed2k("Show.2026.S01E01.2160p.mp4"),
+    ]
+    ordered = sorted(shares, key=_episode_sort_key)
+    eps = [_episode_sort_key(s)[2] for s in ordered]
+    assert eps == [1, 2, 3, 10, 25]
+
+
+def test_episode_sort_key_no_episode_and_115_sort_last_stable():
+    """无集数 ed2k 与 115 排最后，且彼此保持原序（稳定排序）。"""
+    from app.telegram.handlers import _episode_sort_key
+
+    ed2k_ep = _ed2k("Show.S01E05.2160p.mp4")
+    ed2k_none = _ed2k("Movie.2026.2160p.mp4")  # 无 SxxExx
+    p115 = ParsedShare("115", "abc12345", None)
+    ordered = sorted([ed2k_none, ed2k_ep, p115], key=_episode_sort_key)
+    assert ordered[0] is ed2k_ep  # 有集数排第一
+    assert ordered[1] is ed2k_none  # 无集数保持原序
+    assert ordered[2] is p115
