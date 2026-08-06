@@ -631,8 +631,9 @@ class Pusher:
         无海报或发送失败：send_message + text（≤4096，完整）
         quality_extra/is_premium 透传给渲染（编辑模式精品标记/推荐语）。
         """
-        from app.tmdb.client import TMDBHelper
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+        from app.tmdb.client import TMDBHelper
 
         chat_id = self._select_chat_id(provider)
         image_url = TMDBHelper.image_url(details)

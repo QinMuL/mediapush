@@ -60,19 +60,23 @@ class TMDBHelper:
 
     def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None:
+            headers = {"Accept": "application/json"}
+            # v4 read access token（eyJ 开头 JWT）走 Bearer header，避免 URL/日志泄露；
+            # v3 API key（32 位 hex）不支持 Bearer，改走 query 参数（_get 中注入）。
+            if self.api_key.startswith("eyJ"):
+                headers["Authorization"] = f"Bearer {self.api_key}"
             self._client = httpx.AsyncClient(
                 proxy=self.proxy_url or None,
                 timeout=httpx.Timeout(15.0),
-                headers={
-                    "Accept": "application/json",
-                    # api_key 走 header 避免 URL/日志泄露
-                    "Authorization": f"Bearer {self.api_key}",
-                },
+                headers=headers,
             )
         return self._client
 
     async def _get(self, path: str, params: dict) -> dict:
         params = {**params, "language": self.language}
+        # v3 key 走 query 参数（v4 token 已走 Bearer header，不重复注入）
+        if not self.api_key.startswith("eyJ"):
+            params["api_key"] = self.api_key
         client = self._ensure_client()
         last_exc: Exception | None = None
         for attempt in range(4):
