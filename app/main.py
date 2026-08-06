@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import signal
 
 from app.config import Settings
 from app.core.container import Container
@@ -33,9 +32,9 @@ def main() -> None:
         logger.error("TG_BOT_TOKEN 未配置，无法启动 Bot。请填写 .env 后重试。")
         return
 
-    # SIGTERM 优雅退出（Docker stop 用）
-    signal.signal(signal.SIGTERM, lambda *_: None)
-
+    # SIGTERM 由 PTB run_polling 内置处理 → 触发 post_stop/post_shutdown
+    # 优雅清理 TMDB/缓存资源（见 bot.py _post_shutdown）。勿覆盖 signal.signal，
+    # 否则 PTB 收不到 SIGTERM，container.close() 不执行。
     logger.info("启动 Telegram Bot ...")
     container.telegram.run()
 

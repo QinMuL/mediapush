@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 
 from app.parser.media_parser import AggregatedMedia, analyze_share
@@ -76,8 +77,11 @@ class ShareProcessor:
             return PrepareResult(False, f"分享 {parsed.code} 已推送过，跳过")
 
         # 2. 读取分享内容（ed2k 为纯字符串解析，115 为联网读取）
+        t0 = time.time()
         files = await provider.list_share(parsed.code, parsed.password)
-        logger.info("读取分享：%d 个条目（%s）", len(files), parsed.provider)
+        logger.info(
+            "读取分享：%d 个条目（%s，耗时 %.1fs）", len(files), parsed.provider, time.time() - t0
+        )
 
         # 3. 文件名聚合
         media = analyze_share(files)
@@ -88,6 +92,7 @@ class ShareProcessor:
 
         # 4. TMDB 匹配
         # 优先用文件名/目录名标注的 {tmdb-XXX}（分享者明确指定，最可靠）
+        t1 = time.time()
         tmdb_id = None
         mtype = media.media_type
         details = None
@@ -114,8 +119,8 @@ class ShareProcessor:
             details = await self.tmdb.get_details(tmdb_id, mtype)
 
         logger.info(
-            "TMDB 命中：%s（id=%s，%s）",
-            details.get("title") or media.title, tmdb_id, mtype,
+            "TMDB 命中：%s（id=%s，%s，耗时 %.1fs）",
+            details.get("title") or media.title, tmdb_id, mtype, time.time() - t1,
         )
 
         return PrepareResult(

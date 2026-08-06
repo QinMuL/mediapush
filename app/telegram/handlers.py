@@ -15,6 +15,7 @@ import logging
 import re
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -24,14 +25,13 @@ from telegram.ext import (
     filters,
 )
 
-from app.core.link_parser import parse_share, parse_shares
-from app.telegram.pusher import _send_with_retry
+from app.core.link_parser import ParsedShare, parse_share, parse_shares
 from app.telegram.edit_session import (
     MAX_QUALITY_EXTRA,
     EditSession,
     EditState,
 )
-from app.telegram.pusher import render_caption, render_text
+from app.telegram.pusher import _send_with_retry, render_caption, render_text
 
 # Pan115Error 容错导入：p115client 装坏时退化为 Exception，保留 except 语义
 try:
@@ -228,7 +228,7 @@ async def _flush_pending() -> None:
     logger.info("聚合完成 %d 个链接，开始批处理", len(unique))
     try:
         await _process_batch(update, context, unique)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.exception("聚合批处理失败")
 
 
@@ -346,8 +346,9 @@ async def _process_batch(update: Update, context, shares) -> None:
                 result = await container.processor.process(parsed)
             except Pan115Error as exc:
                 lines.append(f"⚠️ {_short_id(parsed)}：{exc}".replace("\n", " "))
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("处理分享失败")
+            except Exception as exc:
+                uid = update.effective_user.id if update.effective_user else None
+                logger.exception("处理分享失败：user=%s", uid)
                 lines.append(f"⚠️ {_short_id(parsed)}：{exc}".replace("\n", " "))
             else:
                 lines.append(_summarize_line(parsed, result))
@@ -408,7 +409,7 @@ async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Pan115Error as exc:
         await _edit(placeholder, f"❌ 115 错误：{exc}")
         return
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.exception("prepare 失败")
         await _edit(placeholder, f"❌ 处理失败：{exc}")
         return
@@ -625,7 +626,7 @@ async def _confirm_push(
             session.files, provider=session.provider,
             quality_extra=session.quality_extra, is_premium=session.is_premium,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.exception("确认推送失败")
         await _edit_preview_text(bot, session, f"⚠️ 推送失败：{exc}")
         return
@@ -702,8 +703,15 @@ async def setup_commands(application: Application) -> None:
 
 
 async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """全局错误处理：记录异常日志，避免静默失败导致 Bot 无响应。"""
-    logger.error("处理异常：%s", context.error, exc_info=context.error)
+    """全局错误处理：网络异常降级 WARN（PTB 自动重连），其他 ERROR + 用户上下文。"""
+    err = context.error
+    if isinstance(err, (NetworkError, TimedOut)):
+        logger.warning("TG 网络异常（PTB 将自动重连）：%s", err)
+        return
+    user_id = None
+    if isinstance(update, Update) and update.effective_user:
+        user_id = update.effective_user.id
+    logger.error("处理异常：user=%s %s", user_id, err, exc_info=err)
 
 
 # ---------------------------------------------------------------------- #

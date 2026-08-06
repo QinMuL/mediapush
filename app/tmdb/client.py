@@ -63,12 +63,16 @@ class TMDBHelper:
             self._client = httpx.AsyncClient(
                 proxy=self.proxy_url or None,
                 timeout=httpx.Timeout(15.0),
-                headers={"Accept": "application/json"},
+                headers={
+                    "Accept": "application/json",
+                    # api_key 走 header 避免 URL/日志泄露
+                    "Authorization": f"Bearer {self.api_key}",
+                },
             )
         return self._client
 
     async def _get(self, path: str, params: dict) -> dict:
-        params = {**params, "api_key": self.api_key, "language": self.language}
+        params = {**params, "language": self.language}
         client = self._ensure_client()
         last_exc: Exception | None = None
         for attempt in range(4):

@@ -39,11 +39,24 @@ class TelegramService:
         from app.telegram.handlers import register, setup_commands
         from app.telegram.pusher import Pusher
 
+        async def _post_stop(app):
+            logger.info("Bot polling 已停止")
+
+        async def _post_shutdown(app):
+            # 关闭时清理 TMDB/缓存资源（telegram 生命周期由 PTB 自管，不在此 stop）
+            logger.info("Bot 关闭：清理 TMDB/缓存资源")
+            if self.container.tmdb is not None:
+                await self.container.tmdb.close()
+            if self.container.cache is not None:
+                await self.container.cache.close()
+
         builder = (
             ApplicationBuilder()
             .token(self.settings.tg_bot_token)
             .concurrent_updates(True)
             .post_init(setup_commands)  # 启动时清除旧菜单并注册新命令
+            .post_stop(_post_stop)  # 停止时记录状态
+            .post_shutdown(_post_shutdown)  # 关闭时清理 TMDB/缓存资源
             # 代理场景下默认超时（read=2s）太短，长轮询/发送容易超时拖死轮询循环
             .read_timeout(30)
             .write_timeout(30)

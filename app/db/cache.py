@@ -4,6 +4,7 @@
 - TMDB 缓存统一 24 小时（ttl_days=1），不区分连载/完结
 - upsert 时刷新 fetched_at（前序 bug：缓存时间戳不刷新导致不过期）
 - get_tmdb 读到过期行时物理删除（自动清除，非惰性残留）
+- 持久连接：长连接 + 启动建表一次，避免每次操作重连+executescript 开销
 """
 
 from __future__ import annotations
@@ -36,20 +37,37 @@ CREATE TABLE IF NOT EXISTS pushed_shares (
 class Cache:
     def __init__(self, db_path: str = "./data/cache.db") -> None:
         self.db_path = db_path
+        self._db: aiosqlite.Connection | None = None
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
+    async def connect(self) -> None:
+        """建长连接 + 建表一次（幂等）。首次操作时懒连接，避免改 build 同步签名。"""
+        if self._db is not None:
+            return
+        self._db = await aiosqlite.connect(self.db_path)
+        await self._db.executescript(_SCHEMA)
+        await self._db.commit()
+
+    async def _ensure(self) -> aiosqlite.Connection:
+        if self._db is None:
+            await self.connect()
+        return self._db
+
     async def _execute(self, sql: str, params: tuple = ()) -> aiosqlite.Cursor:
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.executescript(_SCHEMA)
-            cur = await db.execute(sql, params)
-            await db.commit()
-            return cur
+        db = await self._ensure()
+        cur = await db.execute(sql, params)
+        await db.commit()
+        return cur
 
     async def _fetchone(self, sql: str, params: tuple = ()) -> tuple | None:
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.executescript(_SCHEMA)
-            cur = await db.execute(sql, params)
-            return await cur.fetchone()
+        db = await self._ensure()
+        cur = await db.execute(sql, params)
+        return await cur.fetchone()
+
+    async def close(self) -> None:
+        if self._db is not None:
+            await self._db.close()
+            self._db = None
 
     # ------------------------------------------------------------------ #
     # TMDB 缓存

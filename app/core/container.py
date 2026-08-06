@@ -92,5 +92,7 @@ class Container:
     async def close(self) -> None:
         if self.tmdb is not None:
             await self.tmdb.close()
+        if self.cache is not None:
+            await self.cache.close()
         if self.telegram is not None:
             await self.telegram.stop()
