@@ -254,9 +254,15 @@ def _render_season_block(details: dict, media: AggregatedMedia) -> str:
 
     # 集数行：按季渲染实际集数范围
     final_eps = file_season_eps
-    # 文件名单季但 TMDB 多季 → 用 TMDB 季范围重新分配全局集号
-    # 但 S00（特别篇）不参与重分配：文件名已显式标注 season 0
-    if len(file_season_eps) == 1 and 0 not in file_season_eps and len(tmdb_seasons) > 1:
+    # 仅 S01（可能默认标注）+ 全局集号才重分配：文件名只有 S01Exxx 但 TMDB 有多季，
+    # 用 TMDB 季范围把全局集号拆分到各季。S02+ 显式标注，集号是按季的，不重分配。
+    # S00（特别篇）也不参与重分配。
+    if (
+        len(file_season_eps) == 1
+        and 0 not in file_season_eps
+        and 1 in file_season_eps
+        and len(tmdb_seasons) > 1
+    ):
         all_eps = next(iter(file_season_eps.values()))
         reallocated = _reallocate_by_tmdb(all_eps, tmdb_seasons)
         if reallocated:
