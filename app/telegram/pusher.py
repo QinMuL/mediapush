@@ -229,8 +229,20 @@ def _render_season_block(details: dict, media: AggregatedMedia) -> str:
     else:
         season_str = ""
 
-    # TMDB 总集数：多季用整剧 number_of_episodes，单季用该季 episode_count
-    if len(seasons_list) > 1 or media.season is None:
+    # TMDB 总集数：只统计分享中包含的季，而非整剧总集数
+    if len(seasons_list) > 1:
+        # 多季：TMDB 覆盖分享中所有季时精确统计，否则回退整剧总集数
+        season_set = set(seasons_list)
+        tmdb_season_nums = {s.get("season") for s in tmdb_seasons}
+        if season_set <= tmdb_season_nums:
+            tmdb_eps = sum(
+                s.get("episode_count") or 0
+                for s in tmdb_seasons
+                if s.get("season") in season_set
+            )
+        else:
+            tmdb_eps = details.get("number_of_episodes") or 0
+    elif media.season is None:
         tmdb_eps = details.get("number_of_episodes") or 0
     else:
         tmdb_eps = 0
