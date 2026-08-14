@@ -80,6 +80,43 @@ docker compose logs -f
 - `./data` 持久化 SQLite 缓存与去重记录。
 - 停止：`docker compose down`。
 
+### 健康检查（心跳机制）
+
+容器配有 Docker HEALTHCHECK，能检测 Bot 进程"卡死但未崩溃"的场景（如 polling 网络挂起），配合 `restart: unless-stopped` 自动恢复。
+
+**工作原理**：
+
+| 组件 | 文件 | 说明 |
+|------|------|------|
+| 心跳写入 | `app/telegram/bot.py` | Bot `post_init` 启动异步任务，每 30s `touch /tmp/.heartbeat` |
+| 健康检查 | `docker-compose.yml` | 每 30s 检查心跳文件 mtime 是否在 120s 内，连续 3 次失败标记 `unhealthy` |
+
+**关键参数**（`bot.py` 顶部常量 + `docker-compose.yml` healthcheck 段）：
+
+```
+bot.py:
+  _HEARTBEAT_FILE     = /tmp/.heartbeat     # 心跳文件路径（容器内 /tmp，重启自动清除）
+  _HEARTBEAT_INTERVAL = 30s                 # 写入间隔
+
+docker-compose.yml:
+  interval     = 30s    # 检查间隔
+  timeout      = 10s    # 单次检查超时
+  start_period = 15s    # 启动宽限期（此期间失败不计入 retries）
+  retries      = 3      # 连续失败次数 → unhealthy
+  阈值         = 120s   # 心跳文件 mtime 超过 120s 判定失败
+```
+
+**检测时序**：Bot 卡死后，心跳停止更新 → 约 2min 后（120s 阈值 + 3 次 retries）容器标记 `unhealthy` → Docker 触发重启。
+
+**查看健康状态**：
+
+```bash
+docker inspect mediapush --format '{{.State.Health.Status}}'
+# healthy / unhealthy / starting
+```
+
+**调优**：如需更快检测，减小 `docker-compose.yml` 中的阈值（`120`）或增加 `retries`；如需减少误报，增大阈值。修改后 `docker compose up -d` 重建容器生效。
+
 ---
 
 ## 四、使用
@@ -122,7 +159,7 @@ app/
 ├── tmdb/
 │   └── client.py        # TMDB API（搜索带年回退/详情/海报/集数 + 缓存）
 ├── telegram/
-│   ├── bot.py           # PTB Application（concurrent_updates + 代理）
+│   ├── bot.py           # PTB Application（concurrent_updates + 代理 + 心跳）
 │   ├── handlers.py      # 命令 + 裸链接处理
 │   └── pusher.py        # 卡片渲染 + 推送
 └── db/
@@ -152,6 +189,7 @@ ruff check .
 - **Telegram**：`concurrent_updates(True)`（否则长 handler 阻塞队列）；handler 经 `bot_data` 注入 container，不访问私有属性；TG 走代理。
 - **TMDB**：4xx 不重试 / 429·5xx·超时指数退避重试；带年搜无果回退无年；连载剧缓存 3 天、已完结 30 天，upsert 刷新时间戳。
 - **代理分发**：TG + TMDB 走代理，115 默认不走。
+- **健康检查**：Bot `post_init` 启动心跳任务（每 30s 写 `/tmp/.heartbeat`），Docker HEALTHCHECK 检查文件新鲜度（120s 阈值），卡死时自动重启。详见部署章节。
 - 扩展新网盘：继承 `BaseShareProvider` 实现 `list_share`/`check_health`，在 `link_parser` 注册解析，在 `container` 注册实例，上层零改动。
 
 ---
