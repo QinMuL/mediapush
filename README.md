@@ -80,23 +80,32 @@ docker compose logs -f
 - `./data` 持久化 SQLite 缓存与去重记录。
 - 停止：`docker compose down`。
 
-### 健康检查（心跳机制）
+### 健康检查与自愈（心跳机制）
 
-容器配有 Docker HEALTHCHECK，能检测 Bot 进程"卡死但未崩溃"的场景（如 polling 网络挂起），配合 `restart: unless-stopped` 自动恢复。
+容器配有 Docker HEALTHCHECK + 应用级自愈探活，覆盖两类故障场景，**无需人工重启**：
+
+| 故障场景 | 检测方式 | 恢复方式 | 耗时 |
+|---------|---------|---------|------|
+| 进程崩溃 | Docker 检测 PID 退出 | `restart: unless-stopped` 自动重启 | 即时 |
+| Bot 卡死（事件循环冻结） | 心跳文件停止更新 → HEALTHCHECK 标记 `unhealthy` | 监控告警（需外部 autoheal 容器才自动重启） | ~2min |
+| PTB polling 断联（进程活着但网络挂） | 心跳任务每 90s 调 TG API 探活，连续 3 次失败 → `os._exit(1)` | 进程退出 → Docker 自动重启 | ~4.5min |
 
 **工作原理**：
 
 | 组件 | 文件 | 说明 |
 |------|------|------|
 | 心跳写入 | `app/telegram/bot.py` | Bot `post_init` 启动异步任务，每 30s `touch /tmp/.heartbeat` |
-| 健康检查 | `docker-compose.yml` | 每 30s 检查心跳文件 mtime 是否在 120s 内，连续 3 次失败标记 `unhealthy` |
+| 自愈探活 | `app/telegram/bot.py` | 每 90s 调 `bot.get_me()` 探活，连续 3 次失败强制退出 |
+| Docker 检查 | `docker-compose.yml` | 每 30s 检查心跳文件 mtime 是否在 120s 内，标记 `unhealthy` |
 
 **关键参数**（`bot.py` 顶部常量 + `docker-compose.yml` healthcheck 段）：
 
 ```
 bot.py:
-  _HEARTBEAT_FILE     = /tmp/.heartbeat     # 心跳文件路径（容器内 /tmp，重启自动清除）
-  _HEARTBEAT_INTERVAL = 30s                 # 写入间隔
+  _HEARTBEAT_FILE     = /tmp/.heartbeat   # 心跳文件路径（容器内 /tmp，重启自动清除）
+  _HEARTBEAT_INTERVAL = 30s               # 心跳写入间隔
+  _PROBE_EVERY        = 3                 # 每 3 个心跳周期（90s）探活一次
+  _PROBE_MAX_FAIL     = 3                 # 连续 3 次失败 → os._exit(1)
 
 docker-compose.yml:
   interval     = 30s    # 检查间隔
@@ -106,8 +115,6 @@ docker-compose.yml:
   阈值         = 120s   # 心跳文件 mtime 超过 120s 判定失败
 ```
 
-**检测时序**：Bot 卡死后，心跳停止更新 → 约 2min 后（120s 阈值 + 3 次 retries）容器标记 `unhealthy` → Docker 触发重启。
-
 **查看健康状态**：
 
 ```bash
@@ -115,7 +122,7 @@ docker inspect mediapush --format '{{.State.Health.Status}}'
 # healthy / unhealthy / starting
 ```
 
-**调优**：如需更快检测，减小 `docker-compose.yml` 中的阈值（`120`）或增加 `retries`；如需减少误报，增大阈值。修改后 `docker compose up -d` 重建容器生效。
+**调优**：如需更快检测，减小 `_PROBE_MAX_FAIL` 或 `_PROBE_EVERY`；如需减少误报，增大。修改后需重新构建镜像生效。
 
 ---
 

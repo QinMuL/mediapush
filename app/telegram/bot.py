@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -18,6 +19,10 @@ logger = logging.getLogger(__name__)
 # Docker HEALTHCHECK 检查 mtime 判断 Bot 是否存活（卡死检测）。
 _HEARTBEAT_FILE = Path("/tmp/.heartbeat")
 _HEARTBEAT_INTERVAL = 30  # 秒
+# 自愈探活：每 _PROBE_EVERY 个心跳周期调一次 TG API，连续 _PROBE_MAX_FAIL 次失败则强制退出。
+# 进程退出后 Docker restart 策略自动重启，无需人工干预。
+_PROBE_EVERY = 3  # 每 3 个心跳周期（90s）探活一次
+_PROBE_MAX_FAIL = 3  # 连续 3 次失败（~4.5min）→ os._exit(1)
 
 
 class TelegramService:
@@ -61,18 +66,39 @@ class TelegramService:
             if self.container.cache is not None:
                 await self.container.cache.close()
 
-        async def _heartbeat_loop():
-            """定期写心跳文件，供 Docker HEALTHCHECK 检测 Bot 是否存活。"""
+        async def _heartbeat_loop(app):
+            """心跳 + 自愈探活。
+
+            每 30s 写心跳文件（Docker HEALTHCHECK 用）；
+            每 90s 调 TG API 探活，连续失败则 os._exit 触发 Docker 自动重启。
+            覆盖场景：PTB polling 网络异常后未自动恢复（进程活着但断联）。
+            """
+            fail_count = 0
+            tick = 0
             while True:
+                # 心跳文件
                 try:
                     _HEARTBEAT_FILE.touch()
                 except OSError:
                     pass
+                # 探活（每 _PROBE_EVERY 个周期）
+                tick += 1
+                if tick >= _PROBE_EVERY:
+                    tick = 0
+                    try:
+                        await app.bot.get_me()
+                        fail_count = 0
+                    except Exception as exc:  # noqa: BLE001
+                        fail_count += 1
+                        logger.warning("自愈探活失败（第 %d/%d 次）：%s", fail_count, _PROBE_MAX_FAIL, exc)
+                        if fail_count >= _PROBE_MAX_FAIL:
+                            logger.error("连续 %d 次探活失败，强制退出以触发 Docker 重启", fail_count)
+                            os._exit(1)
                 await asyncio.sleep(_HEARTBEAT_INTERVAL)
 
         async def _post_init(app):
             await setup_commands(app)
-            app.bot_data["_heartbeat_task"] = asyncio.create_task(_heartbeat_loop())
+            app.bot_data["_heartbeat_task"] = asyncio.create_task(_heartbeat_loop(app))
 
         builder = (
             ApplicationBuilder()
