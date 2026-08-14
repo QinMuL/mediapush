@@ -8,9 +8,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# 心跳文件：Bot 主循环每 _HEARTBEAT_INTERVAL 秒 touch 一次，
+# Docker HEALTHCHECK 检查 mtime 判断 Bot 是否存活（卡死检测）。
+_HEARTBEAT_FILE = Path("/tmp/.heartbeat")
+_HEARTBEAT_INTERVAL = 30  # 秒
 
 
 class TelegramService:
@@ -43,6 +50,10 @@ class TelegramService:
             logger.info("Bot polling 已停止")
 
         async def _post_shutdown(app):
+            # 取消心跳任务
+            task = app.bot_data.pop("_heartbeat_task", None)
+            if task and not task.done():
+                task.cancel()
             # 关闭时清理 TMDB/缓存资源（telegram 生命周期由 PTB 自管，不在此 stop）
             logger.info("Bot 关闭：清理 TMDB/缓存资源")
             if self.container.tmdb is not None:
@@ -50,11 +61,24 @@ class TelegramService:
             if self.container.cache is not None:
                 await self.container.cache.close()
 
+        async def _heartbeat_loop():
+            """定期写心跳文件，供 Docker HEALTHCHECK 检测 Bot 是否存活。"""
+            while True:
+                try:
+                    _HEARTBEAT_FILE.touch()
+                except OSError:
+                    pass
+                await asyncio.sleep(_HEARTBEAT_INTERVAL)
+
+        async def _post_init(app):
+            await setup_commands(app)
+            app.bot_data["_heartbeat_task"] = asyncio.create_task(_heartbeat_loop())
+
         builder = (
             ApplicationBuilder()
             .token(self.settings.tg_bot_token)
             .concurrent_updates(True)
-            .post_init(setup_commands)  # 启动时清除旧菜单并注册新命令
+            .post_init(_post_init)  # 注册命令 + 启动心跳
             .post_stop(_post_stop)  # 停止时记录状态
             .post_shutdown(_post_shutdown)  # 关闭时清理 TMDB/缓存资源
             # 代理场景下默认超时（read=2s）太短，长轮询/发送容易超时拖死轮询循环

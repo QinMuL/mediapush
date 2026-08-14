@@ -18,3 +18,11 @@ services:
         max-file: "3"
     volumes:
       - ./data:/app/data
+    # 健康检查：Bot 每 30s 写 /tmp/.heartbeat，此处检查文件是否在 120s 内更新过。
+    # 连续 3 次失败（~2min）标记 unhealthy，配合 restart 策略自动恢复卡死场景。
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import os,time; exit(0 if time.time()-os.path.getmtime('/tmp/.heartbeat')<120 else 1)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
