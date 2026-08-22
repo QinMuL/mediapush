@@ -45,10 +45,11 @@ _LEVEL_TAG = {
     logging.CRITICAL: "FATAL",
 }
 
-# 噪声库降级（PTB/httpx 等默认 INFO 太啰嗦）
+# 噪声库降级（PTB/httpx 等默认 INFO 太啰嗦；httpcore 为 httpx 底层，DEBUG 刷屏）
 _NOISY_LOGGERS: dict[str, int] = {
     "telegram": logging.WARNING,
     "httpx": logging.WARNING,
+    "httpcore": logging.WARNING,
     "urllib3": logging.WARNING,
     "asyncio": logging.WARNING,
     "p115client": logging.WARNING,
