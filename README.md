@@ -59,8 +59,9 @@ cp .env.example .env
 | `PAN115_COOKIE` | 115 cookie（**可选**，留空走匿名读取） |
 | `PAN115_USE_PROXY` | 115 是否走代理，默认 `false` |
 | `PROXY_URL` | TG/TMDB 代理地址 |
-| `LOG_LEVEL` | 日志级别，默认 `INFO` |
+| `LOG_LEVEL` | 控制台日志级别，默认 `INFO`（文件日志恒为 `DEBUG` 全量） |
 | `DB_PATH` | SQLite 缓存路径，默认 `./data/cache.db` |
+| `LOG_FILE` | 文件日志路径，默认 `./data/logs/mediapush.log`（按天轮转，保留 14 天） |
 
 ---
 
@@ -73,29 +74,55 @@ docker compose up -d --build
 查看日志：
 
 ```bash
-docker compose logs -f
+docker compose logs -f          # 实时控制台日志（INFO 故事线）
+docker compose logs --since 1h  # 最近 1 小时
 ```
 
 - 容器通过 `extra_hosts: host.docker.internal:host-gateway` 映射宿主机，`PROXY_URL` 可填 `http://host.docker.internal:7890` 访问宿主机代理。
 - `./data` 持久化 SQLite 缓存与去重记录。
 - 停止：`docker compose down`。
 
+### 日志体系（双通道分级）
+
+| 通道 | 级别 | 内容 | 用途 |
+|------|------|------|------|
+| 控制台（`docker compose logs`） | INFO（`LOG_LEVEL` 可调） | 故事线：收到链接 → 读取 → TMDB 命中 → 推送结果 | 日常观察 |
+| 文件（`./data/logs/`） | DEBUG（全量） | 上述 + DEBUG 细节 + 第三方库 WARNING | 排障定位 |
+
+文件日志**按天轮转**：每天午夜切分，保留 14 天，过期自动删除。
+
+```
+data/logs/
+├── mediapush.log              # 当天日志
+├── mediapush.log.2026-08-21   # 昨天（自动生成）
+├── mediapush.log.2026-08-20
+└── ...（最多保留 14 天）
+```
+
+排障示例：Bot 不响应时先看当天文件里的探活/polling 日志：
+
+```bash
+tail -100 data/logs/mediapush.log
+grep -E "探活|polling|推送" data/logs/mediapush.log
+```
+
 ### 健康检查与自愈（心跳机制）
 
-容器配有 Docker HEALTHCHECK + 应用级自愈探活，覆盖两类故障场景，**无需人工重启**：
+容器配有 Docker HEALTHCHECK + 应用级自愈探活，覆盖三类故障场景，**无需人工重启**：
 
 | 故障场景 | 检测方式 | 恢复方式 | 耗时 |
 |---------|---------|---------|------|
-| 进程崩溃 | Docker 检测 PID 退出 | `restart: unless-stopped` 自动重启 | 即时 |
+| 进程崩溃 | Docker 检测 PID 退出 | `restart: always` 自动重启 | 即时 |
 | Bot 卡死（事件循环冻结） | 心跳文件停止更新 → HEALTHCHECK 标记 `unhealthy` | 监控告警（需外部 autoheal 容器才自动重启） | ~2min |
-| PTB polling 断联（进程活着但网络挂） | 心跳任务每 90s 调 TG API 探活，连续 3 次失败 → `os._exit(1)` | 进程退出 → Docker 自动重启 | ~4.5min |
+| PTB polling 静默死亡（任务退出但进程活着） | 心跳任务每 90s 检查内部 polling task 状态，`done` 即强制退出 | 进程退出 → Docker 自动重启 | ~90s |
+| 代理长期断联（网络探活失败） | 心跳任务每 90s 调 TG API 探活，连续 3 次失败 → `os._exit(1)` | 进程退出 → Docker 自动重启 | ~4.5min |
 
 **工作原理**：
 
 | 组件 | 文件 | 说明 |
 |------|------|------|
 | 心跳写入 | `app/telegram/bot.py` | Bot `post_init` 启动异步任务，每 30s `touch /tmp/.heartbeat` |
-| 自愈探活 | `app/telegram/bot.py` | 每 90s 调 `bot.get_me()` 探活，连续 3 次失败强制退出 |
+| 自愈探活 | `app/telegram/bot.py` | 每 90s 双重探活：polling task 活性 + `bot.get_me()` 网络连通 |
 | Docker 检查 | `docker-compose.yml` | 每 30s 检查心跳文件 mtime 是否在 120s 内，标记 `unhealthy` |
 
 **关键参数**（`bot.py` 顶部常量 + `docker-compose.yml` healthcheck 段）：

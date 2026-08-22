@@ -43,11 +43,33 @@ def test_formatter_has_color_when_enabled():
 
 
 def test_setup_logging_sets_root_level():
-    """setup_logging 设置根级别 + 噪声库降级。"""
-    setup_logging("DEBUG", use_color=False)
-    assert logging.getLogger().level == logging.DEBUG
+    """root 恒 DEBUG（由 handler 过滤）+ 控制台级别生效 + 噪声库降级。"""
+    setup_logging("INFO", use_color=False)
+    assert logging.getLogger().level == logging.DEBUG  # root 放开，handler 各自过滤
+    console = logging.getLogger().handlers[0]
+    assert console.level == logging.INFO
     assert logging.getLogger("telegram").level == logging.WARNING
     assert logging.getLogger("httpx").level == logging.WARNING
+    # 恢复
+    setup_logging("INFO", use_color=False)
+
+
+def test_file_debug_console_info_split(tmp_path, capsys):
+    """分级：控制台 INFO（DEBUG 不进），文件 DEBUG（全量）。"""
+    log_file = tmp_path / "logs" / "app.log"
+    setup_logging("INFO", use_color=False, log_file=str(log_file))
+    logging.getLogger("test.split").debug("debug-only-detail")
+    logging.getLogger("test.split").info("info-story")
+    for h in logging.getLogger().handlers:
+        h.flush()
+    # 控制台：只有 INFO
+    captured = capsys.readouterr()
+    assert "debug-only-detail" not in captured.out
+    assert "info-story" in captured.out
+    # 文件：DEBUG + INFO 全量
+    content = log_file.read_text(encoding="utf-8")
+    assert "debug-only-detail" in content
+    assert "info-story" in content
     # 恢复
     setup_logging("INFO", use_color=False)
 

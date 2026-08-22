@@ -191,12 +191,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     shares = parse_shares(text)
     if not shares:
         return
+    uid = update.effective_user.id if update.effective_user else "?"
     # 单链接且无聚合中 → 立即直推
     if len(shares) == 1 and not _pending_shares:
-        logger.info("收到链接：%s", shares[0].provider)
+        logger.info("收到链接：%s（user=%s）", shares[0].provider, uid)
         await _process(update, context, shares[0])
         return
     # 多链接或聚合中 → 缓冲聚合
+    logger.info("收到链接：%d 个（user=%s，进入聚合）", len(shares), uid)
     _pending_shares.extend(shares)
     if _pending_update is None:
         _pending_update = update

@@ -25,6 +25,51 @@ _PROBE_EVERY = 3  # 每 3 个心跳周期（90s）探活一次
 _PROBE_MAX_FAIL = 3  # 连续 3 次失败（~4.5min）→ os._exit(1)
 
 
+async def _heartbeat_loop(app) -> None:
+    """心跳 + 自愈探活（模块级，便于单测）。
+
+    每 30s 写心跳文件（Docker HEALTHCHECK 用）；
+    每 90s 双重探活，异常时 os._exit 触发 Docker 自动重启：
+    1) polling 任务活性：PTB 的 network_retry_loop 因意外异常退出时
+       updater.running 标志仍为 True（进程"健康"但永远收不到消息），
+       检查内部 polling task 是否 done 能捕获此场景；
+    2) 网络连通：get_me 探测 bot client（代理/httpx 连接池卡死）。
+    """
+    fail_count = 0
+    tick = 0
+    while True:
+        # 心跳文件
+        try:
+            _HEARTBEAT_FILE.touch()
+        except OSError:
+            pass
+        # 探活（每 _PROBE_EVERY 个周期）
+        tick += 1
+        if tick >= _PROBE_EVERY:
+            tick = 0
+            # 1) polling 任务活性（done 且 running 标志仍 True = 静默死亡）
+            task = getattr(app.updater, "_Updater__polling_task", None)
+            if task is not None and task.done() and app.updater.running:
+                exc = None
+                try:
+                    exc = task.exception()
+                except asyncio.CancelledError:
+                    exc = "cancelled"
+                logger.error("polling 任务已静默死亡（%s），强制退出以触发 Docker 重启", exc)
+                os._exit(1)
+            # 2) 网络连通性
+            try:
+                await app.bot.get_me()
+                fail_count = 0
+            except Exception as exc:  # noqa: BLE001
+                fail_count += 1
+                logger.warning("自愈探活失败（第 %d/%d 次）：%s", fail_count, _PROBE_MAX_FAIL, exc)
+                if fail_count >= _PROBE_MAX_FAIL:
+                    logger.error("连续 %d 次探活失败，强制退出以触发 Docker 重启", fail_count)
+                    os._exit(1)
+        await asyncio.sleep(_HEARTBEAT_INTERVAL)
+
+
 class TelegramService:
     def __init__(self, settings, container) -> None:
         self.settings = settings
@@ -65,36 +110,6 @@ class TelegramService:
                 await self.container.tmdb.close()
             if self.container.cache is not None:
                 await self.container.cache.close()
-
-        async def _heartbeat_loop(app):
-            """心跳 + 自愈探活。
-
-            每 30s 写心跳文件（Docker HEALTHCHECK 用）；
-            每 90s 调 TG API 探活，连续失败则 os._exit 触发 Docker 自动重启。
-            覆盖场景：PTB polling 网络异常后未自动恢复（进程活着但断联）。
-            """
-            fail_count = 0
-            tick = 0
-            while True:
-                # 心跳文件
-                try:
-                    _HEARTBEAT_FILE.touch()
-                except OSError:
-                    pass
-                # 探活（每 _PROBE_EVERY 个周期）
-                tick += 1
-                if tick >= _PROBE_EVERY:
-                    tick = 0
-                    try:
-                        await app.bot.get_me()
-                        fail_count = 0
-                    except Exception as exc:  # noqa: BLE001
-                        fail_count += 1
-                        logger.warning("自愈探活失败（第 %d/%d 次）：%s", fail_count, _PROBE_MAX_FAIL, exc)
-                        if fail_count >= _PROBE_MAX_FAIL:
-                            logger.error("连续 %d 次探活失败，强制退出以触发 Docker 重启", fail_count)
-                            os._exit(1)
-                await asyncio.sleep(_HEARTBEAT_INTERVAL)
 
         async def _post_init(app):
             await setup_commands(app)

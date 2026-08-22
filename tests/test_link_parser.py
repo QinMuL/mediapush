@@ -99,7 +99,7 @@ def test_ed2k_invalid_hash_rejected():
 
 
 # -------------------- parse_shares 多链接 -------------------- #
-from app.core.link_parser import parse_shares  # noqa: E402
+from app.core.link_parser import parse_shares
 
 _MULTI_MSG = """
 https://115cdn.com/s/swslhhz3nu1?password=c0a6#

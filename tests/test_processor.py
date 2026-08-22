@@ -171,7 +171,7 @@ def test_tmdb_not_configured():
 
 
 # -------------------- ed2k 路由 -------------------- #
-from app.providers.ed2k import Ed2kProvider  # noqa: E402
+from app.providers.ed2k import Ed2kProvider
 
 _ED2K_URL = (
     "ed2k://|file|宾虚 (1959) - 2160p.BluRay REMUX.DoVi P7.H.265.10-bit.23.976fps.TrueHD 7.1-WF.mkv"
