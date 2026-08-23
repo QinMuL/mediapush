@@ -293,11 +293,11 @@ def _render_season_block(details: dict, media: AggregatedMedia) -> str:
         prefix = f"{season_str} " if season_str else ""
         lines.append(f"📋 集数：{prefix}{ep_range}")
 
-    # 状态行：TMDB 网站状态（连载中/已完结/...）
+    # 状态行：TMDB 网站状态（连载中/已完结/...）；未映射值转义防 HTML 注入
     status_raw = details.get("status") or ""
     if status_raw:
         status_zh = _STATUS_MAP.get(status_raw, status_raw)
-        lines.append(f"⚙️ 状态：{status_zh}")
+        lines.append(f"⚙️ 状态：{_esc(status_zh)}")
 
     if not lines:
         return ""
@@ -431,10 +431,17 @@ def _file_sort_key(f: ShareFile) -> tuple:
 
 
 def _render_files_block(
-    files: list[ShareFile], *, max_items: int | None = None, provider: str = "115"
+    files: list[ShareFile],
+    *,
+    max_items: int | None = None,
+    provider: str = "115",
+    files_sorted: list[ShareFile] | None = None,
 ) -> str:
-    """文件清单可展开模块。max_items 限制显示前 N 项。"""
-    files_sorted = sorted(files, key=_file_sort_key)
+    """文件清单可展开模块。max_items 限制显示前 N 项。
+
+    files_sorted：调用方已排序的列表（截断搜索复用，避免大分享重复排序）。
+    """
+    files_sorted = files_sorted if files_sorted is not None else sorted(files, key=_file_sort_key)
     shown = files_sorted if max_items is None else files_sorted[:max_items]
     title = "📁 资源文件" if provider == "ed2k" else "📁 分享内容"
     lines = [f"<blockquote expandable>{title}（{len(files)} 项） · 点击展开"]
@@ -473,6 +480,9 @@ def _fit_caption(
 
     固定部分（必保）：head + quality_block + season_block + footer
     可变部分（按优先级截断）：文件清单 → 简介
+
+    性能：排序一次复用；减文件项数用二分查找（caption 长度随项数单调
+    不减），1166 文件从线性重试 ~3.6s 降到毫秒级，不再阻塞事件循环。
     """
     SEP = "\n\n"
 
@@ -489,7 +499,15 @@ def _fit_caption(
         parts.append(footer)
         return SEP.join(parts)
 
-    fb = _render_files_block(files, provider=provider) if files else ""
+    # 排序一次：完整渲染与截断二分复用
+    files_sorted = sorted(files, key=_file_sort_key) if files else None
+
+    def render_fb(n: int | None = None) -> str:
+        return _render_files_block(
+            files, max_items=n, provider=provider, files_sorted=files_sorted
+        )
+
+    fb = render_fb() if files else ""
     ob = _render_overview_block(overview) if overview else ""
 
     # 1. 完整
@@ -504,15 +522,19 @@ def _fit_caption(
         if len(body) <= limit:
             return body
 
-    # 3. 减文件项数
+    # 3. 减文件项数：二分找最大 n∈[1, len] 使 caption ≤ limit
     if files:
-        for n in range(len(files) - 1, 0, -1):
-            fb2 = _render_files_block(files, max_items=n, provider=provider)
-            body = build(fb2, ob)
-            if len(body) <= limit:
-                return body
-        # 全去掉文件清单
-        fb = ""
+        fb = ""  # 兜底：n=1 仍超限时去掉整个文件清单
+        if len(build(render_fb(1), ob)) <= limit:
+            lo, hi = 1, len(files)
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                fb_mid = render_fb(mid)
+                if len(build(fb_mid, ob)) <= limit:
+                    fb = fb_mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
         body = build(fb, ob)
         if len(body) <= limit:
             return body

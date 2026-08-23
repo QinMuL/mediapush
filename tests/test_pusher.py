@@ -160,6 +160,68 @@ def test_caption_truncates_overview_first():
     assert "已显示前" not in cap or "已显示前 4 项" not in cap
 
 
+# -------------------- 大分享截断性能（防 O(N²) 回归） -------------------- #
+def test_caption_binary_search_matches_linear_result():
+    """二分截断与旧线性算法结果一致：取最大可容纳文件项数。
+
+    独立实现线性基准（从 n=len 往下找第一个 ≤limit 的 n），
+    与 render_caption 的二分结果对比项数，锁行为等价。
+    """
+    from app.telegram.pusher import (
+        _CAPTION_LIMIT,
+        _fit_caption,
+        _render_files_block,
+        _render_footer,
+        _render_head,
+        _render_overview_block,
+        _render_quality_block,
+        _render_season_block,
+    )
+
+    files = _many_files(300)  # 中等规模即可验证等价性（线性基准不慢）
+    details, media = _tv_details(), _tv_media()
+    head = _render_head(details, media, files)
+    qb = _render_quality_block(media)
+    sb = _render_season_block(details, media)
+    footer = _render_footer("sw8k9m2", "ab12", "115")
+    overview = details.get("overview", "")
+
+    # 新算法（二分）
+    new_result = _fit_caption(head, qb, sb, footer, files, overview)
+
+    # 旧算法线性基准：从 n=len 往下找最大可行 n
+    ob = _render_overview_block(overview, limit=200)
+    def build(fb: str) -> str:
+        parts = [p for p in (head, qb, sb, fb, ob, footer) if p]
+        return "\n\n".join(parts)
+    linear_n = None
+    for n in range(len(files), 0, -1):
+        if len(build(_render_files_block(files, max_items=n))) <= _CAPTION_LIMIT:
+            linear_n = n
+            break
+    assert linear_n is not None, "n=1 应可容纳（构造数据需保证）"
+
+    # 新结果应展示与线性基准相同的项数
+    assert f"已显示前 {linear_n} 项" in new_result
+    assert len(new_result) <= _CAPTION_LIMIT
+
+
+def test_caption_large_share_performance():
+    """1166 文件大分享：截断耗时 <200ms（CI 机器余量；本地 ~10ms）。
+
+    旧线性实现实测 3.6s（阻塞事件循环），此处防性能回归。
+    """
+    import time
+
+    files = _many_files(1166)
+    t0 = time.perf_counter()
+    cap = render_caption(_tv_details(), _tv_media(), "sw8k9m2", "ab12", files)
+    dt = time.perf_counter() - t0
+    assert len(cap) <= 1024
+    assert "三体" in cap and "115.com" in cap
+    assert dt < 0.2, f"截断耗时 {dt*1000:.0f}ms，疑似回归 O(N²)"
+
+
 def test_caption_no_files_still_has_overview():
     """无文件清单时，caption 仍含简介模块。"""
     cap = render_caption(_tv_details(), _tv_media(), "abc12345", None, None)

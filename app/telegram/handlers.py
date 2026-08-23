@@ -289,7 +289,7 @@ def _summarize_line(parsed, result) -> str:
         title = (result.title or _short_id(parsed)).replace("\n", " ")
         year = f" ({result.year})" if result.year else ""
         return f"✅ {title}{year}"
-    if "已推送" in result.message:
+    if "已推送" in msg:
         title = (result.title or _short_id(parsed)).replace("\n", " ")
         return f"⏭️ {title}（已推送，跳过）"
     return f"⚠️ {_short_id(parsed)}：{msg}"
@@ -561,9 +561,13 @@ async def _edit_preview_text(bot, session: EditSession, text: str) -> None:
 
 
 async def on_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """编辑键盘回调：edit_quality / toggle_premium / confirm_push / cancel_edit。"""
+    """编辑键盘回调：edit_quality / toggle_premium / confirm_push / cancel_edit。
+
+    Telegram 每个 callback query 只能 answer 一次：校验分支（无权限/会话失效）
+    用弹窗 answer 并 return，正常路径过校验后统一 answer 一次。
+    先 answer 再校验会吞掉弹窗（二次 answer 抛 BadRequest）。
+    """
     q = update.callback_query
-    await q.answer()
     if not _is_admin(update, context):
         await q.answer("⛔ 无权限", show_alert=True)
         return
@@ -574,6 +578,7 @@ async def on_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await q.answer("会话已失效，请重新 /edit", show_alert=True)
         return
 
+    await q.answer()  # 正常路径 ack
     bot = context.bot
     data = q.data
 

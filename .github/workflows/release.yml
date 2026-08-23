@@ -66,6 +66,16 @@ jobs:
           echo "version_num=${next#v}" >> "$GITHUB_OUTPUT"
           echo "::notice::Next version: $next (skip=$skip, bump=$bump)"
 
+      - name: Install dependencies
+        if: steps.ver.outputs.skip != 'true'
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint & Test
+        if: steps.ver.outputs.skip != 'true'
+        run: |
+          ruff check app tests
+          pytest -q
+
       - name: Create & push tag
         if: steps.ver.outputs.skip != 'true'
         run: |
