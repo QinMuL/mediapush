@@ -1,9 +1,11 @@
-"""首次登录监控账号（交互式 CLI）：
+"""监控账号登录 CLI（备选方式）：
 
     python -m app.monitor.login
 
+推荐方式：直接向 Bot 发送 /mon login，在对话中完成手机号 → 验证码 →
+两步验证密码的交互式登录（无需 SSH 进容器）。
+
 前置：.env 配置 TG_API_ID / TG_API_HASH（https://my.telegram.org → API development tools 申请）。
-流程：输入手机号（+86…）→ Telegram 下发验证码 → 两步验证密码（如已设置）。
 成功后生成 monitor.session（MONITOR_SESSION 可配路径），容器内监控服务自动复用；
 session 文件随 ./data 卷持久化，切勿泄露（等同账号登录态）。
 """

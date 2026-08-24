@@ -39,7 +39,9 @@
 ### 7. 频道监控账号（可选）
 - 功能：用你自己的 Telegram 账号实时监控指定公开频道，自动捕获其中的 ed2k 链接并推送到推送频道。
 - 到 <https://my.telegram.org> → API development tools 申请 `api_id` / `api_hash`，填 `TG_API_ID` / `TG_API_HASH`。
-- 在项目目录运行 `python -m app.monitor.login`，按提示输入手机号、验证码（及两步验证密码）完成登录，生成 `data/monitor.session`。
+- 启动后直接向 Bot 发送 `/mon login`，在对话中依次发送手机号（国内 11 位自动补 +86）→ 验证码 → 两步验证密码（如已设置）即完成登录，无需 SSH 进容器；登录后监控自动启动。
+- 备选：项目目录运行 `python -m app.monitor.login` CLI 登录（交互方式相同）。
+- 登录态保存为 `data/monitor.session`（随数据卷持久化），切勿泄露（等同账号登录态）。
 - 建议使用小号：监控账号需加入被监控频道，频繁操作存在限流风险。
 
 ---
@@ -191,6 +193,7 @@ docker inspect mediapush --format '{{.State.Health.Status}}'
 | 命令 | 说明 |
 |---|---|
 | `/mon` | 查看监控状态（服务/频道/目标/窗口/规则） |
+| `/mon login [手机号]` | 交互式登录监控账号：对话中发送手机号 → 验证码 → 两步密码（5 分钟有效，`/cancel` 可中止，敏感消息自动删除） |
 | `/mon add @频道` | 添加监控频道（t.me 链接 / chat_id 亦可，账号自动加入频道） |
 | `/mon del @频道` | 移除监控频道 |
 | `/mon target <频道ID>` | 设置推送目标（默认 `TG_CHAT_ID_ED2K`，回退 `TG_CHAT_ID`；Bot 需为该频道管理员） |
@@ -235,7 +238,7 @@ app/
 │   ├── store.py         # 监控配置持久化（频道/规则/去重，monitor.db）
 │   ├── watcher.py       # ed2k 提取/验证/过滤/渲染（纯函数）
 │   ├── service.py       # Telethon 封装 + 实时事件 + 补扫 + 推送
-│   └── login.py         # 首次登录 CLI（python -m app.monitor.login）
+│   └── login.py         # 登录 CLI（备选；推荐 Bot 内 /mon login）
 └── db/
     └── cache.py         # aiosqlite：tmdb_cache + pushed_shares
 tests/                   # 单测（parser/link_parser/tmdb/pusher/cache/processor/monitor）

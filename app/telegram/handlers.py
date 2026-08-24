@@ -112,7 +112,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /cancel — 取消当前编辑\n"
         "• /refresh <tmdb_id> — 清除该 TMDB 缓存后重拉\n"
         "• /status — 查看配置与 115 健康状态\n"
-        "• /mon — 频道监控管理（自动捕获监控频道 ed2k 并推送）"
+        "• /mon — 频道监控管理（/mon login 交互式登录，自动捕获 ed2k 推送）"
     )
 
 
@@ -177,6 +177,7 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 _MON_USAGE = (
     "📡 频道监控用法：\n"
     "• /mon — 查看监控状态\n"
+    "• /mon login [手机号] — 交互式登录监控账号（验证码/两步密码在对话中完成）\n"
     "• /mon add <@频道> — 添加监控频道（t.me 链接/chat_id 亦可，自动加入）\n"
     "• /mon del <@频道> — 移除监控频道\n"
     "• /mon target <频道ID> — 设置推送目标（默认 ed2k 频道）\n"
@@ -185,7 +186,7 @@ _MON_USAGE = (
     "• /mon filter +<关键词> — 仅推送命中关键词的链接\n"
     "• /mon filter -<关键词> — 丢弃命中关键词的链接\n"
     "• /mon filter del <关键词> — 删除规则\n"
-    "首次使用：.env 配置 TG_API_ID/TG_API_HASH → python -m app.monitor.login 登录"
+    "首次使用：.env 配置 TG_API_ID/TG_API_HASH → /mon login 登录"
 )
 
 
@@ -200,7 +201,7 @@ async def _mon_status(container) -> str:
     if monitor.state == STATE_RUNNING and monitor.is_running:
         state = "✅ 运行中"
     elif monitor.state == STATE_NO_LOGIN:
-        state = f"❌ 账号未登录（运行 {monitor.login_hint} 后重启）"
+        state = "❌ 账号未登录（发送 /mon login 开始登录）"
     elif monitor.state == STATE_NO_API:
         state = "❌ 未配置 TG_API_ID/TG_API_HASH"
     else:
@@ -241,6 +242,12 @@ async def cmd_mon(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if monitor is None or store is None:
         await update.message.reply_text("❌ 频道监控未启用（MONITOR_ENABLED=false）")
+        return
+
+    if sub == "login":  # 交互式登录监控账号
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        phone = " ".join(args[1:]).strip()
+        await update.message.reply_text(await monitor.login_start(chat_id, phone))
         return
 
     if sub == "add":  # 添加监控频道（自动加入）
@@ -320,17 +327,48 @@ _pending_context = None
 _AGGREGATE_WINDOW = 3  # 聚合窗口（秒）
 
 
+async def _handle_login_input(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, monitor, stage: str
+) -> None:
+    """登录会话中的文本输入按阶段解释（手机号/验证码/密码），并删除敏感消息。"""
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+    if stage == "phone":
+        ok, msg = await monitor.login_phone(text)
+    elif stage == "code":
+        status, msg = await monitor.login_code(text)
+        ok = status != "error"  # retry 保留会话；error/ok/password 均终止输入流
+    else:  # password
+        status, msg = await monitor.login_password(text)
+        ok = status != "error"
+    await update.message.reply_text(msg)
+    # 手机号/验证码/密码属敏感内容：私聊中 Bot 可删，失败（群组无权限）仅记录
+    if ok:
+        try:
+            await update.message.delete()
+        except Exception:
+            logger.debug("登录敏感消息删除失败（可能无权限）", exc_info=True)
+
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """裸链接消息自动触发处理（单链接直推 / 多链接聚合批处理）。
 
     单链接且无聚合中 → 立即直推（保持原 UX）。
     多链接或聚合中 → 缓冲聚合：TG 会把超长消息拆成多条，此处等 3s 合并
     成一个批量，统一按集数排序推送，避免拆分破坏顺序。
-    顶部优先处理编辑模式 AWAITING_QUALITY 状态。
+    顶部优先处理编辑模式 AWAITING_QUALITY 状态，其次监控登录输入流。
     """
     global _pending_update, _pending_context, _pending_timer
     if not _is_admin(update, context):
         return
+    monitor = getattr(_container(context), "monitor", None)
+    if monitor is not None:
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        stage = await monitor.login_stage(chat_id)
+        if stage is not None:
+            await _handle_login_input(update, context, monitor, stage)
+            return
     session = _get_session(context)
     if session is not None and session.state == EditState.AWAITING_QUALITY:
         await _handle_quality_input(update, context, session)
@@ -590,9 +628,13 @@ async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/cancel：取消当前编辑会话（不推送、不标记已推送）。"""
+    """/cancel：取消当前编辑会话 / 登录会话（不推送、不标记已推送）。"""
     if not _is_admin(update, context):
         await update.message.reply_text("⛔ 无权限")
+        return
+    monitor = _container(context).monitor
+    if monitor is not None and monitor.login_active:
+        await update.message.reply_text(await monitor.login_cancel())
         return
     session = _get_session(context)
     if session is None:

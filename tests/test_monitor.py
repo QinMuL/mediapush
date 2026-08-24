@@ -318,6 +318,247 @@ def test_normalize_ref_variants():
 
 
 # ------------------------------------------------------------------ #
+# service：Bot 内交互式登录流（stub TelegramClient，不触网）
+# ------------------------------------------------------------------ #
+class _FakeLoginClient:
+    """可编程 Telethon 客户端替身：模拟发码/验证码/两步密码各分支。"""
+
+    def __init__(self, *, need_password=False, code_valid=True, password_valid=True):
+        self.need_password = need_password
+        self.code_valid = code_valid
+        self.password_valid = password_valid
+        self.connected = False
+        self.handlers = []
+        self.calls = []  # (method, kwargs) 调用记录
+
+    async def connect(self):
+        self.connected = True
+
+    async def disconnect(self):
+        self.connected = False
+
+    def is_connected(self):
+        return self.connected
+
+    async def is_user_authorized(self):
+        return False  # 登录流程中恒为未授权
+
+    def add_event_handler(self, handler, event):
+        self.handlers.append(handler)
+
+    async def get_me(self):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(first_name="监控号", id=42, phone="+8613800138000")
+
+    async def send_code_request(self, phone):
+        self.calls.append(("send_code", phone))
+        from types import SimpleNamespace
+
+        return SimpleNamespace(phone_code_hash="hash123")
+
+    async def sign_in(self, code=None, password=None, phone_code_hash=None):
+        from telethon.errors import (
+            PasswordHashInvalidError,
+            PhoneCodeInvalidError,
+            SessionPasswordNeededError,
+        )
+
+        self.calls.append(("sign_in", code, password))
+        if code is not None:
+            if not self.code_valid:
+                raise PhoneCodeInvalidError(request=None)
+            if self.need_password:
+                raise SessionPasswordNeededError(request=None)
+        if password is not None and not self.password_valid:
+            raise PasswordHashInvalidError(request=None)
+
+
+def _login_svc(tmp_path, monkeypatch, client_kwargs=None, settings=None):
+    """构造登录测试用 MonitorService：_make_client 每次产生新 FakeClient（真实语义）。"""
+    from app.monitor.service import MonitorService
+
+    store = MonitorStore(str(tmp_path / "m.db"))
+
+    class _Container:
+        pusher = None
+
+    svc = MonitorService(settings or _Settings(), store, _Container())
+    fakes: list[_FakeLoginClient] = []
+
+    async def _fake_make_client(self):
+        client = _FakeLoginClient(**(client_kwargs or {}))
+        await client.connect()
+        fakes.append(client)
+        return client
+
+    monkeypatch.setattr(MonitorService, "_make_client", _fake_make_client)
+    return svc, store, fakes
+
+
+def test_login_flow_with_password(tmp_path, monkeypatch):
+    """完整登录流：/mon login → 手机号（自动补 +86）→ 验证码 → 两步密码 → 监控启动。"""
+    from app.monitor.service import STATE_RUNNING
+
+    svc, store, fakes = _login_svc(tmp_path, monkeypatch, {"need_password": True})
+
+    async def run():
+        # 1) /mon login（无手机号）→ 等手机号
+        msg = await svc.login_start(chat_id=100)
+        assert "手机号" in msg
+        assert await svc.login_stage(100) == "phone"
+
+        # 2) 手机号（国内 11 位自动补 +86）→ 发码（创建客户端）
+        ok, msg = await svc.login_phone("13800138000")
+        assert ok and "验证码" in msg
+        assert await svc.login_stage(100) == "code"
+        assert ("send_code", "+8613800138000") in fakes[0].calls
+
+        # 3) 验证码 → 触发两步验证
+        status, msg = await svc.login_code("12345")
+        assert status == "password" and "两步验证" in msg
+        assert await svc.login_stage(100) == "password"
+
+        # 4) 密码 → 登录成功，监控启动（同一客户端贯穿发码与登录）
+        status, msg = await svc.login_password("secret-pwd")
+        assert status == "ok" and "登录成功" in msg
+        assert svc.state == STATE_RUNNING
+        assert svc.is_running
+        assert len(fakes) == 1  # 全程同一客户端
+        assert len(fakes[0].handlers) == 1  # NewMessage 处理器已注册
+        assert ("sign_in", "12345", None) in fakes[0].calls
+        assert ("sign_in", None, "secret-pwd") in fakes[0].calls
+
+        # 登录完成后会话清空，文本恢复链接解析
+        assert await svc.login_stage(100) is None
+        await asyncio.sleep(0)  # 让后台 _post_login 任务执行完毕
+        await store.close()
+
+    asyncio.run(run())
+
+
+def test_login_flow_direct_code_ok(tmp_path, monkeypatch):
+    """/mon login 带手机号直接发码；验证码即完成（无两步验证）。"""
+    from app.monitor.service import STATE_RUNNING
+
+    svc, store, _ = _login_svc(tmp_path, monkeypatch)
+
+    async def run():
+        msg = await svc.login_start(chat_id=100, phone="+8613800138000")
+        assert "验证码" in msg
+        assert await svc.login_stage(100) == "code"
+        status, msg = await svc.login_code("54321")
+        assert status == "ok"
+        assert svc.state == STATE_RUNNING
+        await asyncio.sleep(0)
+        await store.close()
+
+    asyncio.run(run())
+
+
+def test_login_retry_keeps_session(tmp_path, monkeypatch):
+    """验证码错误 → retry 保留会话可重试；手机号阶段格式错误同样保留。"""
+    svc, store, _ = _login_svc(
+        tmp_path, monkeypatch, {"code_valid": False, "need_password": True}
+    )
+
+    async def run():
+        # 手机号格式错误：会话保留在 phone 阶段
+        await svc.login_start(100)
+        ok, msg = await svc.login_phone("123")
+        assert not ok and "格式" in msg
+        assert await svc.login_stage(100) == "phone"
+
+        # 发码后验证码错误：会话保留在 code 阶段
+        await svc.login_phone("+8613800138000")
+        status, msg = await svc.login_code("00000")
+        assert status == "retry" and "验证码错误" in msg
+        assert await svc.login_stage(100) == "code"
+        await store.close()
+
+    asyncio.run(run())
+
+
+def test_login_timeout_discards_client(tmp_path, monkeypatch):
+    """会话超时 → login_stage 惰性清理并断开客户端。"""
+    svc, store, fakes = _login_svc(tmp_path, monkeypatch)
+
+    async def run():
+        import time as _time
+
+        await svc.login_start(100, "+8613800138000")
+        assert await svc.login_stage(100) == "code"
+        assert fakes[0].connected
+
+        svc._login.expires_at = _time.time() - 1  # 手工置过期
+        assert await svc.login_stage(100) is None
+        assert not fakes[0].connected  # 客户端已断开
+        assert svc._login is None
+        await store.close()
+
+    asyncio.run(run())
+
+
+def test_login_cancel_and_single_instance(tmp_path, monkeypatch):
+    """/cancel 取消登录；新 /mon login 覆盖旧会话并断开旧客户端。"""
+    svc, store, fakes = _login_svc(tmp_path, monkeypatch)
+
+    async def run():
+        assert "没有进行中的登录" in await svc.login_cancel()
+
+        await svc.login_start(100, "+8613800138000")
+        assert "已取消登录" in await svc.login_cancel()
+        assert not fakes[0].connected
+
+        # 新会话覆盖旧会话：旧客户端断开，新客户端接管
+        await svc.login_start(100, "+8613800138000")
+        assert fakes[1].connected
+        await svc.login_start(200, "+8613912345678")
+        assert not fakes[1].connected  # 旧客户端被覆盖废弃
+        assert fakes[2].connected
+        assert await svc.login_stage(200) == "code"
+        assert await svc.login_stage(100) is None  # 旧 chat 不再有效
+        await store.close()
+
+    asyncio.run(run())
+
+
+def test_login_rejected_when_running_or_no_api(tmp_path, monkeypatch):
+    """监控运行中拒绝重复登录；缺 API 配置直接拒绝。"""
+    from app.monitor.service import STATE_NO_API
+
+    class _NoApiSettings(_Settings):
+        def __init__(self):
+            super().__init__()
+            self.tg_api_id = 0
+            self.tg_api_hash = ""
+
+    svc, store, _ = _login_svc(tmp_path, monkeypatch)
+    svc_noapi, store2, _ = _login_svc(tmp_path, monkeypatch, settings=_NoApiSettings())
+
+    async def run():
+        # 正常配置 → 进入手机号阶段
+        msg = await svc.login_start(100)
+        assert "手机号" in msg
+
+        # 缺 API 配置 → 直接拒绝
+        msg = await svc_noapi.login_start(100)
+        assert "TG_API_ID" in msg
+        assert svc_noapi.state == STATE_NO_API
+
+        # 已运行 → 拒绝（手工接管一个已连接客户端）
+        client = _FakeLoginClient()
+        await client.connect()
+        await svc._setup(client)
+        msg = await svc.login_start(100)
+        assert "已在运行" in msg
+        await store.close()
+        await store2.close()
+
+    asyncio.run(run())
+
+
+# ------------------------------------------------------------------ #
 # service：事件 → 推送 管线（stub Bot / Telethon 事件，不触网）
 # ------------------------------------------------------------------ #
 class _FakeBot:

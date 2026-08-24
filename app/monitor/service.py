@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
@@ -43,6 +44,10 @@ _CATCHUP_LIMIT = 100  # 补扫每频道最多回溯消息数（停机恢复）
 _PUSH_RETRY = 3  # 推送失败重试次数（线性退避 5s/10s/15s）
 _PUSH_INTERVAL = 2.0  # 相邻推送最小间隔（秒），防 flood control
 _SEEN_TTL_DAYS = 30  # 去重记录保留天数（启动时清理）
+_LOGIN_TIMEOUT = 300  # 交互式登录会话有效期（秒）
+# 手机号：+国家码+号码（5-15 位）；国内 11 位裸号自动补 +86
+_PHONE_RE = re.compile(r"\+\d{5,15}")
+_PHONE_CN_RE = re.compile(r"1\d{10}")
 
 # 服务状态（/mon 展示与排障用）
 STATE_DISABLED = "disabled"  # MONITOR_ENABLED=false
@@ -88,6 +93,17 @@ class _Pending:
     task: asyncio.Task | None = None
 
 
+@dataclass
+class _LoginFlow:
+    """Bot 内交互式登录会话（/mon login 发起，单实例）。"""
+
+    chat_id: int  # 发起登录的管理员（登录输入仅该会话接受）
+    stage: str  # phone（等手机号）| code（等验证码）| password（等两步密码）
+    phone: str
+    client: object  # TelegramClient（stage=phone 时为 None）
+    expires_at: float
+
+
 class MonitorService:
     def __init__(self, settings, store: MonitorStore, container) -> None:
         self.settings = settings
@@ -99,6 +115,7 @@ class MonitorService:
         self._pending: dict[int, _Pending] = {}
         self._seen_mem: set[str] = set()  # 进程内去重（关补扫/实时并发窗口的竞态）
         self._push_lock = asyncio.Lock()
+        self._login: _LoginFlow | None = None  # 进行中的登录会话
 
     # ------------------------------------------------------------------ #
     # 只读状态（/mon 展示用）
@@ -109,7 +126,11 @@ class MonitorService:
 
     @property
     def login_hint(self) -> str:
-        return f"python -m app.monitor.login（session：{self.settings.monitor_session}）"
+        return "/mon login（Bot 内交互式登录；或 python -m app.monitor.login CLI）"
+
+    @property
+    def login_active(self) -> bool:
+        return self._login is not None
 
     async def filters(self) -> FilterRules:
         rules = await self.store.list_filters()
@@ -136,8 +157,9 @@ class MonitorService:
     # 生命周期
     # ------------------------------------------------------------------ #
     async def start(self) -> bool:
+        """启动监控：session 已授权则直接运行；未授权转 NO_LOGIN（等 /mon login）。"""
         try:
-            from telethon import TelegramClient, events
+            from telethon import events  # noqa: F401 — 仅探测依赖
         except ImportError:
             self.state = STATE_NO_API
             logger.error("telethon 未安装，频道监控不可用（pip install telethon）")
@@ -147,6 +169,26 @@ class MonitorService:
             logger.warning("TG_API_ID / TG_API_HASH 未配置，频道监控不启动")
             return False
 
+        try:
+            client = await self._make_client()
+        except Exception:
+            self.state = STATE_NO_LOGIN
+            logger.exception("监控客户端连接失败（%s）", self.login_hint)
+            return False
+        if not await client.is_user_authorized():
+            self.state = STATE_NO_LOGIN
+            logger.warning("监控账号未登录：请向 Bot 发送 /mon login 交互式登录")
+            await client.disconnect()
+            return False
+
+        await self._setup(client)
+        await self._post_login()
+        return True
+
+    async def _make_client(self):
+        """创建 Telethon 客户端并连接（代理沿用 Bot 配置）。"""
+        from telethon import TelegramClient
+
         client = TelegramClient(
             self.settings.monitor_session,
             self.settings.tg_api_id,
@@ -154,11 +196,11 @@ class MonitorService:
             proxy=parse_proxy(self.settings.proxy_url),
         )
         await client.connect()
-        if not await client.is_user_authorized():
-            self.state = STATE_NO_LOGIN
-            logger.error("监控账号未登录，请运行 %s", self.login_hint)
-            await client.disconnect()
-            return False
+        return client
+
+    async def _setup(self, client) -> None:
+        """登录态就绪后的快速初始化：注册事件处理器 + 状态置运行。"""
+        from telethon import events
 
         me = await client.get_me()
         logger.info(
@@ -166,15 +208,183 @@ class MonitorService:
             getattr(me, "first_name", "") or me.id,
             getattr(me, "phone", ""),
         )
-
         client.add_event_handler(self._on_new_message, events.NewMessage())
         self._client = client
         self.state = STATE_RUNNING
 
+    async def _post_login(self) -> None:
+        """慢速初始化：清理去重 + 加载频道 + 补扫（可后台执行）。"""
         await self._cleanup_seen()
         await self._load_channels()
         await self._catchup()
-        return True
+
+    # ------------------------------------------------------------------ #
+    # Bot 内交互式登录（/mon login → 手机号 → 验证码 → 两步密码）
+    # ------------------------------------------------------------------ #
+    async def login_stage(self, chat_id: int) -> str | None:
+        """该 chat 的登录阶段（超时惰性清理）；无有效会话返回 None。"""
+        flow = self._login
+        if flow is None or flow.chat_id != chat_id:
+            return None
+        if time.time() > flow.expires_at:
+            await self._login_discard("超时")
+            return None
+        return flow.stage
+
+    async def login_start(self, chat_id: int, phone: str = "") -> str:
+        """开始登录（/mon login [手机号]）；phone 为空则先等用户发送手机号。"""
+        if self.is_running:
+            return "✅ 监控已在运行，无需登录"
+        if not self.settings.tg_api_id or not self.settings.tg_api_hash:
+            self.state = STATE_NO_API
+            return "❌ 未配置 TG_API_ID / TG_API_HASH（.env 填写后重启容器）"
+
+        await self._login_discard("新登录会话")  # 单实例：新登录覆盖旧会话
+        flow = _LoginFlow(
+            chat_id=chat_id,
+            stage="phone",
+            phone="",
+            client=None,
+            expires_at=time.time() + _LOGIN_TIMEOUT,
+        )
+        if not phone:
+            self._login = flow
+            return "📲 请发送监控账号的手机号（国际格式如 +8613800138000，国内 11 位亦可）"
+        _, msg = await self._send_code(flow, phone)
+        return msg
+
+    async def login_phone(self, phone: str) -> tuple[bool, str]:
+        """stage=phone：接收手机号 → 连接 + 发送验证码。"""
+        flow = self._login
+        if flow is None or flow.stage != "phone":
+            return False, "❌ 登录会话不存在，请重新 /mon login"
+        if time.time() > flow.expires_at:
+            await self._login_discard("超时")
+            return False, "❌ 登录已超时，请重新 /mon login"
+        return await self._send_code(flow, phone)
+
+    async def _send_code(self, flow: _LoginFlow, phone: str) -> tuple[bool, str]:
+        """校验手机号格式 → 连接 → 请求验证码（进入 code 阶段）。"""
+        from telethon.errors import FloodWaitError
+
+        phone = re.sub(r"[\s\-()]", "", phone.strip())
+        if _PHONE_CN_RE.fullmatch(phone):  # 国内 11 位裸号自动补 +86
+            phone = "+86" + phone
+        if not _PHONE_RE.fullmatch(phone):
+            return False, "❌ 手机号格式：+国家码手机号（如 +8613800138000），请重发"
+
+        try:
+            client = await self._make_client()
+        except Exception as exc:  # noqa: BLE001 — 网络异常回报给用户
+            logger.warning("监控登录：连接 Telegram 失败：%s", exc)
+            return False, f"❌ 连接 Telegram 失败：{exc}"
+        try:
+            await client.send_code_request(phone)
+        except FloodWaitError as exc:
+            await client.disconnect()
+            return False, f"❌ 验证码请求过于频繁，请 {int(exc.seconds) + 5} 秒后重新 /mon login"
+        except Exception as exc:  # noqa: BLE001 — 任意 API 错误回报给用户
+            logger.warning("监控登录：发送验证码失败：%s", exc)
+            await client.disconnect()
+            return False, f"❌ 发送验证码失败：{exc}，请重发手机号"
+
+        self._login = _LoginFlow(
+            chat_id=flow.chat_id,
+            stage="code",
+            phone=phone,
+            client=client,
+            expires_at=time.time() + _LOGIN_TIMEOUT,
+        )
+        logger.info("监控登录：验证码已发送（chat=%s）", flow.chat_id)
+        return True, "✅ 验证码已发送至该账号的 Telegram 客户端，请直接发送验证码（5 分钟内有效）"
+
+    async def login_code(self, code: str) -> tuple[str, str]:
+        """stage=code：验证码登录。返回 (status, msg)。
+
+        status：ok=登录成功并启动监控 | password=需两步验证 | retry=输入有误可重试
+                | error=会话失效需重新开始
+        """
+        from telethon.errors import (
+            PhoneCodeExpiredError,
+            PhoneCodeInvalidError,
+            SessionPasswordNeededError,
+        )
+
+        flow = self._login
+        if flow is None or flow.stage != "code":
+            return "error", "❌ 登录会话不存在，请重新 /mon login"
+        if time.time() > flow.expires_at:
+            await self._login_discard("超时")
+            return "error", "❌ 登录已超时，请重新 /mon login"
+        code = code.strip().replace(" ", "")
+        if not code.isdigit():
+            return "retry", "❌ 验证码应为数字，请重发"
+        try:
+            # 只传 code：传 phone 会触发重发验证码
+            await flow.client.sign_in(code=code)
+        except SessionPasswordNeededError:
+            flow.stage = "password"
+            return "password", "🔐 该账号已开启两步验证，请发送密码"
+        except PhoneCodeInvalidError:
+            return "retry", "❌ 验证码错误，请重发"
+        except PhoneCodeExpiredError:
+            await self._login_discard("验证码过期")
+            return "error", "❌ 验证码已过期，请重新 /mon login"
+        except Exception as exc:  # noqa: BLE001 — 任意 API 错误可重试
+            logger.warning("监控登录：验证码登录失败：%s", exc)
+            return "retry", f"❌ 登录失败：{exc}，请重发验证码"
+        return await self._login_done()
+
+    async def login_password(self, password: str) -> tuple[str, str]:
+        """stage=password：两步验证密码登录（语义同 login_code）。"""
+        from telethon.errors import PasswordHashInvalidError
+
+        flow = self._login
+        if flow is None or flow.stage != "password":
+            return "error", "❌ 登录会话不存在，请重新 /mon login"
+        if time.time() > flow.expires_at:
+            await self._login_discard("超时")
+            return "error", "❌ 登录已超时，请重新 /mon login"
+        try:
+            await flow.client.sign_in(password=password)
+        except PasswordHashInvalidError:
+            return "retry", "❌ 密码错误，请重发"
+        except Exception as exc:  # noqa: BLE001 — 任意 API 错误可重试
+            logger.warning("监控登录：密码登录失败：%s", exc)
+            return "retry", f"❌ 登录失败：{exc}，请重发密码"
+        return await self._login_done()
+
+    async def login_cancel(self) -> str:
+        if self._login is None:
+            return "当前没有进行中的登录"
+        await self._login_discard("手动取消")
+        return "已取消登录，敏感消息可自行删除"
+
+    async def _login_done(self) -> tuple[str, str]:
+        """登录成功：接管为监控客户端，慢速初始化转后台。"""
+        flow, self._login = self._login, None
+        logger.info("监控账号登录成功：%s（chat=%s）", flow.phone, flow.chat_id)
+        await self._setup(flow.client)
+        # 加载频道/补扫较慢，后台执行不阻塞回复
+        asyncio.create_task(self._post_login())
+        return (
+            "ok",
+            "✅ 登录成功，频道监控已启动 🎉\n"
+            + f"session 已保存：{self.settings.monitor_session}\n"
+            + "用 /mon add @频道 添加监控，/mon 查看状态",
+        )
+
+    async def _login_discard(self, reason: str) -> None:
+        """废弃登录会话（覆盖/取消/超时）：断开未完成的客户端。"""
+        flow, self._login = self._login, None
+        if flow is None:
+            return
+        if flow.client is not None:
+            try:
+                await flow.client.disconnect()
+            except Exception:
+                logger.exception("废弃登录客户端断开失败")
+        logger.info("登录会话已废弃（%s，chat=%s）", reason, flow.chat_id)
 
     async def stop(self) -> None:
         """停止监控：冲刷待推送批次 → 断开客户端。"""
