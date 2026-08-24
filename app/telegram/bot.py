@@ -125,8 +125,7 @@ class TelegramService:
                 ok = await self.container.monitor.start()
                 if not ok:
                     logger.warning(
-                        "频道监控未启动（/mon 可查看原因；登录：%s）",
-                        "python -m app.monitor.login",
+                        "频道监控未启动（/mon 可查看原因；发送 /mon login 交互式登录）"
                     )
             except Exception as exc:
                 logger.error("频道监控启动失败：%s", exc, exc_info=exc)
