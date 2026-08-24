@@ -132,6 +132,19 @@ class MonitorService:
     def login_active(self) -> bool:
         return self._login is not None
 
+    @property
+    def login_stage_desc(self) -> str:
+        """登录进行中的阶段描述（/mon 状态展示用；无会话返回空串）。"""
+        if self._login is None:
+            return ""
+        if time.time() > self._login.expires_at:
+            return ""  # 已过期（下次访问时惰性清理）
+        return {
+            "phone": "等待手机号",
+            "code": "等待验证码",
+            "password": "等待两步密码",
+        }.get(self._login.stage, self._login.stage)
+
     async def filters(self) -> FilterRules:
         rules = await self.store.list_filters()
         return FilterRules(

@@ -558,6 +558,28 @@ def test_login_rejected_when_running_or_no_api(tmp_path, monkeypatch):
     asyncio.run(run())
 
 
+def test_login_stage_desc_property(tmp_path, monkeypatch):
+    """login_stage_desc：各阶段中文描述；无会话/过期返回空串。"""
+    import time as _time
+
+    svc, store, _ = _login_svc(tmp_path, monkeypatch)
+    assert svc.login_stage_desc == ""  # 无会话
+
+    async def run():
+        await svc.login_start(100)  # phone 阶段
+        assert svc.login_stage_desc == "等待手机号"
+        await svc.login_phone("+8613800138000")  # code 阶段
+        assert svc.login_stage_desc == "等待验证码"
+        svc._login.stage = "password"
+        assert svc.login_stage_desc == "等待两步密码"
+
+        svc._login.expires_at = _time.time() - 1  # 过期
+        assert svc.login_stage_desc == ""
+        await store.close()
+
+    asyncio.run(run())
+
+
 # ------------------------------------------------------------------ #
 # service：事件 → 推送 管线（stub Bot / Telethon 事件，不触网）
 # ------------------------------------------------------------------ #

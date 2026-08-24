@@ -139,7 +139,27 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 lines.append(f"115 健康：{'✅' if ok else '❌ cookie 失效'}")
         except Exception as exc:  # noqa: BLE001
             lines.append(f"115：❌ {exc}")
+    monitor = getattr(container, "monitor", None)
+    if monitor is None:
+        lines.append("频道监控：未启用（MONITOR_ENABLED=false）")
+    elif monitor.login_active:
+        lines.append(f"频道监控：⏳ 登录进行中（{monitor.login_stage_desc or '会话已过期'}）")
+    else:
+        lines.append(f"频道监控：{await _monitor_state_line(monitor)}")
     await update.message.reply_text("\n".join(lines))
+
+
+async def _monitor_state_line(monitor) -> str:
+    """/status 用的一行式监控状态。"""
+    from app.monitor.service import STATE_NO_API, STATE_NO_LOGIN, STATE_RUNNING
+
+    if monitor.state == STATE_RUNNING and monitor.is_running:
+        return "✅ 运行中（/mon 查看详情）"
+    if monitor.state == STATE_NO_API:
+        return "❌ 未配置 TG_API_ID/TG_API_HASH"
+    if monitor.state == STATE_NO_LOGIN:
+        return "❌ 账号未登录（/mon login 登录）"
+    return "❌ 未运行（/mon login 重新登录）"
 
 
 async def cmd_115(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -198,14 +218,17 @@ async def _mon_status(container) -> str:
     if monitor is None or store is None:
         return "📡 频道监控：未启用（MONITOR_ENABLED=false）"
 
-    if monitor.state == STATE_RUNNING and monitor.is_running:
+    if monitor.login_active:
+        desc = monitor.login_stage_desc or "会话已过期"
+        state = f"⏳ 登录进行中（{desc}，/cancel 可中止）"
+    elif monitor.state == STATE_RUNNING and monitor.is_running:
         state = "✅ 运行中"
     elif monitor.state == STATE_NO_LOGIN:
         state = "❌ 账号未登录（发送 /mon login 开始登录）"
     elif monitor.state == STATE_NO_API:
         state = "❌ 未配置 TG_API_ID/TG_API_HASH"
     else:
-        state = "❌ 未运行"
+        state = "❌ 未运行（/mon login 重新登录）"
 
     channels = await store.list_channels()
     rules = await store.list_filters()
@@ -248,6 +271,11 @@ async def cmd_mon(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id = update.effective_chat.id if update.effective_chat else 0
         phone = " ".join(args[1:]).strip()
         await update.message.reply_text(await monitor.login_start(chat_id, phone))
+        if phone:  # 命令中含手机号，属敏感内容，私聊中 Bot 可删除
+            try:
+                await update.message.delete()
+            except Exception:
+                logger.debug("登录命令消息删除失败（可能无权限）", exc_info=True)
         return
 
     if sub == "add":  # 添加监控频道（自动加入）
@@ -632,7 +660,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not _is_admin(update, context):
         await update.message.reply_text("⛔ 无权限")
         return
-    monitor = _container(context).monitor
+    monitor = getattr(_container(context), "monitor", None)
     if monitor is not None and monitor.login_active:
         await update.message.reply_text(await monitor.login_cancel())
         return
@@ -867,7 +895,7 @@ _BOT_COMMANDS: list[BotCommand] = [
     BotCommand("cancel", "取消当前编辑"),
     BotCommand("status", "查看配置与健康"),
     BotCommand("refresh", "清除 TMDB 缓存"),
-    BotCommand("mon", "频道监控管理"),
+    BotCommand("mon", "频道监控（login 登录/add 添加）"),
 ]
 
 
