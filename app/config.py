@@ -17,6 +17,15 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _env_int(name: str, default: int = 0) -> int:
+    raw = os.getenv(name, "")
+    try:
+        return int(raw.strip()) if raw.strip() else default
+    except ValueError:
+        logger.warning("配置 %s 非法（%r），使用默认 %s", name, raw, default)
+        return default
+
+
 def _env_int_list(name: str) -> list[int]:
     raw = os.getenv(name, "")
     out: list[int] = []
@@ -46,6 +55,13 @@ class Settings:
     log_color: bool = True
     log_file: str = "./data/logs/mediapush.log"
     db_path: str = "./data/cache.db"
+    # 频道监控（Telethon 用户账号，见 app/monitor/）
+    tg_api_id: int = 0
+    tg_api_hash: str = ""
+    monitor_enabled: bool = True
+    monitor_session: str = "./data/monitor.session"
+    monitor_db_path: str = "./data/monitor.db"
+    monitor_batch_seconds: int = 0
 
     @classmethod
     def load(cls) -> Settings:
@@ -72,6 +88,14 @@ class Settings:
             log_color=_env_bool("LOG_COLOR", True),
             log_file=os.getenv("LOG_FILE", "./data/logs/mediapush.log").strip(),
             db_path=os.getenv("DB_PATH", "./data/cache.db").strip() or "./data/cache.db",
+            tg_api_id=_env_int("TG_API_ID", 0),
+            tg_api_hash=os.getenv("TG_API_HASH", "").strip(),
+            monitor_enabled=_env_bool("MONITOR_ENABLED", True),
+            monitor_session=os.getenv("MONITOR_SESSION", "./data/monitor.session").strip()
+            or "./data/monitor.session",
+            monitor_db_path=os.getenv("MONITOR_DB_PATH", "./data/monitor.db").strip()
+            or "./data/monitor.db",
+            monitor_batch_seconds=_env_int("MONITOR_BATCH_SECONDS", 0),
         )
         settings._ensure_dirs()
         return settings
@@ -95,6 +119,8 @@ class Settings:
         # PAN115_COOKIE 可选：读取分享走匿名 web，无需 cookie；cookie 仅用于 /status 健康检查
         if not self.proxy_url:
             warns.append("PROXY_URL 未配置，TG/TMDB 在国内网络可能无法访问。")
+        if self.monitor_enabled and not (self.tg_api_id and self.tg_api_hash):
+            warns.append("TG_API_ID/TG_API_HASH 未配置，频道监控不启动。")
         return warns
 
     def is_admin(self, user_id: int | None) -> bool:

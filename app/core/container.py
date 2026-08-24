@@ -23,6 +23,8 @@ class Container:
         self.tmdb = None
         self.processor = None
         self.telegram = None
+        self.monitor_store = None
+        self.monitor = None
         self._built = False
 
     # ------------------------------------------------------------------ #
@@ -78,6 +80,16 @@ class Container:
         else:
             logger.error("TG_BOT_TOKEN 未配置，Bot 不启动")
 
+        # 频道监控（Telethon 用户账号）——store 恒可建，登录态在 service.start 校验
+        if self.settings.monitor_enabled:
+            from app.monitor.service import MonitorService
+            from app.monitor.store import MonitorStore
+
+            self.monitor_store = MonitorStore(self.settings.monitor_db_path)
+            self.monitor = MonitorService(self.settings, self.monitor_store, self)
+        else:
+            logger.info("MONITOR_ENABLED=false，频道监控未启用")
+
         self._built = True
 
     # ------------------------------------------------------------------ #
@@ -90,6 +102,10 @@ class Container:
         return self.telegram is not None
 
     async def close(self) -> None:
+        if self.monitor is not None:
+            await self.monitor.stop()
+        if self.monitor_store is not None:
+            await self.monitor_store.close()
         if self.tmdb is not None:
             await self.tmdb.close()
         if self.cache is not None:

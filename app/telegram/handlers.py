@@ -26,6 +26,12 @@ from telegram.ext import (
 )
 
 from app.core.link_parser import ParsedShare, parse_share, parse_shares
+from app.monitor.store import (
+    KEY_BATCH,
+    KEY_TARGET,
+    KIND_EXCLUDE,
+    KIND_INCLUDE,
+)
 from app.telegram.edit_session import (
     MAX_QUALITY_EXTRA,
     EditSession,
@@ -105,7 +111,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /edit <链接> — 预览编辑模式：追加推荐语/精品标记后推送（精品资源区分）\n"
         "• /cancel — 取消当前编辑\n"
         "• /refresh <tmdb_id> — 清除该 TMDB 缓存后重拉\n"
-        "• /status — 查看配置与 115 健康状态"
+        "• /status — 查看配置与 115 健康状态\n"
+        "• /mon — 频道监控管理（自动捕获监控频道 ed2k 并推送）"
     )
 
 
@@ -162,6 +169,147 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     n = await _container(context).cache.delete_tmdb(tmdb_id)
     await update.message.reply_text(f"🗑 已清除 TMDB 缓存 {tmdb_id}（{n} 条）。下次匹配将重新拉取。")
+
+
+# ---------------------------------------------------------------------- #
+# 频道监控管理（/mon）：add/del 监控频道、target 推送目标、batch 聚合窗口、filter 关键词
+# ---------------------------------------------------------------------- #
+_MON_USAGE = (
+    "📡 频道监控用法：\n"
+    "• /mon — 查看监控状态\n"
+    "• /mon add <@频道> — 添加监控频道（t.me 链接/chat_id 亦可，自动加入）\n"
+    "• /mon del <@频道> — 移除监控频道\n"
+    "• /mon target <频道ID> — 设置推送目标（默认 ed2k 频道）\n"
+    "• /mon batch <秒> — 聚合窗口（0=实时逐条）\n"
+    "• /mon filter — 查看过滤规则\n"
+    "• /mon filter +<关键词> — 仅推送命中关键词的链接\n"
+    "• /mon filter -<关键词> — 丢弃命中关键词的链接\n"
+    "• /mon filter del <关键词> — 删除规则\n"
+    "首次使用：.env 配置 TG_API_ID/TG_API_HASH → python -m app.monitor.login 登录"
+)
+
+
+async def _mon_status(container) -> str:
+    """组装 /mon 状态文本（服务状态 + 频道 + 目标 + 窗口 + 规则）。"""
+    from app.monitor.service import STATE_NO_API, STATE_NO_LOGIN, STATE_RUNNING
+
+    monitor, store = container.monitor, container.monitor_store
+    if monitor is None or store is None:
+        return "📡 频道监控：未启用（MONITOR_ENABLED=false）"
+
+    if monitor.state == STATE_RUNNING and monitor.is_running:
+        state = "✅ 运行中"
+    elif monitor.state == STATE_NO_LOGIN:
+        state = f"❌ 账号未登录（运行 {monitor.login_hint} 后重启）"
+    elif monitor.state == STATE_NO_API:
+        state = "❌ 未配置 TG_API_ID/TG_API_HASH"
+    else:
+        state = "❌ 未运行"
+
+    channels = await store.list_channels()
+    rules = await store.list_filters()
+    batch = await monitor.batch_seconds()
+    target = await monitor.target_chat_id()
+
+    lines = [f"📡 频道监控：{state}", f"监控频道（{len(channels)}）："]
+    for ch in channels:
+        uname = f"，@{ch.username}" if ch.username else ""
+        lines.append(f"• {ch.title}（{ch.chat_id}{uname}）")
+    if not channels:
+        lines.append("（空，/mon add @频道 添加）")
+    lines.append(f"推送目标：{target or '❌ 未配置'}")
+    lines.append(f"聚合窗口：{batch} 秒（{'实时逐条' if batch == 0 else '同频道合并推送'}）")
+    inc = [r.keyword for r in rules if r.kind == KIND_INCLUDE]
+    exc = [r.keyword for r in rules if r.kind == KIND_EXCLUDE]
+    lines.append(f"仅推送关键词：{'、'.join(inc) if inc else '无'}")
+    lines.append(f"排除关键词：{'、'.join(exc) if exc else '无'}")
+    return "\n".join(lines)
+
+
+async def cmd_mon(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update, context):
+        await update.message.reply_text("⛔ 无权限")
+        return
+    container = _container(context)
+    monitor, store = container.monitor, container.monitor_store
+    args = context.args or []
+    sub = args[0].lower() if args else "status"
+
+    if sub in ("", "status", "list", "状态"):
+        await update.message.reply_text(await _mon_status(container))
+        return
+
+    if monitor is None or store is None:
+        await update.message.reply_text("❌ 频道监控未启用（MONITOR_ENABLED=false）")
+        return
+
+    if sub == "add":  # 添加监控频道（自动加入）
+        if len(args) < 2:
+            await update.message.reply_text("用法：/mon add @频道用户名")
+            return
+        ok, msg = await monitor.add_channel(" ".join(args[1:]))
+        await update.message.reply_text(msg if ok else f"❌ {msg}")
+        return
+
+    if sub in ("del", "remove", "rm"):  # 移除监控频道
+        if len(args) < 2:
+            await update.message.reply_text("用法：/mon del @频道用户名（或 chat_id）")
+            return
+        ok, msg = await monitor.remove_channel(" ".join(args[1:]))
+        await update.message.reply_text(msg if ok else f"❌ {msg}")
+        return
+
+    if sub == "target":  # 推送目标频道
+        if len(args) < 2:
+            current = await monitor.target_chat_id()
+            await update.message.reply_text(
+                f"用法：/mon target <频道ID或@用户名>\n当前：{current or '未配置'}"
+            )
+            return
+        await store.set_setting(KEY_TARGET, args[1].strip())
+        await update.message.reply_text(f"✅ 推送目标已设置为：{args[1].strip()}")
+        return
+
+    if sub == "batch":  # 聚合窗口（秒）
+        if len(args) < 2 or not args[1].isdigit():
+            await update.message.reply_text(
+                f"用法：/mon batch <秒>（0=实时逐条）\n当前：{await monitor.batch_seconds()} 秒"
+            )
+            return
+        await store.set_setting(KEY_BATCH, str(int(args[1])))
+        await update.message.reply_text(f"✅ 聚合窗口已设置为 {int(args[1])} 秒")
+        return
+
+    if sub == "filter":  # 关键词过滤规则
+        rest = args[1:]
+        if not rest:
+            rules = await store.list_filters()
+            if not rules:
+                await update.message.reply_text(
+                    "过滤规则（空）：\n• /mon filter +关键词 → 仅推送命中\n"
+                    "• /mon filter -关键词 → 排除命中"
+                )
+                return
+            lines = ["过滤规则："]
+            for r in rules:
+                lines.append(f"• [{'仅推送' if r.kind == KIND_INCLUDE else '排除'}] {r.keyword}")
+            await update.message.reply_text("\n".join(lines))
+            return
+        op = rest[0]
+        if op.startswith("+") and len(op) > 1:
+            ok = await store.add_filter(op[1:], KIND_INCLUDE)
+            await update.message.reply_text("✅ 已添加仅推送规则" if ok else "❌ 规则已存在")
+        elif op.startswith("-") and len(op) > 1:
+            ok = await store.add_filter(op[1:], KIND_EXCLUDE)
+            await update.message.reply_text("✅ 已添加排除规则" if ok else "❌ 规则已存在")
+        elif op in ("del", "rm") and len(rest) > 1:
+            ok = await store.remove_filter(rest[1])
+            await update.message.reply_text("✅ 已删除规则" if ok else "❌ 规则不存在")
+        else:
+            await update.message.reply_text("用法：/mon filter +关键词 | -关键词 | del 关键词")
+        return
+
+    await update.message.reply_text(_MON_USAGE)
 
 
 # 多链接消息聚合：TG 长消息自动拆分时，缓冲短时间内的多链接消息合并处理
@@ -677,6 +825,7 @@ _BOT_COMMANDS: list[BotCommand] = [
     BotCommand("cancel", "取消当前编辑"),
     BotCommand("status", "查看配置与健康"),
     BotCommand("refresh", "清除 TMDB 缓存"),
+    BotCommand("mon", "频道监控管理"),
 ]
 
 
@@ -730,6 +879,7 @@ def register(application: Application) -> None:
     application.add_handler(CommandHandler("edit", cmd_edit))
     application.add_handler(CommandHandler("cancel", cmd_cancel))
     application.add_handler(CommandHandler("refresh", cmd_refresh))
+    application.add_handler(CommandHandler("mon", cmd_mon))
     application.add_handler(
         CallbackQueryHandler(
             on_edit_callback,

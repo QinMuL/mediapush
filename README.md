@@ -36,6 +36,12 @@
 - TG Bot API 与 TMDB API 在国内需走代理；填 `PROXY_URL`（如 `http://127.0.0.1:7890` 或 `socks5://127.0.0.1:1080`）。
 - **115 默认不走代理**（走代理易触发风控），如确实需要可设 `PAN115_USE_PROXY=true`（当前版本 115 代理尚未完全接线，默认直连）。
 
+### 7. 频道监控账号（可选）
+- 功能：用你自己的 Telegram 账号实时监控指定公开频道，自动捕获其中的 ed2k 链接并推送到推送频道。
+- 到 <https://my.telegram.org> → API development tools 申请 `api_id` / `api_hash`，填 `TG_API_ID` / `TG_API_HASH`。
+- 在项目目录运行 `python -m app.monitor.login`，按提示输入手机号、验证码（及两步验证密码）完成登录，生成 `data/monitor.session`。
+- 建议使用小号：监控账号需加入被监控频道，频繁操作存在限流风险。
+
 ---
 
 ## 二、配置
@@ -62,6 +68,11 @@ cp .env.example .env
 | `LOG_LEVEL` | 控制台日志级别，默认 `INFO`（文件日志恒为 `DEBUG` 全量） |
 | `DB_PATH` | SQLite 缓存路径，默认 `./data/cache.db` |
 | `LOG_FILE` | 文件日志路径，默认 `./data/logs/mediapush.log`（按天轮转，保留 14 天） |
+| `TG_API_ID` / `TG_API_HASH` | 频道监控用户账号凭证（my.telegram.org 申请，可选） |
+| `MONITOR_ENABLED` | 是否启用频道监控，默认 `true` |
+| `MONITOR_SESSION` | Telethon session 路径，默认 `./data/monitor.session` |
+| `MONITOR_DB_PATH` | 监控配置存储，默认 `./data/monitor.db` |
+| `MONITOR_BATCH_SECONDS` | 默认聚合窗口秒数（0=实时逐条），可被 `/mon batch` 覆盖 |
 
 ---
 
@@ -164,6 +175,7 @@ docker inspect mediapush --format '{{.State.Health.Status}}'
 | `/115 <链接> [访问码]` | 显式触发 |
 | `/refresh <tmdb_id>` | 清除该 TMDB 缓存，下次重新拉取（剧集更新集数时用） |
 | `/status` | 查看配置与 115 健康状态 |
+| `/mon` | 频道监控管理（详见下节） |
 | `/help` | 帮助 |
 
 处理流程：Bot 先回复"⏳ 正在读取…"，读取完成后回复 `✅ 已推送 · 文件 N · 🎬 标题 (年份)`，同时频道收到带海报的卡片。
@@ -171,6 +183,29 @@ docker inspect mediapush --format '{{.State.Health.Status}}'
 **卡片包含**：标题/年份、TMDB 评分、类型、国家、导演/主创、主演、画质/HDR/来源、季集（或电影时长）、首播/上映、概览、115 分享链接（含访问码）、TMDB 详情链接。
 
 **去重**：同一分享码重复发送会提示"已推送过，跳过"。TMDB 元数据走缓存（连载中剧集 3 天、已完结 30 天）。
+
+### 频道监控（/mon）
+
+用你自己的 Telegram 账号（Telethon）实时监控公开频道，捕获新消息中的 ed2k 链接（`ed2k://|file|...|/` 标准格式），经格式验证与关键词过滤后推送到目标频道。推送格式包含来源频道、北京时间戳与 `<code>` 明文链接块。
+
+| 命令 | 说明 |
+|---|---|
+| `/mon` | 查看监控状态（服务/频道/目标/窗口/规则） |
+| `/mon add @频道` | 添加监控频道（t.me 链接 / chat_id 亦可，账号自动加入频道） |
+| `/mon del @频道` | 移除监控频道 |
+| `/mon target <频道ID>` | 设置推送目标（默认 `TG_CHAT_ID_ED2K`，回退 `TG_CHAT_ID`；Bot 需为该频道管理员） |
+| `/mon batch <秒>` | 聚合窗口：同频道 N 秒内的链接合并为一条推送（0=实时逐条） |
+| `/mon filter` | 查看关键词过滤规则 |
+| `/mon filter +关键词` | 仅推送文件名命中关键词的链接（include 白名单） |
+| `/mon filter -关键词` | 丢弃文件名命中关键词的链接（exclude 黑名单） |
+| `/mon filter del 关键词` | 删除规则 |
+
+**可靠性机制**：
+- 去重：md5(链接) 持久化 30 天，重复链接不再推送；推送失败不标记，链接再次出现自动重试。
+- 补扫：重启后按频道消息水位（last_msg_id）回溯最多 100 条，停机期间漏掉的消息不丢失。
+- 限流：推送串行 + 2s 间隔 + flood control 自动等待 + 3 次退避重试。
+- 断连：Telethon 自动重连；事件处理异常不影响 Bot 主链路。
+- 频道监控与 Bot 主推送相互独立，监控故障不会影响手动推送功能。
 
 ---
 
@@ -194,11 +229,16 @@ app/
 │   └── client.py        # TMDB API（搜索带年回退/详情/海报/集数 + 缓存）
 ├── telegram/
 │   ├── bot.py           # PTB Application（concurrent_updates + 代理 + 心跳）
-│   ├── handlers.py      # 命令 + 裸链接处理
+│   ├── handlers.py      # 命令 + 裸链接处理 + /mon 频道监控管理
 │   └── pusher.py        # 卡片渲染 + 推送
+├── monitor/             # 频道监控（Telethon 用户账号）
+│   ├── store.py         # 监控配置持久化（频道/规则/去重，monitor.db）
+│   ├── watcher.py       # ed2k 提取/验证/过滤/渲染（纯函数）
+│   ├── service.py       # Telethon 封装 + 实时事件 + 补扫 + 推送
+│   └── login.py         # 首次登录 CLI（python -m app.monitor.login）
 └── db/
     └── cache.py         # aiosqlite：tmdb_cache + pushed_shares
-tests/                   # 单测（parser/link_parser/tmdb/pusher/cache/processor）
+tests/                   # 单测（parser/link_parser/tmdb/pusher/cache/processor/monitor）
 ```
 
 ---

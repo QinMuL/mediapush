@@ -104,6 +104,14 @@ class TelegramService:
             task = app.bot_data.pop("_heartbeat_task", None)
             if task and not task.done():
                 task.cancel()
+            # 频道监控：取消启动任务 + 停止服务（冲刷待推送批次后断开）
+            monitor_task = app.bot_data.pop("_monitor_task", None)
+            if monitor_task and not monitor_task.done():
+                monitor_task.cancel()
+            if self.container.monitor is not None:
+                await self.container.monitor.stop()
+            if self.container.monitor_store is not None:
+                await self.container.monitor_store.close()
             # 关闭时清理 TMDB/缓存资源（telegram 生命周期由 PTB 自管，不在此 stop）
             logger.info("Bot 关闭：清理 TMDB/缓存资源")
             if self.container.tmdb is not None:
@@ -111,9 +119,24 @@ class TelegramService:
             if self.container.cache is not None:
                 await self.container.cache.close()
 
+        async def _start_monitor():
+            """频道监控启动（Telethon 用户账号）；失败不影响 Bot 主链路。"""
+            try:
+                ok = await self.container.monitor.start()
+                if not ok:
+                    logger.warning(
+                        "频道监控未启动（/mon 可查看原因；登录：%s）",
+                        "python -m app.monitor.login",
+                    )
+            except Exception as exc:
+                logger.error("频道监控启动失败：%s", exc, exc_info=exc)
+
         async def _post_init(app):
             await setup_commands(app)
             app.bot_data["_heartbeat_task"] = asyncio.create_task(_heartbeat_loop(app))
+            # 频道监控：独立任务启动（连接 + 补扫耗时，不阻塞 polling）
+            if self.container.monitor is not None:
+                app.bot_data["_monitor_task"] = asyncio.create_task(_start_monitor())
 
         builder = (
             ApplicationBuilder()
