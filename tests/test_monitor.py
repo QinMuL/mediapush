@@ -604,6 +604,18 @@ class _FakeContainer:
         self.pusher = _FakePusher(fail)
 
 
+class _FakeProcessor:
+    """可编程 processor：按序弹出预设结果，记录 process 调用。"""
+
+    def __init__(self, results: list) -> None:
+        self.results = list(results)
+        self.calls: list[tuple] = []
+
+    async def process(self, parsed, *, chat_id: str | None = None):
+        self.calls.append((parsed.provider, parsed.code, chat_id))
+        return self.results.pop(0)
+
+
 class _FakeDate:
     def __init__(self, ts: float) -> None:
         self._ts = ts
@@ -731,6 +743,115 @@ def test_flush_failure_rolls_back_seen(tmp_path, monkeypatch):
         assert container.pusher.bot.sent == []  # 全部失败（内部已重试 3 次）
         assert not await store.is_seen(h)  # 未标记去重
         assert h not in svc._seen_mem  # 占位回滚，可重试
+        await store.close()
+
+    asyncio.run(run())
+
+
+# ------------------------------------------------------------------ #
+# service：卡片模式（有 processor 时走主链路，模板与手动推送一致）
+# ------------------------------------------------------------------ #
+def _pr(ok: bool, message: str = "", dup: bool = False):
+    from app.core.processor import ProcessResult
+
+    return ProcessResult(ok=ok, message=message, dup=dup)
+
+
+def _make_card_svc(tmp_path, results, fail: bool = False):
+    """构造带 FakeProcessor 的监控服务（卡片模式）。"""
+    from app.monitor.service import MonitorService, _Pending
+
+    store = MonitorStore(str(tmp_path / "m.db"))
+    container = _FakeContainer(fail)
+    processor = _FakeProcessor(results)
+    container.processor = processor
+    svc = MonitorService(_Settings(), store, container)
+    items = [parse_link(_LINK_OK), parse_link(_LINK_OK2)]
+    hashes = [link_hash(_LINK_OK), link_hash(_LINK_OK2)]
+    svc._pending[-100123] = _Pending(
+        title="频道", items=items, hashes=hashes, latest_ts=1756089600.0
+    )
+    svc._seen_mem = set(hashes)
+    return svc, store, container, processor
+
+
+def test_flush_card_mode_uses_processor_pipeline(tmp_path, monkeypatch):
+    """有 processor：逐链接走 process（与手动推送同一管线），不再发合并文本。"""
+    import app.monitor.service as svc_mod
+
+    monkeypatch.setattr(svc_mod, "_PUSH_INTERVAL", 0)
+    svc, store, container, processor = _make_card_svc(
+        tmp_path, [_pr(True), _pr(True)]
+    )
+
+    async def run():
+        await svc._flush(-100123)
+        # 两条链接各走一次主链路，provider=ed2k、code=完整 URL、目标=ed2k 频道
+        assert [(p, c, t) for p, c, t in processor.calls] == [
+            ("ed2k", _LINK_OK, "@ed2k_ch"),
+            ("ed2k", _LINK_OK2, "@ed2k_ch"),
+        ]
+        assert container.pusher.bot.sent == []  # 卡片由 pusher.push_share 发出
+        assert await store.is_seen(link_hash(_LINK_OK))
+        assert await store.is_seen(link_hash(_LINK_OK2))
+        await store.close()
+
+    asyncio.run(run())
+
+
+def test_flush_card_mode_dup_marks_seen_without_fallback(tmp_path):
+    """已推送过（dup）：视为完成并标记 seen，不回退纯文本。"""
+    svc, store, container, processor = _make_card_svc(
+        tmp_path, [_pr(True), _pr(False, "分享 xxx 已推送过，跳过", dup=True)]
+    )
+
+    async def run():
+        await svc._flush(-100123)
+        assert len(processor.calls) == 2
+        assert container.pusher.bot.sent == []  # dup 不回退纯文本
+        assert await store.is_seen(link_hash(_LINK_OK2))  # 仍标记 seen
+        await store.close()
+
+    asyncio.run(run())
+
+
+def test_flush_card_mode_tmdb_miss_falls_back_to_text(tmp_path):
+    """TMDB 未匹配：卡片失败但回退纯文本中继成功 → 标记 seen。"""
+    svc, store, container, _ = _make_card_svc(
+        tmp_path, [_pr(True), _pr(False, "TMDB 未匹配到：Unknown")]
+    )
+
+    async def run():
+        await svc._flush(-100123)
+        # 第二条回退为单链接纯文本
+        assert len(container.pusher.bot.sent) == 1
+        text = container.pusher.bot.sent[0]["text"]
+        assert f"<code>{_LINK_OK2}</code>" in text
+        assert await store.is_seen(link_hash(_LINK_OK))
+        assert await store.is_seen(link_hash(_LINK_OK2))  # 回退成功也算完成
+        await store.close()
+
+    asyncio.run(run())
+
+
+def test_flush_card_mode_partial_failure_rolls_back(tmp_path, monkeypatch):
+    """部分失败：成功的标记 seen，失败的回滚占位（可重试）。"""
+    import app.monitor.service as svc_mod
+
+    async def _fast_sleep(_secs):
+        pass
+
+    monkeypatch.setattr(svc_mod.asyncio, "sleep", _fast_sleep)
+    svc, store, _, _ = _make_card_svc(
+        tmp_path, [_pr(True), _pr(False, "TMDB 未匹配到：X")], fail=True
+    )
+
+    async def run():
+        await svc._flush(-100123)
+        # 第一条卡片成功；第二条卡片失败且回退纯文本也失败（bot.fail=True）
+        assert await store.is_seen(link_hash(_LINK_OK))
+        assert not await store.is_seen(link_hash(_LINK_OK2))
+        assert link_hash(_LINK_OK2) not in svc._seen_mem  # 占位回滚
         await store.close()
 
     asyncio.run(run())

@@ -22,6 +22,7 @@ class ProcessResult:
     title: str = ""
     year: int | None = None
     media_type: str = ""
+    dup: bool = False  # 命中去重（已推送过）——监控据此跳过且不重试
 
 
 @dataclass
@@ -135,8 +136,11 @@ class ShareProcessor:
             files=files,
         )
 
-    async def process(self, parsed) -> ProcessResult:
-        """自动直推：prepare → push_share → mark_pushed（行为与重构前等价）。"""
+    async def process(self, parsed, *, chat_id: str | None = None) -> ProcessResult:
+        """自动直推：prepare → push_share → mark_pushed（行为与重构前等价）。
+
+        chat_id 覆盖推送目标频道（频道监控用；None 按 provider 分流）。
+        """
         pr = await self.prepare(parsed)
         if not pr.ok:
             return ProcessResult(
@@ -146,6 +150,7 @@ class ShareProcessor:
                 title=pr.title,
                 year=pr.year,
                 media_type=pr.media_type,
+                dup="已推送过" in pr.message,
             )
 
         # 6. 推送
@@ -156,7 +161,7 @@ class ShareProcessor:
             )
         ok, msg = await pusher.push_share(
             pr.details, pr.media, parsed.code, parsed.password, pr.files,
-            provider=parsed.provider,
+            provider=parsed.provider, chat_id=chat_id,
         )
         title = pr.details.get("title") or pr.media.title
         if ok:

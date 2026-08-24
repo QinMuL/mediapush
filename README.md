@@ -188,7 +188,7 @@ docker inspect mediapush --format '{{.State.Health.Status}}'
 
 ### 频道监控（/mon）
 
-用你自己的 Telegram 账号（Telethon）实时监控公开频道，捕获新消息中的 ed2k 链接（`ed2k://|file|...|/` 标准格式），经格式验证与关键词过滤后推送到目标频道。推送格式包含来源频道、北京时间戳与 `<code>` 明文链接块。
+用你自己的 Telegram 账号（Telethon）实时监控公开频道，捕获新消息中的 ed2k 链接（`ed2k://|file|...|/` 标准格式），经格式验证与关键词过滤后推送到目标频道。推送走与手动推送完全相同的卡片管线：TMDB 自动匹配 → 海报/背景图卡片 + 画质分析 + 📚 TMDB 详情按钮（与手动推送模板一致）；TMDB 未匹配到时回退纯文本中继（来源频道 + 时间戳 + `<code>` 明文链接块），链接不丢失。
 
 | 命令 | 说明 |
 |---|---|
@@ -197,7 +197,7 @@ docker inspect mediapush --format '{{.State.Health.Status}}'
 | `/mon add @频道` | 添加监控频道（t.me 链接 / chat_id 亦可，账号自动加入频道） |
 | `/mon del @频道` | 移除监控频道 |
 | `/mon target <频道ID>` | 设置推送目标（默认 `TG_CHAT_ID_ED2K`，回退 `TG_CHAT_ID`；Bot 需为该频道管理员） |
-| `/mon batch <秒>` | 聚合窗口：同频道 N 秒内的链接合并为一条推送（0=实时逐条） |
+| `/mon batch <秒>` | 聚合窗口：同频道 N 秒内的链接缓冲后逐条推卡片（0=实时；窗口用于合并突发与去重） |
 | `/mon filter` | 查看关键词过滤规则 |
 | `/mon filter +关键词` | 仅推送文件名命中关键词的链接（include 白名单） |
 | `/mon filter -关键词` | 丢弃文件名命中关键词的链接（exclude 黑名单） |

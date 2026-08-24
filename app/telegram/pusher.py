@@ -664,18 +664,20 @@ class Pusher:
         *,
         quality_extra: str = "",
         is_premium: bool = False,
+        chat_id: str | None = None,
     ) -> tuple[bool, str]:
         """推送卡片到频道（单消息）。
 
         有海报：send_photo + caption（≤1024，智能截断）
         无海报或发送失败：send_message + text（≤4096，完整）
         quality_extra/is_premium 透传给渲染（编辑模式精品标记/推荐语）。
+        chat_id 覆盖默认分流目标（频道监控用；None 按 provider 分流）。
         """
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
         from app.tmdb.client import TMDBHelper
 
-        chat_id = self._select_chat_id(provider)
+        chat_id = chat_id or self._select_chat_id(provider)
         image_url = TMDBHelper.image_url(details)
         tmdb_url = _tmdb_url(details)
         reply_markup = None

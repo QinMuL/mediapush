@@ -54,7 +54,8 @@ class FakePusher:
     def __init__(self):
         self.pushed = []
 
-    async def push_share(self, details, media, code, password, files=None, provider="115"):
+    async def push_share(self, details, media, code, password, files=None, provider="115",
+                         **kwargs):
         self.pushed.append((code, password, files, provider))
         return True, "已推送（测试）"
 

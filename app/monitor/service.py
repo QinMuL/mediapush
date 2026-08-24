@@ -544,14 +544,64 @@ class MonitorService:
         pend = self._pending.pop(chat_id, None)
         if pend is None or not pend.items:
             return
-        text = render_batch(pend.title, pend.items, pend.latest_ts)
-        if await self._push_text(text):
-            await self.store.mark_seen(pend.hashes)
-            logger.info("监控推送成功：%s（%d 条）", pend.title, len(pend.items))
-        else:
+
+        processor = getattr(self.container, "processor", None)
+        if processor is None:
+            # 降级：无 processor（如测试 stub）时退回合并纯文本推送
+            text = render_batch(pend.title, pend.items, pend.latest_ts)
+            if await self._push_text(text):
+                await self.store.mark_seen(pend.hashes)
+                logger.info("监控推送成功：%s（%d 条）", pend.title, len(pend.items))
+            else:
+                self._seen_mem -= set(pend.hashes)
+                logger.error("监控推送失败（%d 条待重试）：%s", len(pend.items), pend.title)
+            return
+
+        # 卡片模式：逐链接走主链路（TMDB 匹配 → 海报卡片），
+        # 与手动推送模板完全一致；单条失败不影响其余
+        target = await self.target_chat_id()
+        done: list[str] = []
+        failed: list[str] = []
+        for item, h in zip(pend.items, pend.hashes):
+            if await self._push_card(processor, item, pend.title, pend.latest_ts, target):
+                done.append(h)
+            else:
+                failed.append(h)
+        if done:
+            await self.store.mark_seen(done)
+        if failed:
             # 失败：回滚进程内去重占位，不落库——链接再次出现/重启补扫会重试
-            self._seen_mem -= set(pend.hashes)
-            logger.error("监控推送失败（%d 条待重试）：%s", len(pend.items), pend.title)
+            self._seen_mem -= set(failed)
+            logger.error("监控推送失败（%d 条待重试）：%s", len(failed), pend.title)
+        if done:
+            logger.info("监控推送成功：%s（%d 条卡片）", pend.title, len(done))
+
+    async def _push_card(self, processor, item: LinkItem, source: str, ts: float,
+                         target: str) -> bool:
+        """单链接推送：优先完整卡片（与手动推送一致），TMDB 未匹配回退纯文本。"""
+        from app.core.link_parser import ParsedShare
+
+        try:
+            r = await processor.process(
+                ParsedShare("ed2k", item.link), chat_id=target or None
+            )
+            if r.ok:
+                await asyncio.sleep(_PUSH_INTERVAL)  # 限速，防 flood control
+                return True
+            if r.dup:
+                # 已推送过（手动或此前监控）：视为完成，不重推不回退
+                logger.info("监控跳过已推送链接：%s", r.message)
+                return True
+            logger.warning("监控卡片推送未成功（%s）：%s — 回退纯文本", r.message, item.filename)
+        except Exception:
+            logger.exception("监控卡片推送异常：%s", item.filename)
+
+        # 回退：TMDB 未匹配/卡片异常时仍以纯文本中继链接（不丢资源）
+        text = render_batch(source, [item], ts)
+        if await self._push_text(text):
+            return True
+        logger.error("监控回退纯文本推送失败：%s", item.filename)
+        return False
 
     async def _push_text(self, text: str) -> bool:
         """经 Bot 推送到目标频道：flood 自动等待 + 3 次退避重试 + 全局串行限速。"""
