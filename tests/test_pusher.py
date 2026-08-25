@@ -102,6 +102,17 @@ def test_caption_has_links():
     assert "themoviedb.org" not in cap
 
 
+def test_caption_has_tmdb_id():
+    """标题区含 🆔 TMDB ID 信息项（与 📚 TMDB 详情按钮配套，便于溯源）。"""
+    cap = render_caption(_tv_details(), _tv_media(), "sw8k9m2", "ab12", _sample_files())
+    assert "🆔 TMDB：100" in cap
+    # 无 tmdb_id 时不输出该行
+    details = _tv_details()
+    details["tmdb_id"] = None
+    cap2 = render_caption(details, _tv_media(), "sw8k9m2", "ab12", _sample_files())
+    assert "🆔 TMDB" not in cap2
+
+
 def test_caption_includes_password():
     cap = render_caption(_tv_details(), _tv_media(), "sw8k9m2", "ab12", _sample_files())
     assert "ab12" in cap

@@ -328,6 +328,11 @@ def _render_head(
     icon_label = "📽️ 电影" if is_movie else "🎞️ 剧集"
     lines = [f"{icon_label}：<b>{title}</b>"]
 
+    # TMDB ID（配套下方 📚 TMDB 详情按钮，便于溯源）
+    tmdb_id = details.get("tmdb_id")
+    if tmdb_id:
+        lines.append(f"🆔 TMDB：{tmdb_id}")
+
     # 评分
     vote = details.get("vote_average") or 0
     vcount = details.get("vote_count") or 0
