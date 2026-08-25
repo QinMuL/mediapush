@@ -928,11 +928,48 @@ async def setup_commands(application: Application) -> None:
         logger.warning("清理残留 getUpdates 会话（可忽略，轮询循环会自动重试）：%s", exc)
 
 
+# ---------------------------------------------------------------------- #
+# 网络异常降噪：异常风暴时 60s 窗口内只打 1 次详情，其余计数，恢复打汇总
+_NET_WARN_WINDOW = 60.0
+_net_warn: dict[str, tuple[float, int]] = {}  # 类型名 -> (窗口起点, 计数)
+
+
 async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """全局错误处理：网络异常降级 WARN（PTB 自动重连），其他 ERROR + 用户上下文。"""
+    """全局错误处理：网络/冲突异常降级 WARN（PTB 自动重连），其他 ERROR + 用户上下文。
+
+    - Conflict(409)：进程/网络重启后旧 getUpdates 在 TG 侧残留 ~1 分钟，属预期自愈，WARN
+    - NetworkError/TimedOut：风暴降噪（60s 窗口计数），恢复时打汇总
+    """
+    import time as _time
+
+    from telegram.error import Conflict
+
     err = context.error
+    if isinstance(err, Conflict):
+        logger.warning(
+            "getUpdates 会话冲突（多为进程/网络重启后旧轮询在 TG 侧残留，"
+            "约 1 分钟内自愈；持续超 5 分钟请检查是否有第二实例同 token）：%s",
+            err,
+        )
+        return
     if isinstance(err, (NetworkError, TimedOut)):
-        logger.warning("TG 网络异常（PTB 将自动重连）：%s", err)
+        now = _time.monotonic()
+        kind = type(err).__name__
+        # 未见过的类型：起点设为远古 → 首条必然打详情
+        start, count = _net_warn.get(kind, (now - _NET_WARN_WINDOW - 1, 0))
+        if now - start > _NET_WARN_WINDOW:
+            # 上一窗口结束：若曾风暴，先打汇总再开新窗口
+            if count > 1:
+                logger.warning("TG 网络异常风暴已恢复：近 %ds 内 %s ×%d", _NET_WARN_WINDOW, kind, count)
+            _net_warn[kind] = (now, 1)
+            # 代理不可达（连接被拒/代理握手失败）明确指向代理排查
+            msg = str(err)
+            hint = ""
+            if "refused" in msg.lower() or "proxy" in msg.lower():
+                hint = "（疑似代理不可达：检查 PROXY_URL 指向的代理是否运行、容器能否访问宿主机端口）"
+            logger.warning("TG 网络异常（PTB 将自动重连）%s：%s", hint, err)
+        else:
+            _net_warn[kind] = (start, count + 1)
         return
     user_id = None
     if isinstance(update, Update) and update.effective_user:
