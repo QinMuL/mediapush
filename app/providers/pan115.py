@@ -448,6 +448,45 @@ class Pan115Provider(BaseShareProvider):
             logger.warning("分享设为永久失败（保留默认有效期）：%s", exc)
         return share_code, receive_code
 
+    async def fs_makedirs(self, path: str) -> int:
+        """幂等创建目录（含中间节点），返回目录 cid。需登录 cookie。
+
+        fs_dir_getid2（is_create=1）：已存在返回现有 id，不产生操作事件。
+        响应多端格式差异（webapi data.file_id / app 顶层 cid），全部兼容。
+        """
+        from p115client.client import check_response
+
+        client = self._login_client()
+        resp = await self._call_with_margin(
+            lambda: client.fs_makedirs(path, async_=True),
+            label="fs_makedirs",
+        )
+        try:
+            check_response(resp)
+        except Exception as exc:
+            raise Pan115Error(f"创建目录失败（{path}）：{exc}") from exc
+        data = resp.get("data") or {}
+        cid = int(resp.get("cid") or data.get("cid") or data.get("file_id") or 0)
+        if cid <= 0:
+            raise Pan115Error(f"创建目录失败（{path}）：响应缺少 cid")
+        return cid
+
+    async def fs_move(self, file_id: int, to_cid: int) -> None:
+        """移动文件/目录到目标目录（open API；官方提示勿并发、单次≤5万）。"""
+        from p115client.client import check_response
+
+        client = self._login_client()
+        resp = await self._call_with_margin(
+            lambda: client.fs_move(file_id, pid=to_cid, async_=True),
+            label="fs_move",
+        )
+        try:
+            check_response(resp)
+        except Exception as exc:
+            raise Pan115Error(
+                f"移动失败（fid={file_id}→cid={to_cid}）：{exc}"
+            ) from exc
+
     # ------------------------------------------------------------------ #
     async def check_health(self) -> bool | None:
         """健康检查（验证自有 cookie）。

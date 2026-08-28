@@ -8,6 +8,11 @@
 4. processor.process(ParsedShare("115", share_code, receive_code)) 推卡片
    —— 完全复用手动推送管线（TMDB 匹配/卡片/分流/持久化去重/巡检撤卡）
 5. mark_shared 记档；失败不标记 → 下轮重扫自动重试
+6. 推送成功后移入归档目录（SHARE_ARCHIVE_DIR，空=不移动）
+
+- 归档时机：推送成功 = 快照已生成、审核已通过（process 内部先 list_share），
+  此时移动安全——115 分享绑定文件快照而非路径，移动不失效；且失效巡检兜底。
+  移动失败仅告警不影响推送；ok 状态仍在监控目录 → 下轮补移（幂等闭环）。
 
 - 需 115 cookie（建分享不支持匿名）；无 cookie 优雅跳过
 - 后台每 SHARE_WATCH_INTERVAL_MINUTES 分钟一轮（挂 bot post_init）；
@@ -64,6 +69,7 @@ class ShareWatcher:
         self.settings = settings
         self.interval = max(1.0, settings.share_watch_interval_minutes)
         self._task: asyncio.Task | None = None
+        self._archive_cid: int | None = None  # 归档目录 CID（进程内缓存）
 
     # ------------------------------------------------------------------ #
     async def run_once(self) -> WatchReport:
@@ -101,6 +107,8 @@ class ShareWatcher:
                 record = await cache.get_shared_item(dir_id, fid)
                 if record is not None and record["status"] == "ok":
                     report.skipped += 1
+                    # ok 却仍在监控目录（上次移动失败/归档中途启用）→ 补移
+                    await self._try_archive(pan115, fid, name)
                     continue
 
                 if record is None:
@@ -175,10 +183,48 @@ class ShareWatcher:
             if result.dup:
                 await cache.mark_shared(dir_id, fid)
                 logger.info("目录监控：分享已推送过，直接标记完成：%s", name)
+                await self._try_archive(pan115, fid, name)
                 return
             raise RuntimeError(result.message)
         await cache.mark_shared(dir_id, fid)
         logger.info("目录监控推送成功：%s（分享码 %s）", name, share_code)
+        await self._try_archive(pan115, fid, name)
+
+    # ------------------------------------------------------------------ #
+    # 归档：推送成功后移入全局归档目录（SHARE_ARCHIVE_DIR，空=不启用）
+    @property
+    def archive_enabled(self) -> bool:
+        return bool(getattr(self.settings, "share_archive_dir", ""))
+
+    async def _try_archive(self, pan115, fid: int, name: str) -> None:
+        """移动已分享目录到归档目录；失败仅告警（不影响推送结果，下轮补移）。"""
+        if not self.archive_enabled:
+            return
+        try:
+            await self._move_to_archive(pan115, fid, name)
+        except Exception as exc:  # noqa: BLE001 - 归档失败不影响推送主链路
+            logger.warning("目录监控：移入归档失败（%s，下轮补移）：%s", name, exc)
+
+    async def _move_to_archive(self, pan115, fid: int, name: str) -> None:
+        cid = await self._archive_dir_cid(pan115)
+        try:
+            await pan115.fs_move(fid, cid)
+        except Pan115Error:
+            # 缓存 CID 可能已失效（session 过期/目录被删）→ 清缓存，下轮重解析
+            self._archive_cid = None
+            raise
+        logger.info(
+            "目录监控：%s 已移入归档目录 %s",
+            name, getattr(self.settings, "share_archive_dir", ""),
+        )
+
+    async def _archive_dir_cid(self, pan115) -> int:
+        """归档目录 CID：懒解析 + 进程内缓存（fs_makedirs 幂等，已存在返回现有值）。"""
+        path = str(getattr(self.settings, "share_archive_dir", ""))
+        if self._archive_cid is None:
+            self._archive_cid = await pan115.fs_makedirs(path)
+            logger.info("归档目录就绪：%s（CID %d）", path, self._archive_cid)
+        return self._archive_cid
 
     # ------------------------------------------------------------------ #
     async def start(self) -> None:

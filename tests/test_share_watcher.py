@@ -38,6 +38,8 @@ class _FakePan115:
         self.dirs_map = dirs_map  # cid -> [items]
         self.cookie = cookie
         self.share_calls: list = []
+        self.makedirs_calls: list[str] = []
+        self.moved: list[tuple[int, int]] = []
 
     async def list_dir(self, cid):
         return self.dirs_map.get(cid, [])
@@ -47,6 +49,13 @@ class _FakePan115:
         if fid == 999:  # 特殊 fid：模拟建分享失败
             raise Pan115Error("创建分享失败：风控")
         return f"code{fid}", f"pwd{fid}"
+
+    async def fs_makedirs(self, path):
+        self.makedirs_calls.append(path)
+        return 999  # 归档目录 CID（桩固定值）
+
+    async def fs_move(self, fid, to_cid):
+        self.moved.append((fid, to_cid))
 
 
 class _FakeProcessor:
@@ -72,6 +81,11 @@ class _FakeContainer:
 
 class _FakeSettings:
     share_watch_interval_minutes = 10.0
+    share_archive_dir = ""  # 默认不启用归档（现有用例语义不变）
+
+
+class _ArchiveSettings(_FakeSettings):
+    share_archive_dir = "/已分享"
 
 
 def _dir(idx, path, cid):
@@ -269,3 +283,83 @@ def test_watcher_report_summary():
     assert "推送 2" in s
     assert "失败 1" in s
     assert "已分享 4" in s
+
+
+# ==================== 归档：推送成功后移入 SHARE_ARCHIVE_DIR ====================
+def test_archive_move_after_push_success(monkeypatch):
+    """推送成功 → fs_makedirs 幂等建归档目录 + fs_move 移入。"""
+    _fast(monkeypatch)
+    cache = _FakeCache([_dir(1, "/媒体", 100)])
+    pan115 = _FakePan115({100: [{"fid": 71, "name": "剧I", "is_dir": True}]})
+    proc = _FakeProcessor()
+    watcher = ShareWatcher(
+        _FakeContainer(pan115, cache, proc), _ArchiveSettings()
+    )
+
+    report = asyncio.run(watcher.run_once())
+
+    assert report.shared == 1
+    assert pan115.makedirs_calls == ["/已分享"]
+    assert pan115.moved == [(71, 999)]
+    assert watcher._archive_cid == 999  # CID 已缓存
+
+
+def test_archive_skipped_dir_retried(monkeypatch):
+    """ok 状态仍在监控目录（上次移动失败/归档中途启用）→ 本轮仅补移。"""
+    _fast(monkeypatch)
+    cache = _FakeCache([_dir(1, "/媒体", 100)])
+    cache.records[(1, 81)] = {
+        "file_id": 81, "dir_id": 1, "name": "剧J",
+        "share_code": "old81", "password": "", "status": "ok",
+    }
+    pan115 = _FakePan115({100: [{"fid": 81, "name": "剧J", "is_dir": True}]})
+    proc = _FakeProcessor()
+    watcher = ShareWatcher(
+        _FakeContainer(pan115, cache, proc), _ArchiveSettings()
+    )
+
+    report = asyncio.run(watcher.run_once())
+
+    assert report.skipped == 1
+    assert report.shared == 0
+    assert pan115.share_calls == []  # 不再建分享/推送
+    assert proc.process_calls == []
+    assert pan115.moved == [(81, 999)]  # 只补移动
+
+
+def test_archive_move_failure_not_fatal(monkeypatch):
+    """移动失败仅告警：推送仍计成功、状态 ok；缓存 CID 清空待下轮重解析。"""
+    _fast(monkeypatch)
+
+    class _BoomMove(_FakePan115):
+        async def fs_move(self, fid, to_cid):
+            raise Pan115Error("移动失败：风控")
+
+    cache = _FakeCache([_dir(1, "/媒体", 100)])
+    pan115 = _BoomMove({100: [{"fid": 91, "name": "剧K", "is_dir": True}]})
+    proc = _FakeProcessor()
+    watcher = ShareWatcher(
+        _FakeContainer(pan115, cache, proc), _ArchiveSettings()
+    )
+
+    report = asyncio.run(watcher.run_once())
+
+    assert report.shared == 1  # 推送成功不受影响
+    assert report.failed == 0
+    assert cache.records[(1, 91)]["status"] == "ok"
+    assert watcher._archive_cid is None  # 缓存失效清空 → 下轮重解析
+
+
+def test_archive_disabled_no_move(monkeypatch):
+    """SHARE_ARCHIVE_DIR 空 → 不建目录不移动（仅标记）。"""
+    _fast(monkeypatch)
+    cache = _FakeCache([_dir(1, "/媒体", 100)])
+    pan115 = _FakePan115({100: [{"fid": 95, "name": "剧L", "is_dir": True}]})
+    proc = _FakeProcessor()
+    watcher = ShareWatcher(_FakeContainer(pan115, cache, proc), _FakeSettings())
+
+    report = asyncio.run(watcher.run_once())
+
+    assert report.shared == 1
+    assert pan115.makedirs_calls == []
+    assert pan115.moved == []
