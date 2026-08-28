@@ -1,13 +1,13 @@
 # 网盘分享链接 → TMDB → Telegram 频道推送工具
 
-把 **115 网盘分享链接** 发给一个 Telegram Bot，Bot 会：
+把 **115 网盘分享链接** 或 **ed2k 链接** 发给一个 Telegram Bot，Bot 会：
 
-1. 通过 `p115client` 读取分享内的文件列表
+1. 通过 `p115client` 读取分享内的文件列表（ed2k 则纯本地解析链接）
 2. 用 `guessit` 解析文件名，聚合出标题/年份/季集/画质
 3. 调 **TMDB 官方 API** 匹配元数据（海报、评分、概览、演职员、集数）
 4. 渲染成卡片，**推送到指定 Telegram 频道**，并做去重与缓存
 
-> 当前仅接入 **115 网盘**，但抽象了 `BaseShareProvider` 接口，后续可扩展夸克/阿里等。
+> 已接入 **115 网盘 + ed2k** 两种来源（`BaseShareProvider` 接口抽象，可扩展夸克/阿里等）。115 与 ed2k 卡片可分流推送到不同频道（`TG_CHAT_ID_115` / `TG_CHAT_ID_ED2K`）。
 
 ---
 
@@ -31,10 +31,12 @@
 ### 5. 115 Cookie（可选）
 - **读取分享内容走 115 的匿名 web 接口，无需 cookie**——访问码就是门禁。因此这一项可留空。
 - 仅当想用 `/status` 验证自有账号有效性时才填：浏览器登录 [115 网盘网页版](https://115.com)，F12 → Network → 任一请求 → 复制 `Cookie` 头，形如 `UID=xxx;CID=xxx;SEID=xxx;KID=xxx;`，填 `PAN115_COOKIE`。
+- **推荐文件化**：改填 `PAN115_COOKIE_FILE` 指向 cookie 文件路径（一整行 cookie 字符串）。容器挂载该文件后**更新内容无需重启**——巡检器每轮热加载；cookie 失效时还会私信 admin 告警（24h 节流）。`PAN115_COOKIE` 环境变量优先于文件。
 
 ### 6. 代理（国内必需）
 - TG Bot API 与 TMDB API 在国内需走代理；填 `PROXY_URL`（如 `http://127.0.0.1:7890` 或 `socks5://127.0.0.1:1080`）。
 - **115 默认不走代理**（走代理易触发风控），如确实需要可设 `PAN115_USE_PROXY=true`（当前版本 115 代理尚未完全接线，默认直连）。
+- 进程启动时会**自动清除** docker-compose 注入的 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` 等环境变量（防止 115 意外走代理触发风控）；代理只认 `PROXY_URL` 显式配置。
 
 ### 7. 频道监控账号（可选）
 - 功能：用你自己的 Telegram 账号实时监控指定公开频道，自动捕获其中的 ed2k 链接并推送到推送频道。
@@ -60,13 +62,19 @@ cp .env.example .env
 | 变量 | 说明 |
 |---|---|
 | `TG_BOT_TOKEN` | Bot token |
-| `TG_CHAT_ID` | 推送频道（@username 或 -100xxx） |
+| `TG_CHAT_ID` | 推送频道（@username 或 -100xxx），未分流时的回退目标 |
+| `TG_CHAT_ID_115` | 115 网盘链接推送频道（可选，回退 `TG_CHAT_ID`） |
+| `TG_CHAT_ID_ED2K` | ed2k 链接推送频道（可选，回退 `TG_CHAT_ID`） |
 | `TG_ADMIN_IDS` | 管理员用户 ID（逗号分隔） |
 | `TMDB_API_KEY` | TMDB v3 API Key |
 | `TMDB_LANGUAGE` | TMDB 语言，默认 `zh-CN` |
 | `PAN115_COOKIE` | 115 cookie（**可选**，留空走匿名读取） |
+| `PAN115_COOKIE_FILE` | 115 cookie 文件路径（可选，热加载 + 失效告警；`PAN115_COOKIE` 优先） |
 | `PAN115_USE_PROXY` | 115 是否走代理，默认 `false` |
 | `PROXY_URL` | TG/TMDB 代理地址 |
+| `INSPECT_ENABLED` | 是否启用分享失效巡检，默认 `true` |
+| `INSPECT_INTERVAL_HOURS` | 巡检间隔（小时），默认 `6` |
+| `INSPECT_NOTIFY` | 失效撤卡后是否私信 admin 告警，默认 `true` |
 | `LOG_LEVEL` | 控制台日志级别，默认 `INFO`（文件日志恒为 `DEBUG` 全量） |
 | `DB_PATH` | SQLite 缓存路径，默认 `./data/cache.db` |
 | `LOG_FILE` | 文件日志路径，默认 `./data/logs/mediapush.log`（按天轮转，保留 14 天） |
@@ -174,7 +182,13 @@ docker inspect mediapush --format '{{.State.Health.Status}}'
 |---|---|
 | 直接发送 `https://115.com/s/xxxx?password=yyyy` | 自动识别并处理（最常用） |
 | 发送 8+ 字符裸码 | 当作分享码处理 |
+| 发送 ed2k 链接 `ed2k://\|file\|...\|/` | 当作 ed2k 资源处理（文件名含 SxxExx 判定为剧集） |
+| 消息正文含 `访问码：xxxx` / `提取码:xxxx` / `密码：xxxx` | 链接未带密码时自动提取访问码（URL 自带则不覆盖） |
+| 一条消息含多个链接 | 自动批处理：按集数排序逐个推送，实时进度 + 最终汇总 |
 | `/115 <链接> [访问码]` | 显式触发 |
+| `/edit <链接>` | 预览编辑模式：追加推荐语 / 切换 💎 精品标记后推送（跳过去重，可重推） |
+| `/cancel` | 取消当前编辑会话 |
+| `/inspect [数量]` | 手动巡检一轮已推送分享（失效撤卡，默认 50 条，详见下节） |
 | `/refresh <tmdb_id>` | 清除该 TMDB 缓存，下次重新拉取（剧集更新集数时用） |
 | `/status` | 查看配置与 115 健康状态 |
 | `/mon` | 频道监控管理（详见下节） |
@@ -182,9 +196,25 @@ docker inspect mediapush --format '{{.State.Health.Status}}'
 
 处理流程：Bot 先回复"⏳ 正在读取…"，读取完成后回复 `✅ 已推送 · 文件 N · 🎬 标题 (年份)`，同时频道收到带海报的卡片。
 
-**卡片包含**：标题/年份、TMDB 评分、类型、国家、导演/主创、主演、画质/HDR/来源、季集（或电影时长）、首播/上映、概览、115 分享链接（含访问码）、TMDB 详情链接。
+**卡片包含**：标题/年份、🆔 TMDB ID、TMDB 评分、类型、地区（国旗 emoji）、导演/主创、主演、体积、画质 8 维分析（💎 精品标记 / 📝 推荐语可经 `/edit` 追加）、季集（或电影时长）、首播/上映、概览、文件清单（可展开）、115 分享链接或 ed2k 资源（明文 `code` 模块）、📚 TMDB 详情按钮（卡片下方 inline button）。
 
-**去重**：同一分享码重复发送会提示"已推送过，跳过"。TMDB 元数据走缓存（连载中剧集 3 天、已完结 30 天）。
+**去重与缓存**：
+- 同一分享码重复发送提示"已推送过，跳过"；同一链接 60 秒内重复发送提示"正在处理中"（防并发双推）。
+- TMDB 元数据缓存统一 24 小时（过期自动清除重拉）。
+- `/edit` 重推会跳过持久化去重（用于补档访问码、更新卡片）。
+
+### 分享失效巡检（/inspect）
+
+已推送的 115 分享会因分享者取消/违规/审核而失效，频道里留死链影响体验。巡检器（`app/telegram/inspector.py`）定期体检已推送卡片：
+
+- **周期**：默认每 6 小时一轮（`INSPECT_INTERVAL_HOURS`），每轮查最久未检查的 50 条；启动 2 分钟后先跑一轮。
+- **判定**：调 115 `share_snap` 接口检查状态——`share_state=7` 或 errno 4100009/4100010 判定失效。
+- **撤卡**：失效卡片自动**删除频道消息**（撤卡），标记 `dead` 不再重复巡检；admin 收到汇总私信（`INSPECT_NOTIFY`）。
+- **语义区分**（实测 errno）：
+  - `4100012` 请输入访问码 / `4100008` 访问码错误 → **分享还活着**，计为存活，明细提示 `/edit` 重推可补档，不撤卡。
+  - 快照生成中 / 审核中 → 待定，下轮再看；网络异常 → 下轮自动重试。
+- **手动**：`/inspect 20` 立即巡检 20 条并回汇总（存活/失效撤卡/待定/缺访问码明细）。
+- ed2k 不巡检（磁力链无失效概念）；cookie 文件热加载与失效告警也挂在该循环。
 
 ### 频道监控（/mon）
 
@@ -216,32 +246,35 @@ docker inspect mediapush --format '{{.State.Health.Status}}'
 
 ```
 app/
-├── main.py              # 入口：加载配置 → 构建容器 → run_polling
-├── config.py            # .env / 环境变量加载与校验
+├── main.py              # 入口：加载配置 → 清代理环境变量 → 构建容器 → run_polling
+├── config.py            # .env / 环境变量加载与校验（含 cookie 文件读取）
 ├── core/
 │   ├── container.py     # DI 容器（懒加载各服务）
 │   ├── processor.py     # 编排：读取→解析→TMDB→推送→去重
-│   └── link_parser.py   # 115 链接/裸码解析
+│   └── link_parser.py   # 115 链接/裸码/ed2k 解析 + 正文访问码提取
 ├── providers/
 │   ├── base.py          # BaseShareProvider + ShareFile
+│   ├── ed2k.py          # ed2k Provider（纯字符串解析，无网络请求）
 │   ├── exceptions.py    # Pan115Error（独立，p115client 装坏也可导入）
-│   └── pan115.py        # 115 封装（p115client）
+│   └── pan115.py        # 115 封装（share_snap 预检 + margin/快照渐进重试）
 ├── parser/
 │   └── media_parser.py  # guessit + 噪音清洗 + 分享聚合
 ├── tmdb/
-│   └── client.py        # TMDB API（搜索带年回退/详情/海报/集数 + 缓存）
+│   └── client.py        # TMDB API（搜索带年回退/年份-标题-类型优先匹配/详情/缓存）
 ├── telegram/
-│   ├── bot.py           # PTB Application（concurrent_updates + 代理 + 心跳）
-│   ├── handlers.py      # 命令 + 裸链接处理 + /mon 频道监控管理
-│   └── pusher.py        # 卡片渲染 + 推送
+│   ├── bot.py           # PTB Application（concurrent_updates + 代理 + 心跳 + 巡检挂载）
+│   ├── handlers.py      # 命令 + 裸链接处理 + 批处理聚合 + 处理中去重 + /mon 管理
+│   ├── edit_session.py  # /edit 编辑会话状态（推荐语/精品标记）
+│   ├── inspector.py     # 分享失效巡检（撤卡/告警 + cookie 热加载）
+│   └── pusher.py        # 卡片渲染 + 推送（返回消息引用供撤卡）
 ├── monitor/             # 频道监控（Telethon 用户账号）
 │   ├── store.py         # 监控配置持久化（频道/规则/去重，monitor.db）
 │   ├── watcher.py       # ed2k 提取/验证/过滤/渲染（纯函数）
 │   ├── service.py       # Telethon 封装 + 实时事件 + 补扫 + 推送
 │   └── login.py         # 登录 CLI（备选；推荐 Bot 内 /mon login）
 └── db/
-    └── cache.py         # aiosqlite：tmdb_cache + pushed_shares
-tests/                   # 单测（parser/link_parser/tmdb/pusher/cache/processor/monitor）
+    └── cache.py         # aiosqlite：tmdb_cache + pushed_shares（巡检字段 + 自动迁移）
+tests/                   # 单测（parser/link_parser/pan115/tmdb/pusher/cache/processor/monitor/inspector/handlers）
 ```
 
 ---
@@ -263,9 +296,11 @@ ruff check .
 ### 关键设计约束（来自前序项目经验）
 
 - **p115client**：`P115Client(cookies=...)`（复数）；用 `tool.share_iterdir_walk(client, code, receive_code, app='web', async_=True)`，第三位置必须传访问码 `receive_code`；p115client 在方法内懒导入，装坏不拖垮 bot；`Pan115Error` 独立可导入。
+- **115 响应语义**（实测）：margin 风控返回 `{"margin": N}`（无 state/data，check_response 放行后 `resp["data"]` 抛 KeyError）→ 等 N 秒渐进重试（cap 30s，3 次）；「正在生成文件快照」→ 3s/6s/9s 退避重查；errno 4100009/4100010/`share_state=7` = 失效；errno 4100012/4100008 = 分享存在仅访问码缺失/错误，**不是死链**。
 - **Telegram**：`concurrent_updates(True)`（否则长 handler 阻塞队列）；handler 经 `bot_data` 注入 container，不访问私有属性；TG 走代理。
-- **TMDB**：4xx 不重试 / 429·5xx·超时指数退避重试；带年搜无果回退无年；连载剧缓存 3 天、已完结 30 天，upsert 刷新时间戳。
-- **代理分发**：TG + TMDB 走代理，115 默认不走。
+- **TMDB**：4xx 不重试 / 429·5xx·超时指数退避重试；带年搜无果回退无年；`search_best` 打分：年份吻合 > 标题精确（zh > original_title 别名 > 包含）> 评分，显式 media_type 过滤异型候选；元数据缓存统一 24h（upsert 刷新时间戳）。
+- **代理分发**：TG + TMDB 走代理，115 默认不走；启动时清除进程级代理环境变量（`main.py`）。
+- **推送链路**：`push_share` 返回 `(ok, msg, message_id, chat_id)` 消息引用，`mark_pushed` upsert 存档（provider/password/chat_id/message_id/title）；巡检撤卡靠该引用。批处理串行（全局锁 + 2s 限速）；同一链接处理中 60s 去重防双推。
 - **健康检查**：Bot `post_init` 启动心跳任务（每 30s 写 `/tmp/.heartbeat`），Docker HEALTHCHECK 检查文件新鲜度（120s 阈值），卡死时自动重启。详见部署章节。
 - 扩展新网盘：继承 `BaseShareProvider` 实现 `list_share`/`check_health`，在 `link_parser` 注册解析，在 `container` 注册实例，上层零改动。
 
@@ -274,9 +309,12 @@ ruff check .
 ## 七、常见问题
 
 - **Bot 不响应**：检查 `TG_ADMIN_IDS` 是否填了你的用户 ID；检查 `PROXY_URL` 是否可达；看 `docker compose logs`。
-- **115 读取失败**：访问码错误（确认链接带 `?password=`）；分享已失效；或匿名接口被限流（稍后重试）。注意读取分享**不需要 cookie**，cookie 仅 `/status` 健康检查用。
+- **115 读取失败**：访问码错误（确认链接带 `?password=`，或正文有"访问码：xxxx"提示行）；分享已失效；或匿名接口被限流（margin，稍后自动重试）。注意读取分享**不需要 cookie**，cookie 仅 `/status` 健康检查用。
+- **巡检全是"缺访问码"**：这些是升级前推送的旧卡片（当时未存档访问码），分享本身有效。想完整校验就 `/edit <链接>` 重推一次，之后新卡片都会存档访问码。
+- **巡检报"处理中/待定"**：分享正在生成快照或审核中，下轮巡检会复查；网络异常同理，不判死。
 - **TMDB 匹配不到**：文件名太乱时，可手动 `/115` 带更规范的链接；或检查 `TMDB_LANGUAGE`。
-- **频道收不到**：确认 Bot 已是频道管理员且有发送权限；确认 `TG_CHAT_ID` 正确。
+- **频道收不到**：确认 Bot 已是频道管理员且有发送权限；确认 `TG_CHAT_ID` 正确（分流时检查 `TG_CHAT_ID_115` / `TG_CHAT_ID_ED2K`）。
+- **cookie 失效告警**：仅影响 `/status` 健康检查，匿名读取分享不受影响。更新 cookie：改 `PAN115_COOKIE_FILE` 文件内容（自动热加载）或 `PAN115_COOKIE` 环境变量后重启。
 
 ---
 
@@ -295,4 +333,10 @@ ruff check .
 ```bash
 docker pull ghcr.io/qinmul/mediapush:latest
 ```
+
+---
+
+## 九、致谢
+
+部分工程经验借鉴自开源项目 [P115-Share](https://github.com/ListeningLTG/P115-Share)（分享链接处理工具）：margin 限速识别与渐进重试、快照生成中退避、访问码正文提取、处理中去重、cookie 文件热加载与失效告警、分享失效定期巡检 + 撤卡、代理环境变量清理、TMDB 年份/别名优先匹配。
 
