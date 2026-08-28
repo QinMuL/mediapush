@@ -183,11 +183,16 @@ class Cache:
     async def list_pushed_shares(
         self, *, provider: str = "115", limit: int = 100
     ) -> list[dict]:
-        """巡检候选：status='ok' 的指定 provider 分享，最久未检查的优先。"""
+        """巡检候选：status='ok' 的指定 provider 分享，最久未检查的优先。
+
+        ed2k 双重排除（code 是完整 ed2k:// URL，非 115 分享码，无失效概念）：
+        - provider 不符的行（新数据显式存 'ed2k'）
+        - 旧数据（迁移默认 provider='115' 但 code 是 ed2k:// 开头）
+        """
         cursor = await self._execute(
             "SELECT share_code, password, chat_id, message_id, title, "
             "last_checked_at, pushed_at FROM pushed_shares "
-            "WHERE provider=? AND status='ok' "
+            "WHERE provider=? AND status='ok' AND share_code NOT LIKE 'ed2k://%' "
             "ORDER BY (last_checked_at IS NULL) DESC, last_checked_at ASC "
             "LIMIT ?",
             (provider, limit),
