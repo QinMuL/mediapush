@@ -108,7 +108,25 @@ class Pan115Provider(BaseShareProvider):
             logger.warning("PAN115_USE_PROXY=true 但 p115client 代理未接线，115 仍走直连")
         self._client = None  # type: ignore[assignment]
         self._anon = None  # type: ignore[assignment]  # 匿名 web client（读分享/查状态）
+        self._app_client = None  # type: ignore[assignment]  # 登录 app client（proapi 通道）
         self._uid = _uid_from_cookie(self.cookie)
+
+    # ------------------------------------------------------------------ #
+    def _app_login_client(self):
+        """登录态 android client（proapi/分享快照通道）。无 cookie 返回 None。
+
+        115 已对 webapi 匿名 share_snap 请求返回 405（urllib3_future 请求
+        特征被拒，2026-08 实测：同参数 urllib 200 / 库请求 405）；proapi
+        的 share_snap_app / share_iterdir_walk(登录) 不受影响。
+        优先级：有 cookie 走 app 通道，无 cookie 退匿名 web（等 115 恢复）。
+        """
+        if not self.cookie:
+            return None
+        if self._app_client is None:
+            from p115client.client import P115Client
+
+            self._app_client = P115Client(self.cookie, app="android")
+        return self._app_client
 
     # ------------------------------------------------------------------ #
     def _anon_client(self):
@@ -150,13 +168,20 @@ class Pan115Provider(BaseShareProvider):
             raise Pan115Error(f"p115client.util 导入失败：{exc}") from exc
         payload = dict(share_extract_payload(code))
         payload["receive_code"] = receive_code or payload.get("receive_code") or ""
-        client = self._anon_client()
+
+        # 通道选择：有 cookie 走 proapi app 通道（webapi 匿名已被 405），
+        # 无 cookie 退 webapi 匿名（保底，115 恢复后仍可用）
+        app_client = self._app_login_client()
 
         for attempt in range(1, self._SNAP_MAX_RETRY + 1):
-            resp = await client.share_snap(
-                {"cid": 0, "limit": 1, "offset": 0, **payload},
-                async_=True,
-            )
+            if app_client is not None:
+                resp = await app_client.share_snap_app(
+                    payload, app="android", async_=True,
+                )
+            else:
+                resp = await self._anon_client().share_snap(
+                    payload, async_=True,
+                )
             if _is_margin_response(resp):
                 wait = min(float(resp.get("margin", 5) or 5), self._MARGIN_WAIT_CAP)
                 logger.warning(
@@ -260,9 +285,12 @@ class Pan115Provider(BaseShareProvider):
 
         out: list[ShareFile] = []
         try:
-            # client=None：匿名 web 读取（app='web' 支持不登录）
+            # 通道选择：有 cookie 用登录态（proapi app 通道，webapi 匿名已 405）；
+            # 无 client 匿名 web 读取（app='web' 支持不登录）
+            client = self._app_login_client()
             ait = share_iterdir_walk(
-                None, code, receive_code, app="web", async_=True
+                client, code, receive_code,
+                app="android" if client is not None else "web", async_=True,
             )
             async for _cid, dirs, files in ait:  # (cid, dirs, files)
                 for d in dirs or []:
@@ -304,6 +332,7 @@ class Pan115Provider(BaseShareProvider):
         """热更新 cookie（文件化支持）：重置客户端与 UID，下次健康检查用新值。"""
         self.cookie = (cookie or "").strip()
         self._client = None
+        self._app_client = None
         self._uid = _uid_from_cookie(self.cookie)
 
     # ------------------------------------------------------------------ #

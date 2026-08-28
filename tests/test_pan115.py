@@ -39,13 +39,15 @@ def _patch_precheck_ok(monkeypatch):
 
 def test_list_share_normalizes(monkeypatch):
     _patch_precheck_ok(monkeypatch)
+    seen: dict = {}
 
     def fake_walk(client, code, receive_code, **kw):
-        # 匿名读取：client 应为 None
-        assert client is None, "list_share 应匿名读取（client=None）"
+        # 有 cookie → 登录态 app 通道（proapi；webapi 匿名已被 115 405）
+        seen["client"], seen["app"] = client, kw.get("app")
+        assert client is not None, "有 cookie 应登录态读取"
         assert code == "CODE"
         assert receive_code == "PWD"
-        assert kw.get("app") == "web"
+        assert kw.get("app") == "android"
         assert kw.get("async_") is True
         return _FakeAIter([
             (1, [{"name": "Season 01", "is_dir": True, "size": 0}], []),
@@ -185,14 +187,19 @@ def test_no_cookie_constructs_without_raising():
 
 # -------------------- A2/A3/B2：margin / 快照 / 状态 -------------------- #
 class _FakeSnapClient:
-    """share_snap 桩：按序返回预设响应。"""
+    """share_snap 桩：按序返回预设响应（匿名 web / 登录 app 双通道）。"""
 
     def __init__(self, responses):
         self.responses = list(responses)
         self.calls = 0
+        self.snap_app_calls = 0
 
     async def share_snap(self, payload, **kw):
         self.calls += 1
+        return self.responses.pop(0)
+
+    async def share_snap_app(self, payload, **kw):
+        self.snap_app_calls += 1
         return self.responses.pop(0)
 
 
@@ -231,6 +238,50 @@ def test_margin_retry_then_success(monkeypatch):
 
     asyncio.run(run())
     assert sleeps == [5.0, 30.0]
+
+
+def test_snap_prefers_app_channel_with_cookie(monkeypatch):
+    """有 cookie → share_snap_app（proapi 通道）；webapi 匿名已被 115 405。
+
+    无 cookie 退回匿名 share_snap（保底）。cookie 热更新重置 app client。
+    """
+    p = Pan115Provider("UID=12345;CID=67890;")
+    app_stub = _FakeSnapClient([
+        {"state": True, "data": {"share_state": 1, "shareinfo": {"share_title": "T"}}},
+    ])
+    anon_stub = _FakeSnapClient([{"state": True, "data": {}}])
+    p._app_client = app_stub  # 注入登录 app client 桩
+    p._anon = anon_stub
+
+    async def run():
+        status = await p.check_share_status("CODE", None)
+        assert status.readable
+        assert status.title == "T"
+
+    asyncio.run(run())
+    assert app_stub.snap_app_calls == 1  # 走了 app 通道
+    assert anon_stub.calls == 0  # 匿名通道未动
+
+    # 无 cookie → 退回匿名 web
+    p2 = Pan115Provider("")
+    p2._anon = anon_stub
+    p2._app_client = None
+    anon_stub.responses = [
+        {"state": True, "data": {"share_state": 1, "shareinfo": {}}}
+    ]
+    anon_stub.snap_app_calls = 0
+
+    async def run2():
+        status = await p2.check_share_status("CODE", None)
+        assert status.readable
+
+    asyncio.run(run2())
+    assert anon_stub.calls == 1  # 匿名通道被用
+    assert anon_stub.snap_app_calls == 0
+
+    # cookie 热更新 → app client 重置
+    p.update_cookie("UID=99999;CID=1;")
+    assert p._app_client is None
 
 
 def test_margin_exhausted_raises(monkeypatch):
