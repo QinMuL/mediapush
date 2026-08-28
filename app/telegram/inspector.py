@@ -24,6 +24,12 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# 匿名 share_snap 频繁会被 115 封 IP 一段时间（HTTP 405，p115client 文档
+# 明确警告"一旦过于频繁，会封禁 IP 一段时间"）→ 每条检查间留间隔
+_CHECK_PACING = 1.0
+# 连续异常 N 次 → 疑似 IP 已被限制，中止本轮（剩余下轮再查，别硬打）
+_ABORT_AFTER_ERRORS = 5
+
 
 @dataclass
 class InspectReport:
@@ -121,15 +127,29 @@ class ShareInspector:
             return report
 
         bot = self.container.telegram.bot if self.container.telegram else None
-        for row in rows:
+        consecutive_errors = 0
+        for idx, row in enumerate(rows):
+            # 间隔限速：防匿名 share_snap 连发触发 115 IP 限流（405）
+            if idx:
+                await asyncio.sleep(_CHECK_PACING)
             code = row["share_code"]
             title = row["title"] or code
             try:
                 status = await pan115.check_share_status(code, row["password"] or None)
+                consecutive_errors = 0
             except Exception as exc:  # noqa: BLE001 - 网络/限速异常下轮再看
                 report.errors += 1
+                consecutive_errors += 1
                 logger.warning("巡检查询失败（%s）：%s", code, exc)
                 await cache.touch_checked(code)
+                if consecutive_errors >= _ABORT_AFTER_ERRORS:
+                    remaining = len(rows) - idx - 1
+                    logger.warning(
+                        "巡检连续 %d 次查询异常，疑似 115 已限制本机 IP，"
+                        "中止本轮（剩余 %d 条下轮再查）",
+                        consecutive_errors, remaining,
+                    )
+                    break
                 continue
 
             if status.readable:

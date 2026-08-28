@@ -1,10 +1,18 @@
-"""ShareInspector 巡检测试：失效撤卡 / 待定 / 异常 / 通知。"""
+"""ShareInspector 巡检测试：失效撤卡 / 待定 / 异常 / 通知 / 限速熔断。"""
 
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from app.providers.pan115 import ShareStatus
 from app.telegram.inspector import ShareInspector
+
+
+@pytest.fixture(autouse=True)
+def _fast_pacing(monkeypatch):
+    """巡检间隔清零（生产 1s/条），现有用例秒过；限速语义单独测。"""
+    monkeypatch.setattr("app.telegram.inspector._CHECK_PACING", 0.0)
 
 
 class _FakeCache:
@@ -275,3 +283,61 @@ def test_inspect_need_code_counts_alive():
     tg.bot.delete_message.assert_not_awaited()
     assert set(cache.touched) == {"NEED1", "CHG1"}
     assert "缺访问码" in report.summary()
+
+
+# -------------------- 限速与熔断：防 115 IP 限流（405） -------------------- #
+def test_inspect_pacing_between_checks(monkeypatch):
+    """每条检查之间留 1s 间隔（首条免等）——防匿名连发触发 IP 限流。"""
+    sleeps: list = []
+
+    async def fake_sleep(sec):
+        sleeps.append(sec)
+
+    monkeypatch.setattr("app.telegram.inspector.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("app.telegram.inspector._CHECK_PACING", 1.0)
+    rows = [_row(f"P{i}") for i in range(4)]
+    cache = _FakeCache(rows)
+    pan115 = _FakePan115({f"P{i}": ShareStatus() for i in range(4)})
+    container = _FakeContainer(pan115, cache, _FakeTelegram(), _FakeSettings())
+    insp = ShareInspector(container, container.settings)
+
+    _run(insp.run_once())
+
+    assert sleeps == [1.0, 1.0, 1.0]  # 4 条 = 3 个间隔
+
+
+def test_inspect_aborts_after_consecutive_errors():
+    """连续 5 次查询异常 → 中止本轮，剩余不查（IP 疑似被限，别硬打）。"""
+    rows = [_row(f"E{i}") for i in range(10)]
+    cache = _FakeCache(rows)
+    pan115 = _FakePan115({f"E{i}": RuntimeError("HTTP 405") for i in range(10)})
+    container = _FakeContainer(pan115, cache, _FakeTelegram(), _FakeSettings())
+    insp = ShareInspector(container, container.settings)
+
+    report = _run(insp.run_once())
+
+    assert len(pan115.calls) == 5  # 第 5 次异常即熔断，后 5 条不再请求
+    assert report.errors == 5
+    assert report.total == 10  # 总数照记（summary 体现异常中断）
+
+
+def test_inspect_error_counter_resets_on_success():
+    """异常计数被成功重置：4 异常 + 1 成功 + 4 异常 → 不触发熔断。"""
+    statuses = {}
+    for i in range(4):
+        statuses[f"X{i}"] = RuntimeError("405")
+    statuses["OK1"] = ShareStatus()
+    for i in range(4, 8):
+        statuses[f"X{i}"] = RuntimeError("405")
+    rows = ([_row(f"X{i}") for i in range(4)] + [_row("OK1")]
+            + [_row(f"X{i}") for i in range(4, 8)])
+    cache = _FakeCache(rows)
+    pan115 = _FakePan115(statuses)
+    container = _FakeContainer(pan115, cache, _FakeTelegram(), _FakeSettings())
+    insp = ShareInspector(container, container.settings)
+
+    report = _run(insp.run_once())
+
+    assert len(pan115.calls) == 9  # 全部查完，未熔断
+    assert report.errors == 8
+    assert report.ok == 1
