@@ -44,6 +44,8 @@ class WatchReport:
     failed: int = 0  # 建分享/推送失败（下轮重试，复用已建的码）
     skipped: int = 0  # 已推送（ok）跳过
     items: list[dict] = field(default_factory=list)  # 成功明细
+    failed_items: list[dict] = field(default_factory=list)  # 失败明细（含原因）
+    audit_items: list[dict] = field(default_factory=list)  # 审核中明细
 
     def summary(self) -> str:
         s = (
@@ -59,6 +61,11 @@ class WatchReport:
         if self.skipped:
             s += f" · ⏭️ 已分享 {self.skipped}"
         return s
+
+    @property
+    def has_events(self) -> bool:
+        """本轮是否有值得通知的事件（静默轮不打扰）。"""
+        return bool(self.items or self.failed_items or self.audit_items)
 
 
 class ShareWatcher:
@@ -126,17 +133,25 @@ class ShareWatcher:
                     msg = str(exc)
                     if "审核中" in msg or "快照" in msg:
                         report.auditing += 1
+                        report.audit_items.append({"dir": path, "name": name})
                         logger.info(
                             "目录监控：115 审核中（%s/%s），分享码已登记，下轮重试",
                             path, name,
                         )
                     else:
                         report.failed += 1
+                        report.failed_items.append(
+                            {"dir": path, "name": name, "reason": msg}
+                        )
                         logger.warning(
                             "目录监控处理失败（%s/%s）：%s", path, name, exc
                         )
-                except Exception:  # 失败保留 pending 记录，下轮复用码重试
+                except Exception as exc:  # 失败保留 pending 记录，下轮复用码重试
                     report.failed += 1
+                    report.failed_items.append(
+                        {"dir": path, "name": name, "reason": str(exc) or
+                         exc.__class__.__name__}
+                    )
                     logger.exception("目录监控处理失败（%s/%s）", path, name)
                 else:
                     if is_retry:
@@ -243,12 +258,48 @@ class ShareWatcher:
             self._task.cancel()
         self._task = None
 
+    # ------------------------------------------------------------------ #
+    async def notify_admin(self, report: WatchReport) -> None:
+        """任务详情通知 admin：推送成功 + 失败明细（巡检器 notify_admin 同模式）。"""
+        telegram = getattr(self.container, "telegram", None)
+        admins = getattr(self.settings, "tg_admin_ids", []) or []
+        if telegram is None or not admins:
+            return
+        lines = [f"📂 目录监控：{report.summary()}"]
+        for it in report.items[:20]:
+            lines.append(f"✅ {it['name']}（{it['dir']}）")
+        if len(report.items) > 20:
+            lines.append(f"… 共 {len(report.items)} 个")
+        for it in report.audit_items[:10]:
+            lines.append(f"⏳ {it['name']}（{it['dir']}）审核中")
+        for it in report.failed_items[:10]:
+            reason = it["reason"]
+            if len(reason) > 120:
+                reason = reason[:120] + "…"
+            lines.append(f"⚠️ {it['name']}（{it['dir']}）：{reason}")
+        if len(report.failed_items) > 10:
+            lines.append(f"… 共 {len(report.failed_items)} 个失败")
+        text = "\n".join(lines)
+        if len(text) > 3800:  # TG 上限 4096，留余量
+            text = text[:3800] + "\n…（明细过长已截断）"
+        bot = telegram.bot
+        for uid in admins:
+            try:
+                await bot.send_message(chat_id=uid, text=text)
+            except Exception as exc:  # noqa: BLE001 - 通知失败不影响监控主链路
+                logger.warning("目录监控通知 admin %s 失败：%s", uid, exc)
+
     async def _loop(self) -> None:
         # 启动先歇 1 分钟（等 bot/巡检/监控全部就绪，避开启动高峰）
         await asyncio.sleep(60)
         while True:
             try:
-                await self.run_once()
+                report = await self.run_once()
+                # 静默轮（无成功/失败/审核事件）不打扰；详情推送成功与失败都通知
+                if report.has_events and getattr(
+                    self.settings, "share_watch_notify", True
+                ):
+                    await self.notify_admin(report)
             except asyncio.CancelledError:
                 raise
             except Exception:

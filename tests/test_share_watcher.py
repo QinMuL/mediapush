@@ -82,6 +82,8 @@ class _FakeContainer:
 class _FakeSettings:
     share_watch_interval_minutes = 10.0
     share_archive_dir = ""  # 默认不启用归档（现有用例语义不变）
+    share_watch_notify = True
+    tg_admin_ids: tuple = ()
 
 
 class _ArchiveSettings(_FakeSettings):
@@ -418,3 +420,159 @@ def test_archive_move_failure_no_interval(monkeypatch):
     asyncio.run(watcher.run_once())
 
     assert sleeps == [5.0, 2.0]  # 新分享就绪等待 + 推送限速；移动失败不留间隔
+
+
+# ==================== 任务详情通知：成功/失败明细私信 admin ====================
+class _FakeBot:
+    def __init__(self):
+        self.sent: list[tuple[int, str]] = []
+
+    async def send_message(self, chat_id, text):
+        self.sent.append((chat_id, text))
+
+
+class _FakeTelegram:
+    def __init__(self):
+        self.bot = _FakeBot()
+
+
+class _NotifyContainer(_FakeContainer):
+    def __init__(self, pan115, cache, processor, telegram):
+        super().__init__(pan115, cache, processor)
+        self.telegram = telegram
+
+
+class _NotifySettings(_FakeSettings):
+    tg_admin_ids = (100, 200)
+
+
+def test_notify_admin_success_and_failure_details():
+    """成功/审核/失败明细都进入通知文本，每个 admin 各发一条。"""
+    from app.core.share_watcher import WatchReport
+
+    r = WatchReport(dirs=1, new_items=2, shared=1, failed=1, auditing=1)
+    r.items = [{"dir": "/待分享", "name": "剧A"}]
+    r.audit_items = [{"dir": "/待分享", "name": "剧B"}]
+    r.failed_items = [{"dir": "/待分享", "name": "剧C", "reason": "推送失败：超时"}]
+
+    telegram = _FakeTelegram()
+    watcher = ShareWatcher(
+        _NotifyContainer(None, None, None, telegram), _NotifySettings()
+    )
+
+    asyncio.run(watcher.notify_admin(r))
+
+    assert len(telegram.bot.sent) == 2  # 两个 admin 各一条
+    text = telegram.bot.sent[0][1]
+    assert text.startswith("📂 目录监控：")
+    assert "✅ 剧A（/待分享）" in text
+    assert "⏳ 剧B（/待分享）审核中" in text
+    assert "⚠️ 剧C（/待分享）：推送失败：超时" in text
+
+
+def test_notify_admin_skipped_when_no_admin_or_telegram():
+    """无 admin / telegram 未就绪 → 静默跳过。"""
+    from app.core.share_watcher import WatchReport
+
+    r = WatchReport(shared=1, items=[{"dir": "/d", "name": "x"}])
+
+    # 无 telegram 属性（容器未挂载）
+    watcher = ShareWatcher(_FakeContainer(None, None, None), _NotifySettings())
+    asyncio.run(watcher.notify_admin(r))  # 不抛错
+
+    # telegram 就绪但无 admin
+    telegram = _FakeTelegram()
+    watcher = ShareWatcher(
+        _NotifyContainer(None, None, None, telegram), _FakeSettings()
+    )
+    asyncio.run(watcher.notify_admin(r))
+    assert telegram.bot.sent == []
+
+
+def test_notify_admin_reason_truncated():
+    """超长失败原因截断到 120 字；整条文本超 3800 截断。"""
+    from app.core.share_watcher import WatchReport
+
+    long_reason = "错" * 300
+    r = WatchReport(failed=1)
+    r.failed_items = [{"dir": "/d", "name": "剧Z", "reason": long_reason}]
+
+    telegram = _FakeTelegram()
+    watcher = ShareWatcher(
+        _NotifyContainer(None, None, None, telegram), _NotifySettings()
+    )
+    asyncio.run(watcher.notify_admin(r))
+
+    text = telegram.bot.sent[0][1]
+    assert "剧" + "Z" in text
+    assert len(long_reason) > len(text)  # 原因未全量进入
+
+
+def test_run_once_collects_failure_details(monkeypatch):
+    """处理失败 → failed_items 记录目录/名称/原因（通知数据源）。"""
+    _fast(monkeypatch)
+    cache = _FakeCache([_dir(1, "/媒体", 100)])
+    pan115 = _FakePan115({100: [{"fid": 999, "name": "剧C", "is_dir": True}]})
+    proc = _FakeProcessor()
+    watcher = ShareWatcher(_FakeContainer(pan115, cache, proc), _FakeSettings())
+
+    report = asyncio.run(watcher.run_once())
+
+    assert report.failed == 1
+    assert report.failed_items == [
+        {"dir": "/媒体", "name": "剧C", "reason": "创建分享失败：风控"}
+    ]
+    assert report.has_events
+
+
+def test_run_once_quiet_round_has_no_events(monkeypatch):
+    """静默轮（无成功/失败/审核）→ has_events=False，循环不发通知。"""
+    _fast(monkeypatch)
+    cache = _FakeCache([_dir(1, "/媒体", 100)])
+    pan115 = _FakePan115({})  # 目录下无子目录
+    proc = _FakeProcessor()
+    watcher = ShareWatcher(_FakeContainer(pan115, cache, proc), _FakeSettings())
+
+    report = asyncio.run(watcher.run_once())
+
+    assert not report.has_events
+
+
+def test_loop_notifies_when_enabled(monkeypatch):
+    """循环轮：有事件 + 通知开启 → notify_admin 被调用；关闭 → 不调用。"""
+    from app.core.share_watcher import WatchReport
+
+    r = WatchReport(shared=1, items=[{"dir": "/d", "name": "x"}])
+    calls: list = []
+
+    real_sleep = asyncio.sleep  # 补丁前留存真实 sleep（补丁会替换全局模块属性）
+
+    async def fast_sleep(sec):
+        await real_sleep(0.001)  # 极短真实等待，避免忙转
+
+    monkeypatch.setattr("app.core.share_watcher.asyncio.sleep", fast_sleep)
+
+    class _LoopWatcher(ShareWatcher):
+        async def run_once(self):
+            return r
+
+        async def notify_admin(self, report):
+            calls.append(report)
+
+    async def run(notify: bool):
+        settings = _NotifySettings() if notify else _OffSettings()
+        w = _LoopWatcher(_FakeContainer(None, None, None), settings)
+        task = asyncio.create_task(w._loop())
+        await real_sleep(0.05)  # 真实观察窗：等 _loop 跑过启动 sleep + run_once
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    class _OffSettings(_NotifySettings):
+        share_watch_notify = False
+
+    asyncio.run(run(True))
+    assert calls  # 已通知
+
+    calls.clear()
+    asyncio.run(run(False))
+    assert calls == []  # 未通知

@@ -77,6 +77,7 @@ cp .env.example .env
 | `INSPECT_NOTIFY` | 失效撤卡后是否私信 admin 告警，默认 `true` |
 | `SHARE_WATCH_ENABLED` | 是否启用目录监控自动建分享，默认 `true` |
 | `SHARE_WATCH_INTERVAL_MINUTES` | 目录扫描间隔（分钟），默认 `10` |
+| `SHARE_WATCH_NOTIFY` | 每轮扫描结果（成功/失败明细）私信 admin，默认 `true`（静默轮不打扰） |
 | `SHARE_ARCHIVE_DIR` | 推送成功后移入的归档目录，默认 `/已分享`（空=不移动；须在监控目录之外） |
 | `LOG_LEVEL` | 控制台日志级别，默认 `INFO`（文件日志恒为 `DEBUG` 全量） |
 | `DB_PATH` | SQLite 缓存路径，默认 `./data/cache.db` |
@@ -219,6 +220,7 @@ docker inspect mediapush --format '{{.State.Health.Status}}'
 - **建分享**：`share_send` 创建 + `share_duration=-1` 设**永久**（P115-Share 同款配方）；margin 限速自动等待重试。
 - **推送**：完全复用手动推送卡片管线（TMDB 匹配/海报/画质/分流频道），推送串行 + 2s 限速防 flood。
 - **去重**：子目录 fid 持久化（shared_items），已分享的不再重复；建分享/推送失败不标记，下轮自动重试（宁重不漏）。
+- **通知**：每轮扫描结束把任务详情（✅ 推送成功明细 / ⏳ 审核中 / ⚠️ 失败明细含原因）私信 admin（`SHARE_WATCH_NOTIFY`，静默轮不打扰）。
 - **归档**：推送成功后自动把子目录移入 `/已分享`（`SHARE_ARCHIVE_DIR`，留空禁用）——115 分享绑定文件快照而非路径，移动后链接依然有效，且失效巡检兜底；移动失败不影响推送，下轮扫描自动补移。监控目录因此始终保持"待处理队列"语义，不会越积越大。
 - **闭环**：推送后访问码/消息引用自动存档 → 失效巡检器照常撤卡死链。
 

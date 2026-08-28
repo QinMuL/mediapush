@@ -79,6 +79,8 @@ class Settings:
     # 目录监控 → 自动建永久分享（见 app/core/share_watcher.py）
     share_watch_enabled: bool = True
     share_watch_interval_minutes: float = 10.0
+    # 每轮扫描结果（成功/失败明细）私信 admin；静默轮不打扰
+    share_watch_notify: bool = True
     # 推送成功后移入的归档目录（须在监控目录之外；空=不移动仅标记）
     share_archive_dir: str = "/已分享"
 
@@ -133,6 +135,7 @@ class Settings:
             share_watch_interval_minutes=_env_float(
                 "SHARE_WATCH_INTERVAL_MINUTES", 10.0
             ),
+            share_watch_notify=_env_bool("SHARE_WATCH_NOTIFY", True),
             share_archive_dir=os.getenv("SHARE_ARCHIVE_DIR", "/已分享").strip(),
         )
         settings._ensure_dirs()
