@@ -546,3 +546,87 @@ def test_list_dir_no_cookie_raises():
             await p.list_dir(0)
 
     asyncio.run(run())
+
+
+# -------------------- 归档移动：fs_move 990009 忙重试 -------------------- #
+_BUSY = {
+    "state": False,
+    "error": "移动[X]操作尚未执行完成，请稍后再试！",
+    "errno": 990009,
+    "errtype": "war",
+}
+
+
+def test_fs_move_busy_retries(monkeypatch):
+    """errno 990009（上一次移动仍在服务端执行）→ 渐进等待后重试成功。"""
+    sleeps: list = []
+
+    async def fake_sleep(sec):
+        sleeps.append(sec)
+
+    monkeypatch.setattr("app.providers.pan115.asyncio.sleep", fake_sleep)
+    client = _FakeLoginClient()
+    seq = [_BUSY, {"state": True}]
+    calls: list = []
+
+    async def fs_move(fid, pid=0, **kw):
+        calls.append((fid, pid))
+        return seq.pop(0)
+
+    client.fs_move = fs_move
+    p = _login_p(monkeypatch, client)
+
+    async def run():
+        await p.fs_move(777, 999)
+        assert sleeps == [3.0]  # 首次被拒 → 等 3s → 重试成功
+        assert calls == [(777, 999)] * 2
+
+    asyncio.run(run())
+
+
+def test_fs_move_busy_exhausted_raises(monkeypatch):
+    """990009 三次仍忙 → Pan115Error（调用方下轮补移兜底）。"""
+    sleeps: list = []
+
+    async def fake_sleep(sec):
+        sleeps.append(sec)
+
+    monkeypatch.setattr("app.providers.pan115.asyncio.sleep", fake_sleep)
+    client = _FakeLoginClient()
+
+    async def fs_move(fid, pid=0, **kw):
+        return _BUSY
+
+    client.fs_move = fs_move
+    p = _login_p(monkeypatch, client)
+
+    async def run():
+        with pytest.raises(Pan115Error, match="尚未执行完成"):
+            await p.fs_move(777, 999)
+
+    asyncio.run(run())
+    assert sleeps == [3.0, 6.0]  # 渐进 3s/6s 后耗尽
+
+
+def test_fs_move_other_error_no_retry(monkeypatch):
+    """非 990009 错误（如目标目录无效）→ 立即抛，不等待不重试。"""
+    sleeps: list = []
+
+    async def fake_sleep(sec):
+        sleeps.append(sec)
+
+    monkeypatch.setattr("app.providers.pan115.asyncio.sleep", fake_sleep)
+    client = _FakeLoginClient()
+
+    async def fs_move(fid, pid=0, **kw):
+        return {"state": False, "error": "参数错误", "errno": 990002}
+
+    client.fs_move = fs_move
+    p = _login_p(monkeypatch, client)
+
+    async def run():
+        with pytest.raises(Pan115Error, match="移动失败"):
+            await p.fs_move(777, 999)
+
+    asyncio.run(run())
+    assert sleeps == []  # 不等待

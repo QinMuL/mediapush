@@ -56,6 +56,12 @@ def _is_margin_response(resp: object) -> bool:
     )
 
 
+def _is_move_busy(exc: object) -> bool:
+    """识别 errno 990009：上一个移动仍在服务端异步执行（非失败，可等待重试）。"""
+    text = str(exc)
+    return "990009" in text or "尚未执行完成" in text
+
+
 @dataclass
 class ShareStatus:
     """分享状态（share_snap 预检结果，用于巡检与读取前校验）。
@@ -472,20 +478,38 @@ class Pan115Provider(BaseShareProvider):
         return cid
 
     async def fs_move(self, file_id: int, to_cid: int) -> None:
-        """移动文件/目录到目标目录（open API；官方提示勿并发、单次≤5万）。"""
+        """移动文件/目录到目标目录（open API；官方提示勿并发、单次≤5万）。
+
+        115 移动是服务端异步操作：连续两次移动时，上一次仍在执行中
+        会被 errno 990009 拒绝（"操作尚未执行完成，请稍后再试"）
+        —— 识别后渐进 3/6s 等待重试，耗尽才抛（调用方下轮补移兜底）。
+        """
+        import asyncio as _aio
+
         from p115client.client import check_response
 
         client = self._login_client()
-        resp = await self._call_with_margin(
-            lambda: client.fs_move(file_id, pid=to_cid, async_=True),
-            label="fs_move",
-        )
-        try:
-            check_response(resp)
-        except Exception as exc:
-            raise Pan115Error(
-                f"移动失败（fid={file_id}→cid={to_cid}）：{exc}"
-            ) from exc
+        waits = (0.0, 3.0, 6.0)
+        for attempt, wait in enumerate(waits, 1):
+            if wait:
+                await _aio.sleep(wait)
+            resp = await self._call_with_margin(
+                lambda: client.fs_move(file_id, pid=to_cid, async_=True),
+                label="fs_move",
+            )
+            try:
+                check_response(resp)
+                return
+            except Exception as exc:
+                if attempt < len(waits) and _is_move_busy(exc):
+                    logger.warning(
+                        "115 fs_move：上一次移动尚未完成，%.0fs 后重试（%d/%d）",
+                        waits[attempt], attempt, len(waits) - 1,
+                    )
+                    continue
+                raise Pan115Error(
+                    f"移动失败（fid={file_id}→cid={to_cid}）：{exc}"
+                ) from exc
 
     # ------------------------------------------------------------------ #
     async def check_health(self) -> bool | None:
