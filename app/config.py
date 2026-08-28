@@ -26,6 +26,15 @@ def _env_int(name: str, default: int = 0) -> int:
         return default
 
 
+def _env_float(name: str, default: float = 0.0) -> float:
+    raw = os.getenv(name, "")
+    try:
+        return float(raw.strip()) if raw.strip() else default
+    except ValueError:
+        logger.warning("配置 %s 非法（%r），使用默认 %s", name, raw, default)
+        return default
+
+
 def _env_int_list(name: str) -> list[int]:
     raw = os.getenv(name, "")
     out: list[int] = []
@@ -49,6 +58,7 @@ class Settings:
     tmdb_api_key: str = ""
     tmdb_language: str = "zh-CN"
     pan115_cookie: str = ""
+    pan115_cookie_file: str = ""  # cookie 文件路径（挂载更新免重建容器）
     pan115_use_proxy: bool = False
     proxy_url: str = ""
     log_level: str = "INFO"
@@ -62,6 +72,10 @@ class Settings:
     monitor_session: str = "./data/monitor.session"
     monitor_db_path: str = "./data/monitor.db"
     monitor_batch_seconds: int = 0
+    # 分享失效巡检（见 app/telegram/inspector.py）
+    inspect_enabled: bool = True
+    inspect_interval_hours: float = 6.0
+    inspect_notify: bool = True
 
     @classmethod
     def load(cls) -> Settings:
@@ -73,6 +87,16 @@ class Settings:
         except Exception:  # noqa: S110, BLE001 - dotenv 可选，失败静默
             pass
 
+        # cookie：env 直配优先；否则从 PAN115_COOKIE_FILE 文件读（一整行字符串，
+        # 容器挂载后改文件重启即生效；巡检器还会热更新）
+        cookie = os.getenv("PAN115_COOKIE", "").strip()
+        cookie_file = os.getenv("PAN115_COOKIE_FILE", "").strip()
+        if not cookie and cookie_file:
+            try:
+                cookie = Path(cookie_file).read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                logger.warning("PAN115_COOKIE_FILE 读取失败：%s", exc)
+
         settings = cls(
             tg_bot_token=os.getenv("TG_BOT_TOKEN", "").strip(),
             tg_chat_id=os.getenv("TG_CHAT_ID", "").strip(),
@@ -81,7 +105,8 @@ class Settings:
             tg_admin_ids=_env_int_list("TG_ADMIN_IDS"),
             tmdb_api_key=os.getenv("TMDB_API_KEY", "").strip(),
             tmdb_language=os.getenv("TMDB_LANGUAGE", "zh-CN").strip() or "zh-CN",
-            pan115_cookie=os.getenv("PAN115_COOKIE", "").strip(),
+            pan115_cookie=cookie,
+            pan115_cookie_file=cookie_file,
             pan115_use_proxy=_env_bool("PAN115_USE_PROXY", False),
             proxy_url=os.getenv("PROXY_URL", "").strip(),
             log_level=(os.getenv("LOG_LEVEL", "INFO").strip() or "INFO").upper(),
@@ -96,6 +121,9 @@ class Settings:
             monitor_db_path=os.getenv("MONITOR_DB_PATH", "./data/monitor.db").strip()
             or "./data/monitor.db",
             monitor_batch_seconds=_env_int("MONITOR_BATCH_SECONDS", 0),
+            inspect_enabled=_env_bool("INSPECT_ENABLED", True),
+            inspect_interval_hours=_env_float("INSPECT_INTERVAL_HOURS", 6.0),
+            inspect_notify=_env_bool("INSPECT_NOTIFY", True),
         )
         settings._ensure_dirs()
         return settings

@@ -670,13 +670,15 @@ class Pusher:
         quality_extra: str = "",
         is_premium: bool = False,
         chat_id: str | None = None,
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, int | None, str]:
         """推送卡片到频道（单消息）。
 
         有海报：send_photo + caption（≤1024，智能截断）
         无海报或发送失败：send_message + text（≤4096，完整）
         quality_extra/is_premium 透传给渲染（编辑模式精品标记/推荐语）。
         chat_id 覆盖默认分流目标（频道监控用；None 按 provider 分流）。
+        返回 (ok, message, message_id, chat_id)：后两者为频道消息引用，
+        供失效巡检撤卡（delete_message）与 mark_pushed 存档。
         """
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -697,7 +699,7 @@ class Pusher:
                 quality_extra=quality_extra, is_premium=is_premium,
             )
             try:
-                await _send_with_retry(lambda: self.bot.send_photo(
+                sent = await _send_with_retry(lambda: self.bot.send_photo(
                     chat_id=chat_id,
                     photo=image_url,
                     caption=caption,
@@ -705,7 +707,7 @@ class Pusher:
                     reply_markup=reply_markup,
                 ))
                 logger.info("推送 → 频道 %s（海报+详情）", chat_id)
-                return True, "已推送（海报+详情）"
+                return True, "已推送（海报+详情）", _msg_id(sent), _chat_id_str(sent, chat_id)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("send_photo 失败，回退 send_message：%s", exc)
 
@@ -714,7 +716,7 @@ class Pusher:
             details, media, code, password, files, provider,
             quality_extra=quality_extra, is_premium=is_premium,
         )
-        await _send_with_retry(lambda: self.bot.send_message(
+        sent = await _send_with_retry(lambda: self.bot.send_message(
             chat_id=chat_id,
             text=text,
             parse_mode="HTML",
@@ -722,4 +724,16 @@ class Pusher:
             reply_markup=reply_markup,
         ))
         logger.info("推送 → 频道 %s（纯文本+详情）", chat_id)
-        return True, "已推送（纯文本+详情）"
+        return True, "已推送（纯文本+详情）", _msg_id(sent), _chat_id_str(sent, chat_id)
+
+
+def _msg_id(sent: object) -> int | None:
+    """从发送返回的 Message 取 message_id（测试桩无此属性时 None）。"""
+    return getattr(sent, "message_id", None)
+
+
+def _chat_id_str(sent: object, fallback: str) -> str:
+    """从发送返回的 Message 取 chat.id（测试桩无此属性时回退目标 chat_id）。"""
+    chat = getattr(sent, "chat", None)
+    cid = getattr(chat, "id", None)
+    return str(cid) if cid is not None else str(fallback)

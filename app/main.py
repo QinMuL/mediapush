@@ -3,10 +3,30 @@
 from __future__ import annotations
 
 import logging
+import os
 
 from app.config import Settings
 from app.core.container import Container
 from app.logging_config import setup_logging
+
+# 启动时清除进程级代理环境变量（借 P115-Share）：docker-compose 注入的
+# HTTP_PROXY 等会被 httpx/aiohttp 自动读取，导致 115（须直连防风控）与
+# TMDB 意外走代理。代理一律显式配置（PROXY_URL → PTB/TMDB；115 默认直连）。
+_PROXY_ENV_KEYS = (
+    "HTTP_PROXY", "http_proxy",
+    "HTTPS_PROXY", "https_proxy",
+    "ALL_PROXY", "all_proxy",
+)
+
+
+def _clear_proxy_env() -> None:
+    cleared = [k for k in _PROXY_ENV_KEYS if os.environ.pop(k, None) is not None]
+    if cleared:
+        logging.getLogger("app").warning(
+            "已清除进程级代理环境变量（%s）：代理请用 PROXY_URL 显式配置；"
+            "115 走直连防风控",
+            ", ".join(cleared),
+        )
 
 
 def main() -> None:
@@ -20,6 +40,7 @@ def main() -> None:
 
     logger = logging.getLogger("app")
     logger.info("配置加载完成，DB=%s", settings.db_path)
+    _clear_proxy_env()
 
     warns = settings.validate()
     for w in warns:

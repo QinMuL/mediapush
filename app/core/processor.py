@@ -159,7 +159,7 @@ class ShareProcessor:
             return ProcessResult(
                 False, "推送器未就绪", file_count=pr.file_count, title=pr.media.title
             )
-        ok, msg = await pusher.push_share(
+        ok, msg, message_id, push_chat_id = await pusher.push_share(
             pr.details, pr.media, parsed.code, parsed.password, pr.files,
             provider=parsed.provider, chat_id=chat_id,
         )
@@ -169,9 +169,16 @@ class ShareProcessor:
         else:
             logger.warning("推送频道失败：%s — %s", title, msg)
 
-        # 7. 标记已推送
+        # 7. 标记已推送（存巡检/撤卡所需引用）
         if ok:
-            await self.cache.mark_pushed(parsed.code)
+            await self.cache.mark_pushed(
+                parsed.code,
+                provider=parsed.provider,
+                password=parsed.password,
+                chat_id=push_chat_id,
+                message_id=message_id,
+                title=title,
+            )
 
         return ProcessResult(
             ok=ok,

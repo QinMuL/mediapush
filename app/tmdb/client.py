@@ -124,16 +124,45 @@ class TMDBHelper:
     async def search_best(
         self, title: str, year: int | None, media_type: str = "auto"
     ) -> tuple[int, str] | None:
-        """返回最佳匹配 (tmdb_id, media_type)，无则 None。"""
+        """返回最佳匹配 (tmdb_id, media_type)，无则 None。
+
+        匹配优先级（借 P115-Share 的思路）：
+        1. 年份吻合（文件名年份可信度最高，防同名老片/新片混淆）
+        2. 标题相似度：精确（zh title）> 原名精确（original_title，别名兜底）> 互相包含
+        3. 评分 + 海报（流行度兜底，即原行为）
+        media_type 显式时过滤异型候选（电影/剧集同名命名空间冲突兜底）。
+        """
         candidates = await self.search(title, year, media_type)
         if not candidates:
             return None
-        # 优先选有 poster / 评分高的
-        best = max(
-            candidates,
-            key=lambda c: (c.get("vote_average") or 0, bool(c.get("poster_path"))),
-        )
-        return int(best["id"]), "movie" if "title" in best else "tv"
+
+        def kind(c: dict) -> str:
+            return "movie" if "title" in c else "tv"
+
+        pool = candidates
+        if media_type in ("movie", "tv"):
+            same = [c for c in candidates if kind(c) == media_type]
+            pool = same or candidates
+        t = (title or "").strip().lower()
+
+        def score(c: dict) -> tuple:
+            d = c.get("release_date") or c.get("first_air_date") or ""
+            cy = int(d[:4]) if d[:4].isdigit() else None
+            year_ok = 1 if (year is None or cy == year) else 0
+            ct = (c.get("title") or c.get("name") or "").strip().lower()
+            ot = (c.get("original_title") or c.get("original_name") or "").strip().lower()
+            if t and ct == t:
+                ts = 3
+            elif t and ot == t:
+                ts = 2
+            elif t and ((ct and (t in ct or ct in t)) or (ot and (t in ot or ot in t))):
+                ts = 1
+            else:
+                ts = 0
+            return (year_ok, ts, c.get("vote_average") or 0, bool(c.get("poster_path")))
+
+        best = max(pool, key=score)
+        return int(best["id"]), kind(best)
 
     # ------------------------------------------------------------------ #
     # 详情

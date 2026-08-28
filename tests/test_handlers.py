@@ -44,7 +44,7 @@ class _FakeApp:
 def test_bot_commands_structure():
     """命令清单顺序与描述非空。"""
     cmds = [c.command for c in _BOT_COMMANDS]
-    assert cmds == ["start", "help", "115", "edit", "cancel", "status", "refresh", "mon"]
+    assert cmds == ["start", "help", "115", "edit", "cancel", "status", "refresh", "mon", "inspect"]
     for c in _BOT_COMMANDS:
         assert c.description, f"{c.command} 描述为空"
 
@@ -87,7 +87,7 @@ class _FakePusher:
 
     async def push_share(self, *args, **kwargs):
         self.push_calls.append((args, kwargs))
-        return self.push_return
+        return True, self.push_return, 555, "@chan"
 
 
 class _FakeCache:
@@ -98,7 +98,7 @@ class _FakeCache:
     async def is_pushed(self, _code) -> bool:
         return self._pushed
 
-    async def mark_pushed(self, code):
+    async def mark_pushed(self, code, **kwargs):
         self.marked.append(code)
 
 
@@ -427,3 +427,47 @@ def test_episode_sort_key_no_episode_and_115_sort_last_stable():
     assert ordered[0] is ed2k_ep  # 有集数排第一
     assert ordered[1] is ed2k_none  # 无集数保持原序
     assert ordered[2] is p115
+
+
+# -------------------- A4 处理中 60s 去重 -------------------- #
+def test_processing_dedup_blocks_duplicate_concurrent():
+    """同一链接处理中再次发送 → 提示且不再重复 process。"""
+    proc = _FakeProcessor()
+    container = _FakeContainer(processor=proc)
+    ctx = _make_context(container)
+    msg = _make_message("https://115.com/s/abc12345")
+    update = _make_update(message=msg)
+
+    from app.telegram.handlers import _mark_processing, _processing
+
+    # 第一次正常处理（结束后标记已被 finally 清除）
+    asyncio.run(on_text(update, ctx))
+    assert len(proc.process_calls) == 1
+
+    # 模拟"处理中"（另一并发任务尚未完成）→ 跳过并提示
+    _mark_processing(ParsedShare("115", "abc12345"))
+    try:
+        asyncio.run(on_text(update, ctx))
+        assert len(proc.process_calls) == 1  # 未重复处理
+        texts = [c.args[0] for c in msg.reply_text.call_args_list]
+        assert any("正在处理中" in t for t in texts)
+    finally:
+        _processing.clear()
+
+
+def test_processing_ttl_expires():
+    """超过 60s 的陈旧标记视为不在处理中（顺手清理）。"""
+    import time as _t
+
+    from app.telegram.handlers import (
+        _PROCESSING_TTL,
+        _is_processing,
+        _processing,
+    )
+
+    _processing["115:xyz"] = _t.monotonic() - _PROCESSING_TTL - 1  # 已过期
+    try:
+        assert _is_processing(ParsedShare("115", "xyz")) is False
+        assert "115:xyz" not in _processing  # 已被清理
+    finally:
+        _processing.clear()

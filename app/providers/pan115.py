@@ -12,12 +12,22 @@ cookie 降级为可选：仅用于 /status 健康检查（验证自有账号有�
 - p115client 在方法内懒导入（装坏不拖垮 bot）
 - user_info(uid, async_=True) 健康检查需显式 uid（从 cookie 解析 UID）
 - 115 默认不走代理（走代理易触发风控）
+
+借 P115-Share（github.com/ListeningLTG/P115-Share）的经验：
+- margin 限速识别：115 风控返回 {"margin": N}（无 state/data，仅剩余秒数），
+  check_response 因缺 state 而放行，随后 resp["data"]["count"] 抛 KeyError ——
+  故先拿 share_snap 原始响应自行识别，margin 时等 N 秒渐进重试
+- 快照渐进重试：分享刚创建时 115 返回"正在生成文件快照"，等待后重查
+- 状态语义（get_share_status 同款）：share_state 0=审核中 7=失效；
+  errno 4100009/4100010=已取消；have_vio_file=1=违规
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+from dataclasses import dataclass
 
 from app.providers.base import BaseShareProvider, ShareFile
 from app.providers.exceptions import Pan115Error
@@ -32,8 +42,39 @@ def _uid_from_cookie(cookie: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _is_margin_response(resp: object) -> bool:
+    """识别 115 margin 限速响应 {"margin": N}（无 state/data/count，仅秒数）。"""
+    return (
+        isinstance(resp, dict)
+        and "margin" in resp
+        and "data" not in resp
+        and "state" not in resp
+        and "count" not in resp
+    )
+
+
+@dataclass
+class ShareStatus:
+    """分享状态（share_snap 预检结果，用于巡检与读取前校验）。"""
+
+    state: int | None = None  # share_state：0=审核中 1=正常 7=失效（其他未知）
+    snapshotting: bool = False  # 正在生成文件快照（等待后可恢复）
+    violating: bool = False  # have_vio_file=1 违规
+    title: str = ""
+    message: str = ""  # 非空表示不可读（原因）
+
+    @property
+    def readable(self) -> bool:
+        return not self.message
+
+
 class Pan115Provider(BaseShareProvider):
     name = "115"
+
+    # margin/快照渐进重试（借 P115-Share）
+    _SNAP_MAX_RETRY = 3  # 渐进重试总次数
+    _MARGIN_WAIT_CAP = 30.0  # margin 等待上限（秒），防 115 返回超大值
+    _SNAP_WAIT = 3.0  # 快照生成中基础等待（3s/6s/9s 渐进退避）
 
     def __init__(
         self,
@@ -49,7 +90,17 @@ class Pan115Provider(BaseShareProvider):
         if use_proxy:
             logger.warning("PAN115_USE_PROXY=true 但 p115client 代理未接线，115 仍走直连")
         self._client = None  # type: ignore[assignment]
+        self._anon = None  # type: ignore[assignment]  # 匿名 web client（读分享/查状态）
         self._uid = _uid_from_cookie(self.cookie)
+
+    # ------------------------------------------------------------------ #
+    def _anon_client(self):
+        """懒构造匿名 P115Client（app='web'，无需登录），构造一次复用。"""
+        if self._anon is None:
+            from p115client.client import P115Client
+
+            self._anon = P115Client("", app="web")
+        return self._anon
 
     # ------------------------------------------------------------------ #
     def _build_client(self):
@@ -68,13 +119,114 @@ class Pan115Provider(BaseShareProvider):
         return self._client
 
     # ------------------------------------------------------------------ #
+    async def _share_snap_raw(self, code: str, receive_code: str) -> dict:
+        """匿名调 share_snap（cid=0 仅拿状态），带 margin/快照渐进重试。
+
+        - margin 响应：等待 min(margin, cap) 秒后重试
+        - "正在生成文件快照"：渐进退避（3s/6s/9s）后重查
+        - 其余原样返回（含 state=False 的失败响应，由调用方 check_response 分类）
+        - 重试耗尽仍 margin/快照中 → 抛 Pan115Error
+        """
+        try:
+            from p115client.util import share_extract_payload
+        except Exception as exc:
+            raise Pan115Error(f"p115client.util 导入失败：{exc}") from exc
+        payload = dict(share_extract_payload(code))
+        payload["receive_code"] = receive_code or payload.get("receive_code") or ""
+        client = self._anon_client()
+
+        for attempt in range(1, self._SNAP_MAX_RETRY + 1):
+            resp = await client.share_snap(
+                {"cid": 0, "limit": 1, "offset": 0, **payload},
+                async_=True,
+            )
+            if _is_margin_response(resp):
+                wait = min(float(resp.get("margin", 5) or 5), self._MARGIN_WAIT_CAP)
+                logger.warning(
+                    "115 margin 限速：等待 %.0fs 后重试（%d/%d）",
+                    wait, attempt, self._SNAP_MAX_RETRY,
+                )
+                await asyncio.sleep(wait)
+                continue
+            if "正在生成文件快照" in str(resp):
+                wait = self._SNAP_WAIT * attempt
+                logger.info(
+                    "分享快照生成中，等待 %.0fs 后重查（%d/%d）",
+                    wait, attempt, self._SNAP_MAX_RETRY,
+                )
+                await asyncio.sleep(wait)
+                continue
+            return resp
+        raise Pan115Error("115 限速或快照生成中，多次重试后仍失败", code=code)
+
+    # ------------------------------------------------------------------ #
+    async def check_share_status(self, code: str, password: str | None) -> ShareStatus:
+        """检查分享状态（单次快照，不递归读列表）。
+
+        借 P115-Share get_share_status 的状态语义：
+        - share_state 0=审核中 7=失效；errno 4100009/4100010=已取消
+        - "正在生成文件快照"=快照中（渐进重试内已消化，仍中则报快照中）
+        - have_vio_file=1=违规
+        网络异常向上抛 Pan115Error（由巡检器决定重试）。
+        """
+        receive_code = password or ""
+        try:
+            from p115client.client import check_response
+        except Exception as exc:
+            raise Pan115Error(f"p115client 导入失败：{exc}") from exc
+
+        resp = await self._share_snap_raw(code, receive_code)
+        try:
+            check_response(resp)
+        except Exception as exc:  # noqa: BLE001 - P115OSError 分类
+            msg = str(exc)
+            if "正在生成文件快照" in msg:
+                return ShareStatus(state=0, snapshotting=True, message="分享正在生成文件快照")
+            if "4100009" in msg or "4100010" in msg or "链接已失效" in msg or "分享已取消" in msg:
+                return ShareStatus(state=7, message="分享已失效或被取消")
+            if "password" in msg.lower() or "receive" in msg.lower() or "访问码" in msg:
+                return ShareStatus(message="访问码错误或分享需要访问码")
+            if "not exist" in msg.lower() or "不存在" in msg or "失效" in msg:
+                return ShareStatus(state=7, message="分享不存在或已失效")
+            return ShareStatus(message=f"分享状态异常：{exc}")
+
+        data = resp.get("data") or {}
+        info = data.get("shareinfo") or data.get("share_info") or {}
+        state = data.get("share_state", info.get("share_state", info.get("status")))
+        try:
+            state = int(state) if state is not None else None
+        except (TypeError, ValueError):
+            state = None
+        snapshotting = "正在生成文件快照" in str(resp)
+        violating = str(info.get("have_vio_file") or "") == "1"
+        title = str(info.get("share_title") or "")
+
+        if snapshotting:
+            return ShareStatus(state=state, snapshotting=True, message="分享正在生成文件快照")
+        if state == 7:
+            return ShareStatus(state=7, message="分享已失效")
+        if state == 0:
+            return ShareStatus(state=0, message="分享审核中")
+        if violating:
+            return ShareStatus(state=state, violating=True, message="分享含违规文件")
+        return ShareStatus(state=state, snapshotting=False, violating=False, title=title)
+
+    # ------------------------------------------------------------------ #
     async def list_share(self, code: str, password: str | None) -> list[ShareFile]:
         """读取分享内容（递归扁平化）。
 
         匿名 web 读取，无需 cookie：
         - code: 分享码（或完整链接，share_iterdir_walk 内部支持链接）
         - password: 访问码（receive_code），无则空串
+
+        读取前先预检（check_share_status）：margin 渐进重试 + 失效/访问码/审核
+        提前给出明确错误，避免 iterdir 黑盒里只能看到 KeyError('data')。
         """
+        # 预检（A2/A3）：不可读时给出明确原因，直接抛
+        status = await self.check_share_status(code, password)
+        if not status.readable:
+            raise Pan115Error(status.message, code=code)
+
         receive_code = password or ""
         try:
             from p115client.tool import share_iterdir_walk
@@ -94,12 +246,19 @@ class Pan115Provider(BaseShareProvider):
                     out.append(self._to_share_file(f, is_dir=False))
         except Pan115Error:
             raise
+        except KeyError as exc:
+            # check_response 对 margin 响应放行 → resp["data"] KeyError（读取途中被限速）
+            if str(exc) == "'data'":
+                raise Pan115Error("115 限速（margin），读取中断，请稍后重试", code=code) from exc
+            raise Pan115Error(f"读取 115 分享失败：{exc!r}", code=code) from exc
         except Exception as exc:
             msg = str(exc).lower()
             if "password" in msg or "receive" in msg or "访问码" in msg:
                 raise Pan115Error("访问码错误或分享需要访问码", code=code) from exc
             if "not exist" in msg or "不存在" in msg or "失效" in msg or "expired" in msg:
                 raise Pan115Error("分享不存在或已失效", code=code) from exc
+            if "margin" in msg:
+                raise Pan115Error("115 限速（margin），请稍后重试", code=code) from exc
             raise Pan115Error(f"读取 115 分享失败：{exc}", code=code) from exc
 
         if not out:
@@ -114,6 +273,13 @@ class Pan115Provider(BaseShareProvider):
             is_dir=bool(d.get("is_dir", is_dir)),
             sha1=(str(d["sha1"]) if d.get("sha1") else None),
         )
+
+    # ------------------------------------------------------------------ #
+    def update_cookie(self, cookie: str) -> None:
+        """热更新 cookie（文件化支持）：重置客户端与 UID，下次健康检查用新值。"""
+        self.cookie = (cookie or "").strip()
+        self._client = None
+        self._uid = _uid_from_cookie(self.cookie)
 
     # ------------------------------------------------------------------ #
     async def check_health(self) -> bool | None:

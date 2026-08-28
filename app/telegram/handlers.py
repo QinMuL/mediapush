@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import NetworkError, TimedOut
@@ -112,7 +113,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /cancel — 取消当前编辑\n"
         "• /refresh <tmdb_id> — 清除该 TMDB 缓存后重拉\n"
         "• /status — 查看配置与 115 健康状态\n"
-        "• /mon — 频道监控管理（/mon login 交互式登录，自动捕获 ed2k 推送）"
+        "• /mon — 频道监控管理（/mon login 交互式登录，自动捕获 ed2k 推送）\n"
+        "• /inspect [数量] — 手动巡检已推送分享，失效撤卡（默认每 6 小时自动跑）"
     )
 
 
@@ -354,6 +356,34 @@ _pending_update: Update | None = None
 _pending_context = None
 _AGGREGATE_WINDOW = 3  # 聚合窗口（秒）
 
+# 处理中 60s 去重（借 P115-Share）：网络读取慢时，重复发送的同一链接直接跳过，
+# 防止并发处理绕过 pushed 去重造成双推。TTL 兜底防泄漏（进程内内存态）。
+_processing: dict[str, float] = {}  # "provider:code" -> 标记时刻（monotonic）
+_PROCESSING_TTL = 60.0
+
+
+def _processing_key(parsed) -> str:
+    return f"{parsed.provider}:{parsed.code}"
+
+
+def _is_processing(parsed) -> bool:
+    """该链接是否正在处理（60s 内）。顺手清理过期标记。"""
+    now = time.monotonic()
+    for k, t in list(_processing.items()):
+        if now - t >= _PROCESSING_TTL:
+            _processing.pop(k, None)
+    key = _processing_key(parsed)
+    started = _processing.get(key)
+    return started is not None and now - started < _PROCESSING_TTL
+
+
+def _mark_processing(parsed) -> None:
+    _processing[_processing_key(parsed)] = time.monotonic()
+
+
+def _unmark_processing(parsed) -> None:
+    _processing.pop(_processing_key(parsed), None)
+
 
 async def _handle_login_input(
     update: Update, context: ContextTypes.DEFAULT_TYPE, monitor, stage: str
@@ -451,6 +481,18 @@ async def _flush_pending() -> None:
 # ---------------------------------------------------------------------- #
 async def _process(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed) -> None:
     container = _container(context)
+    # 处理中 60s 去重：同一链接并发处理会造成双推（读取慢时用户易重发）
+    if _is_processing(parsed):
+        await update.message.reply_text("⏳ 该链接正在处理中，请稍候（勿在 1 分钟内重复发送）")
+        return
+    _mark_processing(parsed)
+    try:
+        await _process_locked(update, context, container, parsed)
+    finally:
+        _unmark_processing(parsed)
+
+
+async def _process_locked(update: Update, context, container, parsed) -> None:
     # ed2k 链接很长，placeholder 用简短文案；115 显示分享码
     if parsed.provider == "ed2k":
         loading = "⏳ 正在解析 ed2k 资源 ..."
@@ -558,16 +600,28 @@ async def _process_batch(update: Update, context, shares) -> None:
     async with _batch_lock:  # 串行化批量，避免多消息并发推送加剧 flood
         for parsed in shares:
             done += 1
+            # 处理中 60s 去重：跳过批外正在处理的同一链接（防双推）
+            if _is_processing(parsed):
+                lines.append(f"⏭️ {_short_id(parsed)}（正在处理中，跳过）")
+                await _edit(
+                    placeholder,
+                    _build_batch_summary(f"⏳ 处理中 ({done}/{total})", lines),
+                )
+                continue
+            _mark_processing(parsed)
             try:
-                result = await container.processor.process(parsed)
-            except Pan115Error as exc:
-                lines.append(f"⚠️ {_short_id(parsed)}：{exc}".replace("\n", " "))
-            except Exception as exc:
-                uid = update.effective_user.id if update.effective_user else None
-                logger.exception("处理分享失败：user=%s", uid)
-                lines.append(f"⚠️ {_short_id(parsed)}：{exc}".replace("\n", " "))
-            else:
-                lines.append(_summarize_line(parsed, result))
+                try:
+                    result = await container.processor.process(parsed)
+                except Pan115Error as exc:
+                    lines.append(f"⚠️ {_short_id(parsed)}：{exc}".replace("\n", " "))
+                except Exception as exc:
+                    uid = update.effective_user.id if update.effective_user else None
+                    logger.exception("处理分享失败：user=%s", uid)
+                    lines.append(f"⚠️ {_short_id(parsed)}：{exc}".replace("\n", " "))
+                else:
+                    lines.append(_summarize_line(parsed, result))
+            finally:
+                _unmark_processing(parsed)
             await _edit(
                 placeholder,
                 _build_batch_summary(f"⏳ 处理中 ({done}/{total})", lines),
@@ -846,7 +900,7 @@ async def _confirm_push(
         return
 
     try:
-        ok, msg = await pusher.push_share(
+        ok, msg, message_id, push_chat_id = await pusher.push_share(
             session.details, session.media, parsed.code, parsed.password,
             session.files, provider=session.provider,
             quality_extra=session.quality_extra, is_premium=session.is_premium,
@@ -858,7 +912,14 @@ async def _confirm_push(
 
     title = session.details.get("title") or session.media.title
     if ok:
-        await container.cache.mark_pushed(parsed.code)
+        await container.cache.mark_pushed(
+            parsed.code,
+            provider=session.provider,
+            password=parsed.password,
+            chat_id=push_chat_id,
+            message_id=message_id,
+            title=title,
+        )
         logger.info("编辑模式推送成功：%s", title)
         _clear_session(context)
         await _edit_preview_text(bot, session, f"✅ 已推送：{title}")
@@ -885,6 +946,42 @@ async def _handle_quality_input(
 
 
 # ---------------------------------------------------------------------- #
+# /inspect：手动触发分享失效巡检
+# ---------------------------------------------------------------------- #
+async def cmd_inspect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """手动巡检一轮已推送分享：失效撤卡 + 汇总（admin only）。
+
+    用法：/inspect [数量]（默认 50 条，最久未检查优先）
+    """
+    if not _is_admin(update, context):
+        return
+    container = _container(context)
+    inspector = getattr(container, "inspector", None)
+    if inspector is None:
+        await update.message.reply_text("❌ 巡检未启用（INSPECT_ENABLED=false）")
+        return
+    limit = 50
+    if context.args:
+        try:
+            limit = max(1, min(int(context.args[0]), 200))
+        except ValueError:
+            pass
+    placeholder = await update.message.reply_text(f"⏳ 正在巡检最多 {limit} 条已推送分享 ...")
+    try:
+        report = await inspector.run_once(limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        await _edit(placeholder, f"❌ 巡检失败：{exc}")
+        return
+    lines = [report.summary()]
+    for it in report.dead_items[:20]:
+        t = it["title"] or it["share_code"]
+        lines.append(f"⚰️ {t}（{it['reason']}）已撤卡")
+    if len(report.dead_items) > 20:
+        lines.append(f"… 共失效 {len(report.dead_items)} 条")
+    await _edit(placeholder, "\n".join(lines))
+
+
+# ---------------------------------------------------------------------- #
 # 快捷菜单命令（启动时通过 setMyCommands 注册，覆盖旧项目残留）
 # 顺序即菜单显示顺序；描述简短，Telegram 会作为 "/" 命令提示展示
 _BOT_COMMANDS: list[BotCommand] = [
@@ -896,6 +993,7 @@ _BOT_COMMANDS: list[BotCommand] = [
     BotCommand("status", "查看配置与健康"),
     BotCommand("refresh", "清除 TMDB 缓存"),
     BotCommand("mon", "频道监控（login 登录/add 添加）"),
+    BotCommand("inspect", "巡检失效分享并撤卡"),
 ]
 
 
@@ -987,6 +1085,7 @@ def register(application: Application) -> None:
     application.add_handler(CommandHandler("cancel", cmd_cancel))
     application.add_handler(CommandHandler("refresh", cmd_refresh))
     application.add_handler(CommandHandler("mon", cmd_mon))
+    application.add_handler(CommandHandler("inspect", cmd_inspect))
     application.add_handler(
         CallbackQueryHandler(
             on_edit_callback,

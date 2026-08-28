@@ -152,3 +152,67 @@ def test_parse_shares_single_equals_parse_share_for_url():
     assert shares[0].provider == single.provider
     assert shares[0].code == single.code
     assert shares[0].password == single.password
+
+
+# -------------------- A1 正文访问码提取 -------------------- #
+def test_body_password_fullwidth_colon():
+    """链接未带访问码时，从正文"访问码：xxxx"提取。"""
+    p = parse_share("https://115.com/s/abc123de\n访问码：w9k2")
+    assert p is not None
+    assert p.password == "w9k2"
+
+
+def test_body_password_halfwidth_colon_and_spacer():
+    p = parse_share("https://115.com/s/abc123de\n提取码: w9k2")
+    assert p is not None
+    assert p.password == "w9k2"
+
+
+def test_body_password_keyword_mi_ma():
+    p = parse_share("https://115.com/s/abc123de\n密码：w9k2")
+    assert p is not None
+    assert p.password == "w9k2"
+
+
+def test_body_password_url_param_wins():
+    """URL 自带 password 时正文提示不覆盖。"""
+    p = parse_share("https://115.com/s/abc123de?password=xyz99\n访问码：w9k2")
+    assert p is not None
+    assert p.password == "xyz99"
+
+
+def test_body_password_no_keyword_no_fill():
+    """正文无访问码提示则保持 None（P115-Share 同款关键词集）。"""
+    p = parse_share("https://115.com/s/abc123de\n复制这段内容可在115-Desktop中打开！")
+    assert p is not None
+    assert p.password is None
+
+
+def test_body_password_bare_code():
+    """裸码 + 正文访问码也能填充。"""
+    p = parse_share("abc12345\n密码：w9k2")
+    assert p is not None
+    assert p.code == "abc12345"
+    assert p.password == "w9k2"
+
+
+def test_body_password_multi_shares_fill_all():
+    """多链接消息中，无密码的链接统一用正文访问码填充。"""
+    txt = (
+        "https://115.com/s/aaaa1111\n"
+        "https://115.com/s/bbbb2222\n"
+        "访问码：w9k2"
+    )
+    shares = parse_shares(txt)
+    assert len(shares) == 2
+    assert shares[0].password == "w9k2"
+    assert shares[1].password == "w9k2"
+
+
+def test_body_password_ed2k_untouched():
+    """ed2k 链接不受正文访问码影响（无访问码概念）。"""
+    txt = f"{_ED2K_SAMPLE}\n访问码：w9k2"
+    shares = parse_shares(txt)
+    assert len(shares) == 1
+    assert shares[0].provider == "ed2k"
+    assert shares[0].password is None

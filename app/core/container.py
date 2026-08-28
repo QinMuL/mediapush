@@ -25,6 +25,7 @@ class Container:
         self.telegram = None
         self.monitor_store = None
         self.monitor = None
+        self.inspector = None
         self._built = False
 
     # ------------------------------------------------------------------ #
@@ -90,6 +91,14 @@ class Container:
         else:
             logger.info("MONITOR_ENABLED=false，频道监控未启用")
 
+        # 分享失效巡检（依赖 pan115/cache + telegram.bot，start 在 bot post_init）
+        if self.settings.inspect_enabled:
+            from app.telegram.inspector import ShareInspector
+
+            self.inspector = ShareInspector(self, self.settings)
+        else:
+            logger.info("INSPECT_ENABLED=false，分享失效巡检未启用")
+
         self._built = True
 
     # ------------------------------------------------------------------ #
@@ -102,6 +111,8 @@ class Container:
         return self.telegram is not None
 
     async def close(self) -> None:
+        if self.inspector is not None:
+            await self.inspector.stop()
         if self.monitor is not None:
             await self.monitor.stop()
         if self.monitor_store is not None:

@@ -108,6 +108,9 @@ class TelegramService:
             monitor_task = app.bot_data.pop("_monitor_task", None)
             if monitor_task and not monitor_task.done():
                 monitor_task.cancel()
+            # 分享失效巡检：停止后台循环
+            if self.container.inspector is not None:
+                await self.container.inspector.stop()
             if self.container.monitor is not None:
                 await self.container.monitor.stop()
             if self.container.monitor_store is not None:
@@ -136,6 +139,11 @@ class TelegramService:
             # 频道监控：独立任务启动（连接 + 补扫耗时，不阻塞 polling）
             if self.container.monitor is not None:
                 app.bot_data["_monitor_task"] = asyncio.create_task(_start_monitor())
+            # 分享失效巡检：后台循环（独立任务，失败不影响主链路）
+            if self.container.inspector is not None:
+                app.bot_data["_inspector_task"] = asyncio.create_task(
+                    self.container.inspector.start()
+                )
 
         builder = (
             ApplicationBuilder()

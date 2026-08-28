@@ -43,7 +43,7 @@ class FakeCache:
     async def is_pushed(self, code):
         return code in self._pushed
 
-    async def mark_pushed(self, code):
+    async def mark_pushed(self, code, **kwargs):
         self.marked.append(code)
 
     async def delete_tmdb(self, tmdb_id):
@@ -57,7 +57,7 @@ class FakePusher:
     async def push_share(self, details, media, code, password, files=None, provider="115",
                          **kwargs):
         self.pushed.append((code, password, files, provider))
-        return True, "已推送（测试）"
+        return True, "已推送（测试）", 555, "@chan"
 
 
 class FakeContainer:

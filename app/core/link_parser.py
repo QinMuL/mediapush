@@ -4,6 +4,7 @@
 - https://115.com/s/{code}?password={pwd}
 - https://115.com/s/{code}?{pwd}（尾 token）
 - 8+ 字符裸码
+- 链接未带访问码时，从消息正文提取（"访问码：xxxx" / "提取码:xxxx" / "密码：xxxx"）
 
 ed2k 单文件链接：
 - ed2k://|file|<文件名>|<字节数>|<hash>|...|/
@@ -19,6 +20,10 @@ _115_URL_RE = re.compile(r"115(?:cdn)?\.com/s/([A-Za-z0-9_-]+)(?:\?(?P<query>[^ 
 _115_PWD_RE = re.compile(r"password=([A-Za-z0-9_-]+)", re.IGNORECASE)
 # 尾 token：URL ? 后无 = 的短串（访问码，4-12 字符）
 _TAIL_TOKEN_RE = re.compile(r"^[A-Za-z0-9]{4,12}$")
+# 正文访问码：关键词 + 冒号/等号（全半角）+ 4-12 位字母数字（借 P115-Share 的提示词模式）
+_ACCESS_CODE_RE = re.compile(
+    r"(?:访问码|提取码|密码)\s*[：:=＝]\s*([A-Za-z0-9]{4,12})",
+)
 # 裸码：8+ 字符（避免误匹配 hello 等普通词）
 _BARE_CODE_RE = re.compile(r"^[A-Za-z0-9_-]{8,}$")
 
@@ -51,6 +56,23 @@ def _from_115_match(m: re.Match) -> ParsedShare:
     return ParsedShare("115", code, pwd)
 
 
+def _fill_body_password(shares: list[ParsedShare], text: str) -> None:
+    """链接未带访问码时，用正文提取的访问码填充（原地）。
+
+    仅 115 需要（ed2k 无访问码）；URL 自带 password/尾 token 的不覆盖。
+    正文懒提取：只有存在待填充项时才扫描一次。
+    """
+    if not any(p.provider == "115" and p.password is None for p in shares):
+        return
+    m = _ACCESS_CODE_RE.search(text)
+    if not m:
+        return
+    pwd = m.group(1)
+    for p in shares:
+        if p.provider == "115" and p.password is None:
+            p.password = pwd
+
+
 def parse_shares(text: str) -> list[ParsedShare]:
     """提取文本中所有 115 + ed2k 链接，按出现顺序返回（去重）。
 
@@ -73,6 +95,7 @@ def parse_shares(text: str) -> list[ParsedShare]:
             continue
         seen.add(key)
         result.append(p)
+    _fill_body_password(result, text)
     return result
 
 
@@ -88,11 +111,15 @@ def parse_share(text: str) -> ParsedShare | None:
 
     m = _115_URL_RE.search(text)
     if m:
-        return _from_115_match(m)
+        p = _from_115_match(m)
+        _fill_body_password([p], text)
+        return p
 
     # 裸码（取首个 token）
     first = text.strip().split()[0] if text.strip() else ""
     if _BARE_CODE_RE.fullmatch(first):
-        return ParsedShare("115", first, None)
+        p = ParsedShare("115", first, None)
+        _fill_body_password([p], text)
+        return p
 
     return None
