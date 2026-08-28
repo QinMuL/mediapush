@@ -204,6 +204,10 @@ class ShareWatcher:
             await self._move_to_archive(pan115, fid, name)
         except Exception as exc:  # noqa: BLE001 - 归档失败不影响推送主链路
             logger.warning("目录监控：移入归档失败（%s，下轮补移）：%s", name, exc)
+            return
+        # 115 移动为服务端异步执行：提交成功后留间隔，避免下一个移动
+        # 撞上"上一个尚未执行完成"（errno 990009）；超大目录仍有重试兜底
+        await asyncio.sleep(3)
 
     async def _move_to_archive(self, pan115, fid: int, name: str) -> None:
         cid = await self._archive_dir_cid(pan115)

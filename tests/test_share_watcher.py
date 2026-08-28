@@ -363,3 +363,58 @@ def test_archive_disabled_no_move(monkeypatch):
     assert report.shared == 1
     assert pan115.makedirs_calls == []
     assert pan115.moved == []
+
+
+def test_archive_interval_between_moves(monkeypatch):
+    """移动提交成功后留 3s 间隔：连续补移不背靠背（防 990009 忙冲突）。"""
+    sleeps: list = []
+
+    async def fake_sleep(sec):
+        sleeps.append(sec)
+
+    monkeypatch.setattr("app.core.share_watcher.asyncio.sleep", fake_sleep)
+    cache = _FakeCache([_dir(1, "/媒体", 100)])
+    for fid, nm in ((81, "剧J"), (82, "剧M")):
+        cache.records[(1, fid)] = {
+            "file_id": fid, "dir_id": 1, "name": nm,
+            "share_code": f"old{fid}", "password": "", "status": "ok",
+        }
+    pan115 = _FakePan115({100: [
+        {"fid": 81, "name": "剧J", "is_dir": True},
+        {"fid": 82, "name": "剧M", "is_dir": True},
+    ]})
+    proc = _FakeProcessor()
+    watcher = ShareWatcher(
+        _FakeContainer(pan115, cache, proc), _ArchiveSettings()
+    )
+
+    report = asyncio.run(watcher.run_once())
+
+    assert report.skipped == 2
+    assert pan115.moved == [(81, 999), (82, 999)]
+    assert sleeps == [3.0, 3.0]  # 每次移动提交后留间隔
+
+
+def test_archive_move_failure_no_interval(monkeypatch):
+    """移动失败 → 不留间隔（无提交成功，重试已由 fs_move 内部处理）。"""
+    sleeps: list = []
+
+    async def fake_sleep(sec):
+        sleeps.append(sec)
+
+    monkeypatch.setattr("app.core.share_watcher.asyncio.sleep", fake_sleep)
+
+    class _BoomMove(_FakePan115):
+        async def fs_move(self, fid, to_cid):
+            raise Pan115Error("移动失败：风控")
+
+    cache = _FakeCache([_dir(1, "/媒体", 100)])
+    pan115 = _BoomMove({100: [{"fid": 96, "name": "剧N", "is_dir": True}]})
+    proc = _FakeProcessor()
+    watcher = ShareWatcher(
+        _FakeContainer(pan115, cache, proc), _ArchiveSettings()
+    )
+
+    asyncio.run(watcher.run_once())
+
+    assert sleeps == [2.0]  # 仅推送限速；移动失败不留间隔
