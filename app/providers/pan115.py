@@ -55,11 +55,19 @@ def _is_margin_response(resp: object) -> bool:
 
 @dataclass
 class ShareStatus:
-    """分享状态（share_snap 预检结果，用于巡检与读取前校验）。"""
+    """分享状态（share_snap 预检结果，用于巡检与读取前校验）。
+
+    访问码语义（errno 实测）：
+    - 4100012「请输入访问码」：分享存在，仅缺访问码 → need_code=True（活着）
+    - 4100008「访问码错误」：分享存在，但传入的码不对（多半被改）→ code_changed=True
+    两类均非失效；但 list_share 深读仍需正确访问码。
+    """
 
     state: int | None = None  # share_state：0=审核中 1=正常 7=失效（其他未知）
     snapshotting: bool = False  # 正在生成文件快照（等待后可恢复）
     violating: bool = False  # have_vio_file=1 违规
+    need_code: bool = False  # 分享存在但需访问码（未存档/无法深读）
+    code_changed: bool = False  # 存档的访问码已失效（分享还活着，卡片旧码失效）
     title: str = ""
     message: str = ""  # 非空表示不可读（原因）
 
@@ -176,6 +184,14 @@ class Pan115Provider(BaseShareProvider):
             raise Pan115Error(f"p115client 导入失败：{exc}") from exc
 
         resp = await self._share_snap_raw(code, receive_code)
+        # 访问码类先判（state=False 但分享存在，不能走失效分类）：
+        # 4100012 请输入访问码（匿名/未存档）；4100008 访问码错误（存的码被改）
+        if resp.get("state") is False and (resp.get("errno") or resp.get("errNo")) in (
+            4100008, 4100012,
+        ):
+            if (resp.get("errno") or resp.get("errNo")) == 4100008:
+                return ShareStatus(need_code=True, code_changed=True)
+            return ShareStatus(need_code=True)
         try:
             check_response(resp)
         except Exception as exc:  # noqa: BLE001 - P115OSError 分类

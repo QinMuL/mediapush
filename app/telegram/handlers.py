@@ -978,6 +978,11 @@ async def cmd_inspect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         lines.append(f"⚰️ {t}（{it['reason']}）已撤卡")
     if len(report.dead_items) > 20:
         lines.append(f"… 共失效 {len(report.dead_items)} 条")
+    for it in report.code_items[:10]:
+        t = it["title"] or it["share_code"]
+        lines.append(f"🔑 {t}（{it['reason']}）—— /edit 重推可补档")
+    if len(report.code_items) > 10:
+        lines.append(f"… 共 {len(report.code_items)} 条缺访问码")
     await _edit(placeholder, "\n".join(lines))
 
 

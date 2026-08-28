@@ -340,3 +340,38 @@ def test_status_errno_cancelled(monkeypatch):
         assert "失效" in status.message
 
     asyncio.run(run())
+
+
+# -------------------- 访问码语义（errno 实测：4100012/4100008 分享存在） -------------------- #
+def test_status_need_code_not_dead(monkeypatch):
+    """errno 4100012（请输入访问码）→ 分享活着，need_code=True 不算待定/失效。"""
+    p = Pan115Provider("")
+    p._anon = _FakeSnapClient([
+        {"state": False, "errno": 4100012, "error": "请输入访问码",
+         "data": {"is_access": 0}},
+    ])
+
+    async def run():
+        st = await p.check_share_status("CODE", None)
+        assert st.need_code is True
+        assert st.code_changed is False
+        assert st.readable  # 活着
+
+    asyncio.run(run())
+
+
+def test_status_code_changed_not_dead(monkeypatch):
+    """errno 4100008（访问码错误）→ 分享活着但码被改，code_changed=True。"""
+    p = Pan115Provider("")
+    p._anon = _FakeSnapClient([
+        {"state": False, "errNo": 4100008, "error": "访问码错误",
+         "data": {"userinfo": {"user_id": "1"}}},
+    ])
+
+    async def run():
+        st = await p.check_share_status("CODE", "oldpwd")
+        assert st.need_code is True
+        assert st.code_changed is True
+        assert st.readable  # 资源还在，不撤卡
+
+    asyncio.run(run())

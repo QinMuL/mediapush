@@ -248,3 +248,30 @@ def test_cookie_health_ok_no_alert():
 
     _run(insp._check_cookie_health())
     tg.bot.send_message.assert_not_awaited()
+
+
+# -------------------- 访问码语义：need_code 计存活 + 明细 -------------------- #
+def test_inspect_need_code_counts_alive():
+    """缺访问码（errno 4100012/4100008）→ 存活计数 + code_items 明细，不待定不撤卡。"""
+    rows = [_row("NEED1", title="缺码的"), _row("CHG1", title="改码的")]
+    cache = _FakeCache(rows)
+    pan115 = _FakePan115({
+        "NEED1": ShareStatus(need_code=True),
+        "CHG1": ShareStatus(need_code=True, code_changed=True),
+    })
+    tg = _FakeTelegram()
+    container = _FakeContainer(pan115, cache, tg, _FakeSettings())
+    insp = ShareInspector(container, container.settings)
+
+    report = _run(insp.run_once())
+
+    assert report.ok == 2  # 活着
+    assert report.need_code == 2
+    assert report.pending == 0
+    assert report.dead == 0
+    reasons = {it["share_code"]: it["reason"] for it in report.code_items}
+    assert "未存档" in reasons["NEED1"]
+    assert "已变更" in reasons["CHG1"]
+    tg.bot.delete_message.assert_not_awaited()
+    assert set(cache.touched) == {"NEED1", "CHG1"}
+    assert "缺访问码" in report.summary()

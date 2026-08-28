@@ -32,12 +32,17 @@ class InspectReport:
     total: int = 0
     ok: int = 0
     dead: int = 0  # 判定失效并处理（撤卡）
-    pending: int = 0  # 快照/审核/访问码等暂不可判
+    pending: int = 0  # 快照/审核等暂不可判
     errors: int = 0  # 网络/接口异常
+    need_code: int = 0  # 存活但缺/失访问码（无法深读，非死链）
     dead_items: list[dict] = field(default_factory=list)  # 撤卡明细（告警用）
+    code_items: list[dict] = field(default_factory=list)  # 访问码问题明细（提醒补档）
 
     def summary(self) -> str:
-        s = f"巡检 {self.total}：✅ 存活 {self.ok} · ⚰️ 失效撤卡 {self.dead} · ⏳ 待定 {self.pending}"
+        s = f"巡检 {self.total}：✅ 存活 {self.ok}"
+        if self.need_code:
+            s += f"（含 {self.need_code} 条缺访问码）"
+        s += f" · ⚰️ 失效撤卡 {self.dead} · ⏳ 待定 {self.pending}"
         if self.errors:
             s += f" · ⚠️ 异常 {self.errors}"
         return s
@@ -129,6 +134,13 @@ class ShareInspector:
 
             if status.readable:
                 report.ok += 1
+                if status.need_code:
+                    # 分享活着但缺/失访问码（errno 4100012/4100008）：
+                    # 不撤卡；提醒补档（/edit 重推会存新码并重置状态）
+                    report.need_code += 1
+                    reason = "访问码已变更（卡片旧码失效）" if status.code_changed else "访问码未存档"
+                    report.code_items.append(dict(row, title=title, reason=reason))
+                    logger.info("巡检存活但缺访问码（%s）：%s", code, reason)
                 await cache.touch_checked(code)
                 continue
 
