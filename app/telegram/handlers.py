@@ -114,7 +114,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /refresh <tmdb_id> — 清除该 TMDB 缓存后重拉\n"
         "• /status — 查看配置与 115 健康状态\n"
         "• /mon — 频道监控管理（/mon login 交互式登录，自动捕获 ed2k 推送）\n"
-        "• /inspect [数量] — 手动巡检已推送分享，失效撤卡（默认每 6 小时自动跑）"
+        "• /inspect [数量] — 手动巡检已推送分享，失效撤卡（默认每 6 小时自动跑）\n"
+        "• /dir add <网盘路径> — 目录监控：新子目录自动建永久分享并推送（/share 立即扫描）"
     )
 
 
@@ -946,6 +947,111 @@ async def _handle_quality_input(
 
 
 # ---------------------------------------------------------------------- #
+# /dir：目录监控管理（add/del/list）；/share：手动触发一轮
+# ---------------------------------------------------------------------- #
+_DIR_USAGE = (
+    "📁 目录监控用法：\n"
+    "• /dir add <网盘路径> — 添加监控目录（如 /媒体/新剧）\n"
+    "• /dir del <网盘路径> — 移除（连同已分享记录）\n"
+    "• /dir list — 查看监控目录与已推送数\n"
+    "• /share — 立即扫描一轮：新子目录建永久分享并推送\n"
+    "说明：监控目录下每个新子目录 = 一张卡片（一部剧/电影）；"
+    "需已配置 115 cookie（创建分享要登录态）。"
+)
+
+
+async def cmd_dir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/dir add|del|list：目录监控管理（admin only）。"""
+    if not _is_admin(update, context):
+        return
+    container = _container(context)
+    args = context.args or []
+
+    async def reply(text: str) -> None:
+        await update.message.reply_text(text)
+
+    if not args or args[0] not in ("add", "del", "list"):
+        await reply(_DIR_USAGE)
+        return
+
+    sub = args[0]
+    if sub == "list":
+        dirs = await container.cache.list_share_dirs()
+        if not dirs:
+            await reply("暂无监控目录。/dir add <网盘路径> 添加")
+            return
+        lines = ["📁 监控目录："]
+        for d in dirs:
+            lines.append(f"• {d['path']}（已推送 {d['shared']} 个子目录）")
+        lines.append("\n/share 立即扫描一轮")
+        await reply("\n".join(lines))
+        return
+
+    # add / del 都需要路径参数（路径含空格时合并剩余参数）
+    target = " ".join(args[1:]).strip().strip("/")
+    if not target:
+        await reply(f"❌ 缺少路径。用法：/dir {sub} <网盘路径>")
+        return
+    path = "/" + target
+
+    if sub == "del":
+        removed = await container.cache.remove_share_dir(path)
+        if removed:
+            await reply(f"✅ 已移除监控目录：{path}")
+        else:
+            await reply(f"❌ 未找到监控目录：{path}（/dir list 查看）")
+        return
+
+    # add：解析路径 → cid（校验存在性，防拼写错误）
+    if container.pan115 is None:
+        await reply("❌ 115 服务未就绪")
+        return
+    if not container.pan115.cookie:
+        await reply(
+            "❌ 未配置 115 cookie（PAN115_COOKIE / PAN115_COOKIE_FILE），"
+            "无法创建分享。请先配置后再添加监控目录。"
+        )
+        return
+    loading = await update.message.reply_text(f"⏳ 正在校验网盘路径 `{path}` ...", parse_mode="Markdown")
+    try:
+        cid = await container.pan115.resolve_path(path)
+    except Pan115Error as exc:
+        await _edit(loading, f"❌ {exc}")
+        return
+    except Exception as exc:
+        logger.exception("路径解析失败")
+        await _edit(loading, f"❌ 路径解析失败：{exc}")
+        return
+    await container.cache.add_share_dir(path, cid)
+    await _edit(loading, f"✅ 已添加监控目录：{path}\n新增子目录将自动建永久分享并推送（/share 立即触发）")
+
+
+async def cmd_share(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/share：手动扫描一轮监控目录（admin only）。"""
+    if not _is_admin(update, context):
+        return
+    container = _container(context)
+    watcher = getattr(container, "share_watcher", None)
+    if watcher is None:
+        await update.message.reply_text("❌ 目录监控未启用（SHARE_WATCH_ENABLED=false）")
+        return
+    placeholder = await update.message.reply_text("⏳ 正在扫描监控目录 ...")
+    try:
+        report = await watcher.run_once()
+    except Exception as exc:  # noqa: BLE001
+        await _edit(placeholder, f"❌ 扫描失败：{exc}")
+        return
+    lines = [report.summary()]
+    for it in report.items[:20]:
+        lines.append(f"✅ {it['name']}（{it['dir']}）")
+    if len(report.items) > 20:
+        lines.append(f"… 共 {len(report.items)} 个")
+    if not report.items and report.new_items == 0 and report.failed == 0:
+        lines.append("（监控目录下无新子目录，均已是分享状态）")
+    await _edit(placeholder, "\n".join(lines))
+
+
+# ---------------------------------------------------------------------- #
 # /inspect：手动触发分享失效巡检
 # ---------------------------------------------------------------------- #
 async def cmd_inspect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -999,6 +1105,8 @@ _BOT_COMMANDS: list[BotCommand] = [
     BotCommand("refresh", "清除 TMDB 缓存"),
     BotCommand("mon", "频道监控（login 登录/add 添加）"),
     BotCommand("inspect", "巡检失效分享并撤卡"),
+    BotCommand("dir", "目录监控管理（add/del/list）"),
+    BotCommand("share", "扫描目录建永久分享并推送"),
 ]
 
 
@@ -1091,6 +1199,8 @@ def register(application: Application) -> None:
     application.add_handler(CommandHandler("refresh", cmd_refresh))
     application.add_handler(CommandHandler("mon", cmd_mon))
     application.add_handler(CommandHandler("inspect", cmd_inspect))
+    application.add_handler(CommandHandler("dir", cmd_dir))
+    application.add_handler(CommandHandler("share", cmd_share))
     application.add_handler(
         CallbackQueryHandler(
             on_edit_callback,

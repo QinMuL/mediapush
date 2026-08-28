@@ -76,6 +76,9 @@ class Settings:
     inspect_enabled: bool = True
     inspect_interval_hours: float = 6.0
     inspect_notify: bool = True
+    # 目录监控 → 自动建永久分享（见 app/core/share_watcher.py）
+    share_watch_enabled: bool = True
+    share_watch_interval_minutes: float = 10.0
 
     @classmethod
     def load(cls) -> Settings:
@@ -124,6 +127,10 @@ class Settings:
             inspect_enabled=_env_bool("INSPECT_ENABLED", True),
             inspect_interval_hours=_env_float("INSPECT_INTERVAL_HOURS", 6.0),
             inspect_notify=_env_bool("INSPECT_NOTIFY", True),
+            share_watch_enabled=_env_bool("SHARE_WATCH_ENABLED", True),
+            share_watch_interval_minutes=_env_float(
+                "SHARE_WATCH_INTERVAL_MINUTES", 10.0
+            ),
         )
         settings._ensure_dirs()
         return settings

@@ -44,7 +44,10 @@ class _FakeApp:
 def test_bot_commands_structure():
     """命令清单顺序与描述非空。"""
     cmds = [c.command for c in _BOT_COMMANDS]
-    assert cmds == ["start", "help", "115", "edit", "cancel", "status", "refresh", "mon", "inspect"]
+    assert cmds == [
+        "start", "help", "115", "edit", "cancel", "status", "refresh",
+        "mon", "inspect", "dir", "share",
+    ]
     for c in _BOT_COMMANDS:
         assert c.description, f"{c.command} 描述为空"
 

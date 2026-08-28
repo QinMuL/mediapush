@@ -13,6 +13,9 @@ cookie 降级为可选：仅用于 /status 健康检查（验证自有账号有�
 - user_info(uid, async_=True) 健康检查需显式 uid（从 cookie 解析 UID）
 - 115 默认不走代理（走代理易触发风控）
 
+目录监控→建分享（share_send + duration=-1 永久，见 create_share）：
+- 需登录 cookie（创建分享接口不支持匿名）；无 cookie 时相关方法抛 Pan115Error
+
 借 P115-Share（github.com/ListeningLTG/P115-Share）的经验：
 - margin 限速识别：115 风控返回 {"margin": N}（无 state/data，仅剩余秒数），
   check_response 因缺 state 而放行，随后 resp["data"]["count"] 抛 KeyError ——
@@ -296,6 +299,145 @@ class Pan115Provider(BaseShareProvider):
         self.cookie = (cookie or "").strip()
         self._client = None
         self._uid = _uid_from_cookie(self.cookie)
+
+    # ------------------------------------------------------------------ #
+    # 目录监控 → 创建永久分享（需登录 cookie）
+    # ------------------------------------------------------------------ #
+    def _login_client(self):
+        """登录态 client（建分享/列自己网盘必须）；无 cookie 抛错。"""
+        client = self._build_client()
+        if client is None:
+            raise Pan115Error("需要 115 cookie（PAN115_COOKIE / PAN115_COOKIE_FILE）才能创建分享")
+        return client
+
+    async def _call_with_margin(self, coro_fn, *, label: str, max_retry: int = 3):
+        """调用 115 接口，margin 限速响应等待后重试（渐进，cap 30s）。
+
+        margin 响应 {"margin": N} 无 state/data（check_response 放行后 data 取值炸），
+        参照 P115-Share：等 N 秒重试，耗尽抛 Pan115Error。
+        """
+        import asyncio as _aio
+
+        for attempt in range(1, max_retry + 1):
+            resp = await coro_fn()
+            if _is_margin_response(resp):
+                wait = min(float(resp.get("margin", 5) or 5), self._MARGIN_WAIT_CAP)
+                logger.warning(
+                    "115 %s margin 限速：等待 %.0fs 重试（%d/%d）",
+                    label, wait, attempt, max_retry,
+                )
+                await _aio.sleep(wait)
+                continue
+            return resp
+        raise Pan115Error(f"115 {label} 限速，多次重试后仍失败")
+
+    async def list_dir(self, cid: int = 0) -> list[dict]:
+        """列自己网盘目录的**子目录**（fs_files + nf=1 仅目录，自动翻页）。
+
+        返回 [{fid, name, size}]（均为目录），需登录 cookie。
+        webapi 响应目录条目无 fid（id 在 cid 键）——p115client overview_attr 同款判定。
+        """
+        from p115client.client import check_response
+
+        client = self._login_client()
+        items: list[dict] = []
+        offset = 0
+        limit = 1000
+        while True:
+            resp = await self._call_with_margin(
+                lambda off=offset: client.fs_files(
+                    {"cid": cid, "limit": limit, "offset": off,
+                     "nf": 1, "asc": 1, "o": "file_name"},
+                    async_=True,
+                ),
+                label="fs_files",
+            )
+            try:
+                check_response(resp)
+            except Exception as exc:
+                raise Pan115Error(f"列目录失败：{exc}", code=str(cid)) from exc
+            data = resp.get("data") or {}
+            batch = data.get("list") or []
+            for it in batch:
+                # webapi 格式：目录无 "fid" 键，目录 id 在 "cid"；文件 id 在 "fid"
+                is_dir = "fid" not in it
+                fid = int(it.get("cid") if is_dir else it.get("fid") or 0)
+                items.append({
+                    "fid": fid,
+                    "name": str(it.get("n") or it.get("file_name") or ""),
+                    "is_dir": is_dir,
+                    "size": int(it.get("s") or it.get("file_size") or 0),
+                })
+            count = int(data.get("count") or 0)
+            # 按实际拉取条数递增（limit=1000 时 offset+=limit 会一页跳过 count）
+            offset += len(batch)
+            if offset >= count or not batch:
+                break
+        return items
+
+    async def resolve_path(self, path: str) -> int:
+        """网盘路径 → cid（逐级下钻）。如 /媒体/新剧 → 逐段匹配目录名。
+
+        大小写不敏感精确匹配；找不到抛 Pan115Error。需登录 cookie。
+        """
+        self._login_client()  # 校验 cookie 存在（列目录需登录态）
+        parts = [p for p in (path or "").strip("/").split("/") if p]
+        cid = 0
+        walked: list[str] = []
+        for part in parts:
+            items = await self.list_dir(cid)
+            hit = next(
+                (it for it in items if it["is_dir"] and it["name"].lower() == part.lower()),
+                None,
+            )
+            if hit is None:
+                raise Pan115Error(
+                    f"网盘目录不存在：/{'/'.join(walked + [part])}"
+                    "（检查路径拼写，目录监控只支持已存在的目录）"
+                )
+            cid = hit["fid"]
+            walked.append(part)
+        return cid
+
+    async def create_share(self, file_ids: int | str) -> tuple[str, str]:
+        """创建**永久**分享，返回 (share_code, receive_code)。需登录 cookie。
+
+        share_send 建分享（margin 渐进重试）→ share_update(duration=-1) 设永久
+        （P115-Share 同款配方）。失败抛 Pan115Error。
+        """
+        from p115client.client import check_response
+
+        client = self._login_client()
+        fids = str(file_ids)
+
+        resp = await self._call_with_margin(
+            lambda: client.share_send(
+                {"file_ids": fids, "ignore_warn": 1}, async_=True
+            ),
+            label="share_send",
+        )
+        try:
+            check_response(resp)
+        except Exception as exc:
+            raise Pan115Error(f"创建分享失败：{exc}") from exc
+        data = resp.get("data") or {}
+        share_code = str(data.get("share_code") or "")
+        receive_code = str(data.get("receive_code") or data.get("recv_code") or "")
+        if not share_code:
+            raise Pan115Error("创建分享失败：响应缺少 share_code")
+
+        # 永久化（失败仅告警：默认分享也有较长有效期，下一轮巡检不受影响）
+        try:
+            upd = await self._call_with_margin(
+                lambda: client.share_update(
+                    {"share_code": share_code, "share_duration": -1}, async_=True
+                ),
+                label="share_update",
+            )
+            check_response(upd)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("分享设为永久失败（保留默认有效期）：%s", exc)
+        return share_code, receive_code
 
     # ------------------------------------------------------------------ #
     async def check_health(self) -> bool | None:

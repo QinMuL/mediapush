@@ -75,6 +75,8 @@ cp .env.example .env
 | `INSPECT_ENABLED` | 是否启用分享失效巡检，默认 `true` |
 | `INSPECT_INTERVAL_HOURS` | 巡检间隔（小时），默认 `6` |
 | `INSPECT_NOTIFY` | 失效撤卡后是否私信 admin 告警，默认 `true` |
+| `SHARE_WATCH_ENABLED` | 是否启用目录监控自动建分享，默认 `true` |
+| `SHARE_WATCH_INTERVAL_MINUTES` | 目录扫描间隔（分钟），默认 `10` |
 | `LOG_LEVEL` | 控制台日志级别，默认 `INFO`（文件日志恒为 `DEBUG` 全量） |
 | `DB_PATH` | SQLite 缓存路径，默认 `./data/cache.db` |
 | `LOG_FILE` | 文件日志路径，默认 `./data/logs/mediapush.log`（按天轮转，保留 14 天） |
@@ -188,6 +190,9 @@ docker inspect mediapush --format '{{.State.Health.Status}}'
 | `/115 <链接> [访问码]` | 显式触发 |
 | `/edit <链接>` | 预览编辑模式：追加推荐语 / 切换 💎 精品标记后推送（跳过去重，可重推） |
 | `/cancel` | 取消当前编辑会话 |
+| `/dir add <网盘路径>` | 登记目录监控（如 `/dir add /媒体/新剧`），新子目录自动建永久分享推送 |
+| `/dir list` / `/dir del <路径>` | 查看 / 移除监控目录 |
+| `/share` | 立即扫描一轮监控目录（不等定时） |
 | `/inspect [数量]` | 手动巡检一轮已推送分享（失效撤卡，默认 50 条，详见下节） |
 | `/refresh <tmdb_id>` | 清除该 TMDB 缓存，下次重新拉取（剧集更新集数时用） |
 | `/status` | 查看配置与 115 健康状态 |
@@ -202,6 +207,18 @@ docker inspect mediapush --format '{{.State.Health.Status}}'
 - 同一分享码重复发送提示"已推送过，跳过"；同一链接 60 秒内重复发送提示"正在处理中"（防并发双推）。
 - TMDB 元数据缓存统一 24 小时（过期自动清除重拉）。
 - `/edit` 重推会跳过持久化去重（用于补档访问码、更新卡片）。
+
+### 目录监控：自动建永久分享（/dir + /share）
+
+监控**自己网盘**的指定目录（需 115 cookie，创建分享接口不支持匿名）：
+
+- **登记**：`/dir add /媒体/新剧`（路径即时校验，防拼写错误）；`/dir list` 查看、`/dir del` 移除。
+- **扫描**：默认每 10 分钟（`SHARE_WATCH_INTERVAL_MINUTES`）后台扫一轮；`/share` 随时手动触发。启动 1 分钟后先跑一轮。
+- **粒度**：监控目录下每个**新子目录** = 一个永久分享 = 一张卡片（一部剧/一部电影），契合卡片模板的文件清单结构。
+- **建分享**：`share_send` 创建 + `share_duration=-1` 设**永久**（P115-Share 同款配方）；margin 限速自动等待重试。
+- **推送**：完全复用手动推送卡片管线（TMDB 匹配/海报/画质/分流频道），推送串行 + 2s 限速防 flood。
+- **去重**：子目录 fid 持久化（shared_items），已分享的不再重复；建分享/推送失败不标记，下轮自动重试（宁重不漏）。
+- **闭环**：推送后访问码/消息引用自动存档 → 失效巡检器照常撤卡死链。
 
 ### 分享失效巡检（/inspect）
 
@@ -251,6 +268,7 @@ app/
 ├── core/
 │   ├── container.py     # DI 容器（懒加载各服务）
 │   ├── processor.py     # 编排：读取→解析→TMDB→推送→去重
+│   └── share_watcher.py # 目录监控→建永久分享→推卡片（/dir 管理）
 │   └── link_parser.py   # 115 链接/裸码/ed2k 解析 + 正文访问码提取
 ├── providers/
 │   ├── base.py          # BaseShareProvider + ShareFile
@@ -315,6 +333,7 @@ ruff check .
 - **TMDB 匹配不到**：文件名太乱时，可手动 `/115` 带更规范的链接；或检查 `TMDB_LANGUAGE`。
 - **频道收不到**：确认 Bot 已是频道管理员且有发送权限；确认 `TG_CHAT_ID` 正确（分流时检查 `TG_CHAT_ID_115` / `TG_CHAT_ID_ED2K`）。
 - **cookie 失效告警**：仅影响 `/status` 健康检查，匿名读取分享不受影响。更新 cookie：改 `PAN115_COOKIE_FILE` 文件内容（自动热加载）或 `PAN115_COOKIE` 环境变量后重启。
+- **目录监控没反应**：需已配置 115 cookie（创建分享要登录态）；`/dir list` 确认目录已登记；`/share` 手动触发看报错；cookie 失效时 `/dir add` 会被拦下。
 
 ---
 

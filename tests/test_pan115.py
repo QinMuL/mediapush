@@ -375,3 +375,173 @@ def test_status_code_changed_not_dead(monkeypatch):
         assert st.readable  # 资源还在，不撤卡
 
     asyncio.run(run())
+
+
+# -------------------- 目录监控：list_dir / resolve_path / create_share -------------------- #
+class _FakeLoginClient:
+    """登录态 client 桩（fs_files / share_send / share_update）。"""
+
+    def __init__(self, pages=None, share_resp=None):
+        self.pages = list(pages or [])   # fs_files 逐页响应
+        self.share_resp = share_resp
+        self.calls: list = []
+
+    async def fs_files(self, payload, **kw):
+        self.calls.append(("fs_files", payload))
+        return self.pages.pop(0)
+
+    async def share_send(self, payload, **kw):
+        self.calls.append(("share_send", payload))
+        return self.share_resp
+
+    async def share_update(self, payload, **kw):
+        self.calls.append(("share_update", payload))
+        return {"state": True}
+
+
+def _login_p(monkeypatch, fake_client):
+    """构造带登录 cookie 的 provider，_build_client 替换为桩。"""
+    p = Pan115Provider("UID=12345;CID=67890;")
+    monkeypatch.setattr(Pan115Provider, "_build_client", lambda self: fake_client)
+    return p
+
+
+def test_list_dir_only_dirs_with_pagination(monkeypatch):
+    """list_dir：nf=1 仅目录；目录 id 取 cid 键（无 fid）；自动翻页。"""
+    client = _FakeLoginClient(pages=[
+        {"state": True, "data": {"count": 3, "list": [
+            {"cid": 11, "pid": 0, "n": "剧A"},
+            {"cid": 12, "pid": 0, "n": "剧B"},
+        ]}},
+        {"state": True, "data": {"count": 3, "list": [
+            {"cid": 13, "pid": 0, "n": "剧C"},
+        ]}},
+    ])
+    p = _login_p(monkeypatch, client)
+
+    async def run():
+        items = await p.list_dir(100)
+        assert [i["name"] for i in items] == ["剧A", "剧B", "剧C"]
+        assert all(i["is_dir"] for i in items)
+        assert items[0]["fid"] == 11
+        # 请求带 nf=1（仅目录）
+        payloads = [c[1] for c in client.calls]
+        assert all(pl.get("nf") == 1 for pl in payloads)
+        assert payloads[0]["cid"] == 100
+
+    asyncio.run(run())
+
+
+def test_resolve_path_drills_down(monkeypatch):
+    """resolve_path：逐级下钻 /媒体/新剧 → cid；大小写不敏感。"""
+    client = _FakeLoginClient(pages=[
+        {"state": True, "data": {"count": 1, "list": [{"cid": 50, "pid": 0, "n": "Media"}]}},
+        {"state": True, "data": {"count": 1, "list": [{"cid": 51, "pid": 50, "n": "新剧"}]}},
+    ])
+    p = _login_p(monkeypatch, client)
+
+    async def run():
+        cid = await p.resolve_path("/media/新剧")
+        assert cid == 51
+
+    asyncio.run(run())
+
+
+def test_resolve_path_not_found(monkeypatch):
+    client = _FakeLoginClient(pages=[
+        {"state": True, "data": {"count": 0, "list": []}},
+    ])
+    p = _login_p(monkeypatch, client)
+
+    async def run():
+        with pytest.raises(Pan115Error, match="不存在"):
+            await p.resolve_path("/没有的目录")
+
+    asyncio.run(run())
+
+
+def test_resolve_path_empty_returns_root(monkeypatch):
+    """/ → cid 0（根目录本身可作监控目录）。"""
+    p = Pan115Provider("UID=1;CID=2;")
+    assert asyncio.run(p.resolve_path("/")) == 0 or True  # 根路径无段不调接口
+    # 空 parts → 不请求任何页，直接返回 0
+    client = _FakeLoginClient()
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(Pan115Provider, "_build_client", lambda self: client)
+    try:
+        async def run():
+            assert await p.resolve_path("/") == 0
+        asyncio.run(run())
+    finally:
+        monkeypatch.undo()
+
+
+def test_create_share_permanent(monkeypatch):
+    """create_share：share_send 建分享 + share_update duration=-1 永久。"""
+    client = _FakeLoginClient(share_resp={
+        "state": True, "data": {"share_code": "swNEW123", "receive_code": "ab12"},
+    })
+    p = _login_p(monkeypatch, client)
+
+    async def run():
+        code, pwd = await p.create_share(12345)
+        assert code == "swNEW123"
+        assert pwd == "ab12"
+        # share_send 带 file_ids + ignore_warn
+        send = next(c for c in client.calls if c[0] == "share_send")[1]
+        assert send["file_ids"] == "12345"
+        # share_update 设永久 -1
+        upd = next(c for c in client.calls if c[0] == "share_update")[1]
+        assert upd == {"share_code": "swNEW123", "share_duration": -1}
+
+    asyncio.run(run())
+
+
+def test_create_share_margin_retries(monkeypatch):
+    """share_send 遇 margin 限速 → 等待后重试成功。"""
+    sleeps: list = []
+
+    async def fake_sleep(sec):
+        sleeps.append(sec)
+
+    monkeypatch.setattr("app.providers.pan115.asyncio.sleep", fake_sleep)
+    client = _FakeLoginClient(share_resp=None)
+    # share_send 依次返回：margin → 成功
+    seq = [
+        {"margin": 7},
+        {"state": True, "data": {"share_code": "swM1", "receive_code": "x1"}},
+    ]
+
+    async def share_send(payload, **kw):
+        return seq.pop(0)
+
+    client.share_send = share_send
+    p = _login_p(monkeypatch, client)
+
+    async def run():
+        code, _pwd = await p.create_share(777)
+        assert code == "swM1"
+        assert sleeps == [7.0]
+
+    asyncio.run(run())
+
+
+def test_create_share_no_cookie_raises():
+    """无 cookie → Pan115Error（创建分享需登录态）。"""
+    p = Pan115Provider("")
+
+    async def run():
+        with pytest.raises(Pan115Error, match="cookie"):
+            await p.create_share(1)
+
+    asyncio.run(run())
+
+
+def test_list_dir_no_cookie_raises():
+    p = Pan115Provider("")
+
+    async def run():
+        with pytest.raises(Pan115Error, match="cookie"):
+            await p.list_dir(0)
+
+    asyncio.run(run())

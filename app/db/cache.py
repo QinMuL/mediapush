@@ -27,6 +27,20 @@ CREATE TABLE IF NOT EXISTS tmdb_cache (
     ttl_days    INTEGER NOT NULL,
     PRIMARY KEY (tmdb_id, media_type)
 );
+CREATE TABLE IF NOT EXISTS share_dirs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    path        TEXT NOT NULL UNIQUE,   -- 网盘路径（如 /媒体/新剧）
+    cid         INTEGER NOT NULL,       -- 路径解析出的目录 id
+    created_at  REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS shared_items (
+    file_id     INTEGER NOT NULL,       -- 子目录 fid（去重 key）
+    dir_id      INTEGER NOT NULL,       -- 所属监控目录 id
+    name        TEXT NOT NULL,
+    share_code  TEXT NOT NULL,
+    pushed_at   REAL NOT NULL,
+    PRIMARY KEY (file_id, dir_id)
+);
 CREATE TABLE IF NOT EXISTS pushed_shares (
     share_code  TEXT PRIMARY KEY,
     pushed_at   REAL NOT NULL,
@@ -93,6 +107,11 @@ class Cache:
         db = await self._ensure()
         cur = await db.execute(sql, params)
         return await cur.fetchone()
+
+    async def _fetchall(self, sql: str, params: tuple = ()) -> list[tuple]:
+        db = await self._ensure()
+        cur = await db.execute(sql, params)
+        return await cur.fetchall()
 
     async def close(self) -> None:
         if self._db is not None:
@@ -217,4 +236,53 @@ class Cache:
             "UPDATE pushed_shares SET status='dead', last_checked_at=? "
             "WHERE share_code=?",
             (time.time(), share_code),
+        )
+
+    # ------------------------------------------------------------------ #
+    # 目录监控 → 自动建分享（/dir add 管理，watcher 消费）
+    # ------------------------------------------------------------------ #
+    async def add_share_dir(self, path: str, cid: int) -> None:
+        """添加（或刷新）监控目录：路径唯一，已存在则更新 cid。"""
+        await self._execute(
+            "INSERT INTO share_dirs (path, cid, created_at) VALUES (?,?,?) "
+            "ON CONFLICT(path) DO UPDATE SET cid=excluded.cid",
+            (path, cid, time.time()),
+        )
+
+    async def remove_share_dir(self, path: str) -> int:
+        """移除监控目录（连同其已分享记录）。返回删除的行数。"""
+        row = await self._fetchone(
+            "SELECT id FROM share_dirs WHERE path=?", (path,)
+        )
+        if not row:
+            return 0
+        dir_id = int(row[0])
+        await self._execute("DELETE FROM shared_items WHERE dir_id=?", (dir_id,))
+        cur = await self._execute("DELETE FROM share_dirs WHERE id=?", (dir_id,))
+        return cur.rowcount
+
+    async def list_share_dirs(self) -> list[dict]:
+        rows = await self._fetchall(
+            "SELECT d.id, d.path, d.cid, "
+            "(SELECT COUNT(*) FROM shared_items s WHERE s.dir_id = d.id) AS shared "
+            "FROM share_dirs d ORDER BY d.id"
+        )
+        keys = ("id", "path", "cid", "shared")
+        return [dict(zip(keys, r)) for r in rows]
+
+    async def is_shared(self, dir_id: int, file_id: int) -> bool:
+        row = await self._fetchone(
+            "SELECT 1 FROM shared_items WHERE dir_id=? AND file_id=?",
+            (dir_id, file_id),
+        )
+        return row is not None
+
+    async def mark_shared(
+        self, dir_id: int, file_id: int, name: str, share_code: str
+    ) -> None:
+        """记录已建分享推送（失败不标记 → 下轮重扫自动重试）。"""
+        await self._execute(
+            "INSERT OR REPLACE INTO shared_items "
+            "(file_id, dir_id, name, share_code, pushed_at) VALUES (?,?,?,?,?)",
+            (file_id, dir_id, name, share_code, time.time()),
         )

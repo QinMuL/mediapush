@@ -26,6 +26,7 @@ class Container:
         self.monitor_store = None
         self.monitor = None
         self.inspector = None
+        self.share_watcher = None
         self._built = False
 
     # ------------------------------------------------------------------ #
@@ -99,6 +100,19 @@ class Container:
         else:
             logger.info("INSPECT_ENABLED=false，分享失效巡检未启用")
 
+        # 目录监控 → 自动建永久分享（依赖 pan115 cookie + processor，start 在 bot post_init）
+        if self.settings.share_watch_enabled:
+            from app.core.share_watcher import ShareWatcher
+
+            self.share_watcher = ShareWatcher(self, self.settings)
+            if not self.settings.pan115_cookie and not self.settings.pan115_cookie_file:
+                logger.warning(
+                    "目录监控已创建但暂无 115 cookie：创建分享需登录态"
+                    "（PAN115_COOKIE / PAN115_COOKIE_FILE），配置后 /dir add 即可用"
+                )
+        else:
+            logger.info("SHARE_WATCH_ENABLED=false，目录监控未启用")
+
         self._built = True
 
     # ------------------------------------------------------------------ #
@@ -111,6 +125,8 @@ class Container:
         return self.telegram is not None
 
     async def close(self) -> None:
+        if self.share_watcher is not None:
+            await self.share_watcher.stop()
         if self.inspector is not None:
             await self.inspector.stop()
         if self.monitor is not None:

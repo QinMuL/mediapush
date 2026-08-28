@@ -74,3 +74,47 @@ def test_list_pushed_shares_excludes_ed2k(tmp_path):
         await cache.close()
 
     asyncio.run(run())
+
+
+# -------------------- 目录监控：share_dirs / shared_items -------------------- #
+def test_share_dirs_lifecycle(tmp_path):
+    """add（重复刷新 cid）/ list（含已推送计数）/ del（连同记录）。"""
+    import asyncio
+
+    from app.db.cache import Cache
+
+    cache = Cache(str(tmp_path / "t.db"))
+
+    async def run():
+        await cache.add_share_dir("/媒体", 100)
+        await cache.add_share_dir("/媒体", 101)  # 重复 → 更新 cid（AUTOINCREMENT 序列仍自增）
+        await cache.add_share_dir("/电影", 200)
+
+        # id 从查询取（ON CONFLICT 下自增序列会跳号，不能硬编码）
+        dirs = await cache.list_share_dirs()
+        by_path = {d["path"]: d for d in dirs}
+        media_id = by_path["/媒体"]["id"]
+        movie_id = by_path["/电影"]["id"]
+
+        await cache.mark_shared(media_id, 11, "剧A", "swA1")
+        await cache.mark_shared(media_id, 12, "剧B", "swB1")
+        await cache.mark_shared(movie_id, 21, "影C", "swC1")
+
+        dirs = await cache.list_share_dirs()
+        by_path = {d["path"]: d for d in dirs}
+        assert by_path["/媒体"]["cid"] == 101  # 刷新生效
+        assert by_path["/媒体"]["shared"] == 2
+        assert by_path["/电影"]["shared"] == 1
+
+        # is_shared 判定
+        assert await cache.is_shared(media_id, 11) is True
+        assert await cache.is_shared(media_id, 99) is False
+
+        # del：连同 shared_items
+        removed = await cache.remove_share_dir("/媒体")
+        assert removed == 1
+        assert await cache.is_shared(media_id, 11) is False  # 记录已删
+        assert await cache.remove_share_dir("/不存在") == 0
+        await cache.close()
+
+    asyncio.run(run())
