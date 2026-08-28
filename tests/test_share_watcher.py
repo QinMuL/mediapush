@@ -417,4 +417,4 @@ def test_archive_move_failure_no_interval(monkeypatch):
 
     asyncio.run(watcher.run_once())
 
-    assert sleeps == [2.0]  # 仅推送限速；移动失败不留间隔
+    assert sleeps == [5.0, 2.0]  # 新分享就绪等待 + 推送限速；移动失败不留间隔
