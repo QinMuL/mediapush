@@ -33,17 +33,20 @@ class WatchReport:
     dirs: int = 0
     new_items: int = 0  # 发现的未分享子目录
     shared: int = 0  # 建分享+推送成功
-    failed: int = 0  # 建分享/推送失败（下轮重试）
-    skipped: int = 0  # 已分享跳过
+    retried: int = 0  # 复用已建分享码重推成功（此前 pending）
+    failed: int = 0  # 建分享/推送失败（下轮重试，复用已建的码）
+    skipped: int = 0  # 已推送（ok）跳过
     items: list[dict] = field(default_factory=list)  # 成功明细
 
     def summary(self) -> str:
         s = (
             f"扫描 {self.dirs} 个目录：新 {self.new_items}"
-            f" → ✅ 推送 {self.shared}"
+            f" → ✅ 推送 {self.shared + self.retried}"
         )
+        if self.retried:
+            s += f"（含复用重试 {self.retried}）"
         if self.failed:
-            s += f" · ⚠️ 失败 {self.failed}（下轮自动重试）"
+            s += f" · ⚠️ 失败 {self.failed}（下轮复用分享码重试）"
         if self.skipped:
             s += f" · ⏭️ 已分享 {self.skipped}"
         return s
@@ -84,47 +87,79 @@ class ShareWatcher:
             dir_id, path, cid = int(d["id"]), d["path"], int(d["cid"])
             try:
                 subdirs = await pan115.list_dir(cid)
-            except Exception as exc:  # noqa: BLE001 - 网络/登录态异常下轮再看
+            except Exception as exc:  # noqa: BLE001 - 网络异常下轮再看（warning 摘要）
                 report.failed += 1
                 logger.warning("目录监控列目录失败（%s）：%s", path, exc)
                 continue
 
             for item in subdirs:
                 fid, name = item["fid"], item["name"]
-                if await cache.is_shared(dir_id, fid):
+                record = await cache.get_shared_item(dir_id, fid)
+                if record is not None and record["status"] == "ok":
                     report.skipped += 1
                     continue
-                report.new_items += 1
+
+                if record is None:
+                    report.new_items += 1
+                # pending：复用已建的 share_code 重推（新分享常处审核/快照中，
+                # 读取失败 → 登记 pending → 下轮复用同码重试，绝不重复建分享）
                 try:
+                    is_retry = record is not None
                     await self._share_and_push(
-                        processor, cache, pan115, dir_id, fid, name
+                        processor, cache, pan115, dir_id, fid, name, record
                     )
-                except Exception:  # 失败不标记，下轮重试
+                except Exception:  # 失败保留 pending 记录，下轮复用码重试
                     report.failed += 1
                     logger.exception("目录监控处理失败（%s/%s）", path, name)
                 else:
-                    report.shared += 1
+                    if is_retry:
+                        report.retried += 1
+                    else:
+                        report.shared += 1
                     report.items.append({"dir": path, "name": name})
                     # 限速：连续推送避免 TG 频道 flood control
                     await asyncio.sleep(2)
 
-        if report.new_items:
+        if report.new_items or report.retried or report.failed:
             logger.info("目录监控完成：%s", report.summary())
         return report
 
     async def _share_and_push(
-        self, processor, cache, pan115, dir_id: int, fid: int, name: str
+        self, processor, cache, pan115,
+        dir_id: int, fid: int, name: str, record: dict | None,
     ) -> None:
-        """单个子目录：建永久分享 → 推卡片 → 标记（异常向上抛，不标记）。"""
-        share_code, receive_code = await pan115.create_share(fid)
+        """单个子目录：建永久分享（或复用 pending 码）→ 推卡片 → 标记 ok。
+
+        两阶段防重复建分享：
+        1. record None → create_share → record_share(pending)【建分享即登记】
+        2. record pending → 复用 share_code/password 重推 → 成功 mark_shared(ok)
+        新分享常处"审核中/快照生成中"（share_snap 预检不过），首次推送易失败
+        ——登记后下轮复用同码重试，不会在账户里堆重复分享。
+        """
+        if record is None:
+            share_code, receive_code = await pan115.create_share(fid)
+            # 建分享成功立即登记：即使推送失败，下轮也复用此码
+            await cache.record_share(
+                dir_id, fid, name, share_code, receive_code or ""
+            )
+            # 新分享预检常在审核/快照中，等一会让 115 就绪再推
+            await asyncio.sleep(5)
+        else:
+            share_code = record["share_code"]
+            receive_code = record["password"] or ""
+            logger.info("目录监控复用分享码重推：%s（%s）", name, share_code)
+
         parsed = ParsedShare("115", share_code, receive_code or None)
         result = await processor.process(parsed)
         if not result.ok:
+            # 推送失败但 is_pushed 命中（此前已推过）→ 视为完成
+            if result.dup:
+                await cache.mark_shared(dir_id, fid)
+                logger.info("目录监控：分享已推送过，直接标记完成：%s", name)
+                return
             raise RuntimeError(result.message)
-        await cache.mark_shared(dir_id, fid, name, share_code)
-        logger.info(
-            "目录监控推送成功：%s（分享码 %s）", name, share_code
-        )
+        await cache.mark_shared(dir_id, fid)
+        logger.info("目录监控推送成功：%s（分享码 %s）", name, share_code)
 
     # ------------------------------------------------------------------ #
     async def start(self) -> None:

@@ -7,20 +7,30 @@ from app.providers.exceptions import Pan115Error
 
 
 class _FakeCache:
+    """两阶段桩：record_share 登记 pending → mark_shared 置 ok。"""
+
     def __init__(self, dirs):
         self.dirs = dirs
-        self.shared: set[tuple[int, int]] = set()
-        self.marked: list[tuple] = []
+        self.records: dict[tuple[int, int], dict] = {}
+        self.recorded: list[tuple] = []
 
     async def list_share_dirs(self):
         return self.dirs
 
-    async def is_shared(self, dir_id, file_id):
-        return (dir_id, file_id) in self.shared
+    async def get_shared_item(self, dir_id, file_id):
+        return self.records.get((dir_id, file_id))
 
-    async def mark_shared(self, dir_id, file_id, name, share_code):
-        self.shared.add((dir_id, file_id))
-        self.marked.append((dir_id, file_id, name, share_code))
+    async def record_share(self, dir_id, file_id, name, share_code, password=""):
+        self.records[(dir_id, file_id)] = {
+            "file_id": file_id, "dir_id": dir_id, "name": name,
+            "share_code": share_code, "password": password, "status": "pending",
+        }
+        self.recorded.append((dir_id, file_id, share_code, password))
+
+    async def mark_shared(self, dir_id, file_id):
+        rec = self.records.get((dir_id, file_id))
+        if rec:
+            rec["status"] = "ok"
 
 
 class _FakePan115:
@@ -68,14 +78,26 @@ def _dir(idx, path, cid):
     return {"id": idx, "path": path, "cid": cid, "shared": 0}
 
 
-def test_run_once_shares_and_pushes_new_dirs():
-    """新子目录 → 建分享 → 推卡片 → 标记；已分享的跳过。"""
+def _fast(monkeypatch):
+    """吞掉限速/就绪等待，测试秒过。"""
+    async def _no_sleep(sec):
+        return None
+    monkeypatch.setattr("app.core.share_watcher.asyncio.sleep", _no_sleep)
+
+
+def test_run_once_shares_and_pushes_new_dirs(monkeypatch):
+    """新子目录 → 建分享 → 推卡片 → 标记 ok；已分享（ok）的跳过。"""
+    _fast(monkeypatch)
     cache = _FakeCache([_dir(1, "/媒体", 100)])
     pan115 = _FakePan115({100: [
         {"fid": 11, "name": "剧A", "is_dir": True, "size": 0},
         {"fid": 12, "name": "剧B", "is_dir": True, "size": 0},
     ]})
-    cache.shared.add((1, 12))  # 剧B 已分享过
+    # 剧B 已推送（ok 状态）
+    cache.records[(1, 12)] = {
+        "file_id": 12, "dir_id": 1, "name": "剧B",
+        "share_code": "old12", "password": "", "status": "ok",
+    }
     proc = _FakeProcessor()
     watcher = ShareWatcher(_FakeContainer(pan115, cache, proc), _FakeSettings())
 
@@ -90,11 +112,13 @@ def test_run_once_shares_and_pushes_new_dirs():
     assert len(proc.process_calls) == 1
     p = proc.process_calls[0]
     assert p.provider == "115" and p.code == "code11" and p.password == "pwd11"
-    # 标记成功（下轮跳过）
-    assert cache.marked == [(1, 11, "剧A", "code11")]
+    # 两阶段：登记 pending（含码/密码）→ 推送成功置 ok
+    assert cache.recorded == [(1, 11, "code11", "pwd11")]
+    assert cache.records[(1, 11)]["status"] == "ok"
 
 
-def test_run_once_share_failure_not_marked():
+def test_run_once_share_failure_not_marked(monkeypatch):
+    _fast(monkeypatch)
     """建分享失败（fid=999 模拟风控）→ 不标记 → 下轮重扫重试。"""
     cache = _FakeCache([_dir(1, "/媒体", 100)])
     pan115 = _FakePan115({100: [
@@ -107,11 +131,12 @@ def test_run_once_share_failure_not_marked():
 
     assert report.failed == 1
     assert report.shared == 0
-    assert cache.marked == []  # 未标记
+    assert cache.recorded == []  # 建分享失败：无登记
     assert proc.process_calls == []  # 未推送
 
 
-def test_run_once_push_failure_not_marked():
+def test_run_once_push_failure_not_marked(monkeypatch):
+    _fast(monkeypatch)
     """推送失败（process 返回 ok=False）→ 不标记 → 下轮重试。"""
     cache = _FakeCache([_dir(1, "/媒体", 100)])
     pan115 = _FakePan115({100: [
@@ -124,7 +149,9 @@ def test_run_once_push_failure_not_marked():
 
     assert report.failed == 1
     assert pan115.share_calls == [21]  # 分享已建
-    assert cache.marked == []  # 但未标记（下轮会重复建——接受，宁重不漏）
+    # 关键：已登记 pending（码留存），下轮复用此码重推，绝不再建新分享
+    assert cache.recorded == [(1, 21, "code21", "pwd21")]
+    assert cache.records[(1, 21)]["status"] == "pending"
     assert report.shared == 0
 
 
@@ -169,7 +196,7 @@ def test_run_once_list_dir_error_counts_failed(monkeypatch):
 
 
 def test_share_rate_limit_sleep_between_pushes(monkeypatch):
-    """连续推送间隔 2s（flood control 限速）。"""
+    """新分享就绪等待 5s + 连续推送限速 2s。"""
     sleeps: list = []
 
     async def fake_sleep(sec):
@@ -185,7 +212,8 @@ def test_share_rate_limit_sleep_between_pushes(monkeypatch):
     watcher = ShareWatcher(_FakeContainer(pan115, cache, proc), _FakeSettings())
 
     asyncio.run(watcher.run_once())
-    assert sleeps == [2.0, 2.0]  # 每次成功推送后
+    # 每个新分享：5s 就绪等待 + 推送成功后 2s 限速
+    assert sleeps == [5.0, 2.0, 5.0, 2.0]
 
 
 def test_start_stop_task_lifecycle():

@@ -96,9 +96,20 @@ def test_share_dirs_lifecycle(tmp_path):
         media_id = by_path["/媒体"]["id"]
         movie_id = by_path["/电影"]["id"]
 
-        await cache.mark_shared(media_id, 11, "剧A", "swA1")
-        await cache.mark_shared(media_id, 12, "剧B", "swB1")
-        await cache.mark_shared(movie_id, 21, "影C", "swC1")
+        # 两阶段：record_share(pending) → mark_shared(ok)
+        await cache.record_share(media_id, 11, "剧A", "swA1", "pw1")
+        await cache.record_share(media_id, 12, "剧B", "swB1")
+        await cache.record_share(movie_id, 21, "影C", "swC1")
+
+        # pending 阶段可查（含码/密码），计入 shared
+        rec = await cache.get_shared_item(media_id, 11)
+        assert rec["status"] == "pending"
+        assert rec["share_code"] == "swA1" and rec["password"] == "pw1"
+        assert await cache.get_shared_item(media_id, 99) is None
+
+        await cache.mark_shared(media_id, 11)  # → ok
+        rec = await cache.get_shared_item(media_id, 11)
+        assert rec["status"] == "ok"
 
         dirs = await cache.list_share_dirs()
         by_path = {d["path"]: d for d in dirs}
@@ -106,14 +117,10 @@ def test_share_dirs_lifecycle(tmp_path):
         assert by_path["/媒体"]["shared"] == 2
         assert by_path["/电影"]["shared"] == 1
 
-        # is_shared 判定
-        assert await cache.is_shared(media_id, 11) is True
-        assert await cache.is_shared(media_id, 99) is False
-
         # del：连同 shared_items
         removed = await cache.remove_share_dir("/媒体")
         assert removed == 1
-        assert await cache.is_shared(media_id, 11) is False  # 记录已删
+        assert await cache.get_shared_item(media_id, 11) is None  # 记录已删
         assert await cache.remove_share_dir("/不存在") == 0
         await cache.close()
 

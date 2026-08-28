@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS shared_items (
     dir_id      INTEGER NOT NULL,       -- 所属监控目录 id
     name        TEXT NOT NULL,
     share_code  TEXT NOT NULL,
+    password    TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'ok',  -- pending=已建分享未推成 / ok=已推送
     pushed_at   REAL NOT NULL,
     PRIMARY KEY (file_id, dir_id)
 );
@@ -65,6 +67,12 @@ _PUSHED_MIGRATE = [
     ("last_checked_at", "REAL"),
 ]
 
+# shared_items 补列（建分享登记与推送成功两阶段）
+_SHARED_MIGRATE = [
+    ("password", "TEXT NOT NULL DEFAULT ''"),
+    ("status", "TEXT NOT NULL DEFAULT 'ok'"),
+]
+
 
 class Cache:
     def __init__(self, db_path: str = "./data/cache.db") -> None:
@@ -79,18 +87,26 @@ class Cache:
         self._db = await aiosqlite.connect(self.db_path)
         await self._db.executescript(_SCHEMA)
         await self._migrate_pushed_shares()
+        await self._migrate_shared_items()
         await self._db.commit()
 
     async def _migrate_pushed_shares(self) -> None:
         """旧库 pushed_shares 补列（幂等）：PRAGMA 检查缺失列后 ALTER ADD。"""
-        cursor = await self._db.execute("PRAGMA table_info(pushed_shares)")
+        await self._migrate_table("pushed_shares", _PUSHED_MIGRATE)
+
+    async def _migrate_shared_items(self) -> None:
+        """旧库 shared_items 补列（password/status）。"""
+        await self._migrate_table("shared_items", _SHARED_MIGRATE)
+
+    async def _migrate_table(self, table: str, cols_ddl: list) -> None:
+        cursor = await self._db.execute(f"PRAGMA table_info({table})")
         cols = {row[1] for row in await cursor.fetchall()}
-        for col, ddl in _PUSHED_MIGRATE:
+        for col, ddl in cols_ddl:
             if col not in cols:
                 await self._db.execute(
-                    f"ALTER TABLE pushed_shares ADD COLUMN {col} {ddl}"
+                    f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"
                 )
-                logger.info("迁移 pushed_shares：新增列 %s", col)
+                logger.info("迁移 %s：新增列 %s", table, col)
 
     async def _ensure(self) -> aiosqlite.Connection:
         if self._db is None:
@@ -270,19 +286,34 @@ class Cache:
         keys = ("id", "path", "cid", "shared")
         return [dict(zip(keys, r)) for r in rows]
 
-    async def is_shared(self, dir_id: int, file_id: int) -> bool:
+    async def get_shared_item(self, dir_id: int, file_id: int) -> dict | None:
+        """查子目录的分享记录（含 pending）：有记录即不再新建分享。"""
         row = await self._fetchone(
-            "SELECT 1 FROM shared_items WHERE dir_id=? AND file_id=?",
+            "SELECT file_id, dir_id, name, share_code, password, status "
+            "FROM shared_items WHERE dir_id=? AND file_id=?",
             (dir_id, file_id),
         )
-        return row is not None
+        if not row:
+            return None
+        keys = ("file_id", "dir_id", "name", "share_code", "password", "status")
+        return dict(zip(keys, row))
 
-    async def mark_shared(
-        self, dir_id: int, file_id: int, name: str, share_code: str
+    async def record_share(
+        self, dir_id: int, file_id: int, name: str, share_code: str,
+        password: str = "",
     ) -> None:
-        """记录已建分享推送（失败不标记 → 下轮重扫自动重试）。"""
+        """阶段一：建分享成功即登记（status='pending'）——重试复用此码，不再新建。"""
         await self._execute(
             "INSERT OR REPLACE INTO shared_items "
-            "(file_id, dir_id, name, share_code, pushed_at) VALUES (?,?,?,?,?)",
-            (file_id, dir_id, name, share_code, time.time()),
+            "(file_id, dir_id, name, share_code, password, status, pushed_at) "
+            "VALUES (?,?,?,?,?, 'pending', ?)",
+            (file_id, dir_id, name, share_code, password, time.time()),
+        )
+
+    async def mark_shared(self, dir_id: int, file_id: int) -> None:
+        """阶段二：推送成功置 status='ok'（分享码/密码沿用登记值）。"""
+        await self._execute(
+            "UPDATE shared_items SET status='ok', pushed_at=? "
+            "WHERE dir_id=? AND file_id=?",
+            (time.time(), dir_id, file_id),
         )
