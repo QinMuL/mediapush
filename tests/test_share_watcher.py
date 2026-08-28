@@ -135,6 +135,35 @@ def test_run_once_share_failure_not_marked(monkeypatch):
     assert proc.process_calls == []  # 未推送
 
 
+def test_run_once_auditing_counted_not_failed(monkeypatch):
+    """审核中/快照生成中（新分享正常中间态）→ 计 auditing 不计 failed，INFO 不打堆栈。"""
+    _fast(monkeypatch)
+    from app.providers.exceptions import Pan115Error
+
+    cache = _FakeCache([_dir(1, "/媒体", 100)])
+    pan115 = _FakePan115({100: [
+        {"fid": 61, "name": "剧H", "is_dir": True},
+    ]})
+
+    class _AuditProcessor(_FakeProcessor):
+        async def process(self, parsed):
+            self.process_calls.append(parsed)
+            raise Pan115Error("分享审核中")
+
+    proc = _AuditProcessor()
+    watcher = ShareWatcher(_FakeContainer(pan115, cache, proc), _FakeSettings())
+
+    report = asyncio.run(watcher.run_once())
+
+    assert report.auditing == 1  # 归类为审核中
+    assert report.failed == 0  # 不算失败
+    assert report.shared == 0
+    # 分享码已登记 pending → 下轮复用码重试（关键）
+    assert cache.recorded == [(1, 61, "code61", "pwd61")]
+    assert cache.records[(1, 61)]["status"] == "pending"
+    assert "审核中" in report.summary()
+
+
 def test_run_once_push_failure_not_marked(monkeypatch):
     _fast(monkeypatch)
     """推送失败（process 返回 ok=False）→ 不标记 → 下轮重试。"""

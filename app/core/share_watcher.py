@@ -22,6 +22,7 @@ import logging
 from dataclasses import dataclass, field
 
 from app.core.link_parser import ParsedShare
+from app.providers.exceptions import Pan115Error
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ class WatchReport:
     new_items: int = 0  # 发现的未分享子目录
     shared: int = 0  # 建分享+推送成功
     retried: int = 0  # 复用已建分享码重推成功（此前 pending）
+    auditing: int = 0  # 115 审核中/快照生成中（新分享正常中间态，非失败）
     failed: int = 0  # 建分享/推送失败（下轮重试，复用已建的码）
     skipped: int = 0  # 已推送（ok）跳过
     items: list[dict] = field(default_factory=list)  # 成功明细
@@ -45,6 +47,8 @@ class WatchReport:
         )
         if self.retried:
             s += f"（含复用重试 {self.retried}）"
+        if self.auditing:
+            s += f" · ⏳ 115 审核中 {self.auditing}（下轮复用码重试）"
         if self.failed:
             s += f" · ⚠️ 失败 {self.failed}（下轮复用分享码重试）"
         if self.skipped:
@@ -108,6 +112,21 @@ class ShareWatcher:
                     await self._share_and_push(
                         processor, cache, pan115, dir_id, fid, name, record
                     )
+                except Pan115Error as exc:
+                    # 审核中/快照生成中：新分享的正常中间态，非失败
+                    # （分享码已登记 pending，下轮复用码重试即可）
+                    msg = str(exc)
+                    if "审核中" in msg or "快照" in msg:
+                        report.auditing += 1
+                        logger.info(
+                            "目录监控：115 审核中（%s/%s），分享码已登记，下轮重试",
+                            path, name,
+                        )
+                    else:
+                        report.failed += 1
+                        logger.warning(
+                            "目录监控处理失败（%s/%s）：%s", path, name, exc
+                        )
                 except Exception:  # 失败保留 pending 记录，下轮复用码重试
                     report.failed += 1
                     logger.exception("目录监控处理失败（%s/%s）", path, name)
@@ -120,7 +139,7 @@ class ShareWatcher:
                     # 限速：连续推送避免 TG 频道 flood control
                     await asyncio.sleep(2)
 
-        if report.new_items or report.retried or report.failed:
+        if report.new_items or report.retried or report.auditing or report.failed:
             logger.info("目录监控完成：%s", report.summary())
         return report
 
