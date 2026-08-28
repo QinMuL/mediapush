@@ -335,7 +335,10 @@ class Pan115Provider(BaseShareProvider):
         """列自己网盘目录的**子目录**（fs_files + nf=1 仅目录，自动翻页）。
 
         返回 [{fid, name, size}]（均为目录），需登录 cookie。
-        webapi 响应目录条目无 fid（id 在 cid 键）——p115client overview_attr 同款判定。
+        响应两种格式（实测 webapi）：
+        - 老格式：data 为列表，count 在顶层
+        - 新格式：data 为 {"list": [...], "count": N}
+        目录条目无 "fid" 键（目录 id 在 "cid"）——p115client overview_attr 同款判定。
         """
         from p115client.client import check_response
 
@@ -356,8 +359,15 @@ class Pan115Provider(BaseShareProvider):
                 check_response(resp)
             except Exception as exc:
                 raise Pan115Error(f"列目录失败：{exc}", code=str(cid)) from exc
-            data = resp.get("data") or {}
-            batch = data.get("list") or []
+            data = resp.get("data")
+            if isinstance(data, dict):
+                batch = data.get("list") or []
+                count = int(data.get("count") or 0)
+            elif isinstance(data, list):
+                batch = data
+                count = int(resp.get("count") or 0)
+            else:
+                batch, count = [], 0
             for it in batch:
                 # webapi 格式：目录无 "fid" 键，目录 id 在 "cid"；文件 id 在 "fid"
                 is_dir = "fid" not in it
@@ -368,7 +378,6 @@ class Pan115Provider(BaseShareProvider):
                     "is_dir": is_dir,
                     "size": int(it.get("s") or it.get("file_size") or 0),
                 })
-            count = int(data.get("count") or 0)
             # 按实际拉取条数递增（limit=1000 时 offset+=limit 会一页跳过 count）
             offset += len(batch)
             if offset >= count or not batch:

@@ -408,14 +408,15 @@ def _login_p(monkeypatch, fake_client):
 
 def test_list_dir_only_dirs_with_pagination(monkeypatch):
     """list_dir：nf=1 仅目录；目录 id 取 cid 键（无 fid）；自动翻页。"""
+    # 实测 webapi 老格式：data 为列表，count 在顶层
     client = _FakeLoginClient(pages=[
-        {"state": True, "data": {"count": 3, "list": [
+        {"state": True, "data": [
             {"cid": 11, "pid": 0, "n": "剧A"},
             {"cid": 12, "pid": 0, "n": "剧B"},
-        ]}},
-        {"state": True, "data": {"count": 3, "list": [
+        ], "count": 3},
+        {"state": True, "data": [
             {"cid": 13, "pid": 0, "n": "剧C"},
-        ]}},
+        ], "count": 3},
     ])
     p = _login_p(monkeypatch, client)
 
@@ -435,8 +436,8 @@ def test_list_dir_only_dirs_with_pagination(monkeypatch):
 def test_resolve_path_drills_down(monkeypatch):
     """resolve_path：逐级下钻 /媒体/新剧 → cid；大小写不敏感。"""
     client = _FakeLoginClient(pages=[
-        {"state": True, "data": {"count": 1, "list": [{"cid": 50, "pid": 0, "n": "Media"}]}},
-        {"state": True, "data": {"count": 1, "list": [{"cid": 51, "pid": 50, "n": "新剧"}]}},
+        {"state": True, "data": [{"cid": 50, "pid": 0, "n": "Media"}], "count": 1},
+        {"state": True, "data": [{"cid": 51, "pid": 50, "n": "新剧"}], "count": 1},
     ])
     p = _login_p(monkeypatch, client)
 
@@ -449,7 +450,7 @@ def test_resolve_path_drills_down(monkeypatch):
 
 def test_resolve_path_not_found(monkeypatch):
     client = _FakeLoginClient(pages=[
-        {"state": True, "data": {"count": 0, "list": []}},
+        {"state": True, "data": [], "count": 0},
     ])
     p = _login_p(monkeypatch, client)
 
