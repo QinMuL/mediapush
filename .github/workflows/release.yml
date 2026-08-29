@@ -22,6 +22,13 @@ permissions:
   contents: write   # 创建/推送 tag
   packages: write    # 推送镜像到 GHCR
 
+# 串行执行：连续 push main 会触发多个 run，并行时各自 fetch tags 都算出
+# 同一个版本号 → 后推的 tag 被拒（already exists）。排队后，后到的 run
+# 能看到先到的刚推的 tag，正确递增版本
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
