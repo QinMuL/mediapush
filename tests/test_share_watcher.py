@@ -78,6 +78,9 @@ class _FakeContainer:
         self.cache = cache
         self.processor = processor
 
+    def refresh_cookie_file(self) -> bool:  # _loop 每轮调用（统一热更新入口）
+        return False
+
 
 class _FakeSettings:
     share_watch_interval_minutes = 10.0

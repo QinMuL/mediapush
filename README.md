@@ -71,6 +71,7 @@ cp .env.example .env
 | `PAN115_COOKIE` | 115 cookie（**可选**，留空走匿名读取） |
 | `PAN115_COOKIE_FILE` | 115 cookie 文件路径（可选，热加载 + 失效告警；`PAN115_COOKIE` 优先） |
 | `PAN115_USE_PROXY` | 115 是否走代理，默认 `false` |
+| `PAN115_REQUEST_INTERVAL` | 115 请求稳态间隔（秒），默认 `1`（margin 限速时自动翻倍降速，恢复后自动回落） |
 | `PROXY_URL` | TG/TMDB 代理地址 |
 | `INSPECT_ENABLED` | 是否启用分享失效巡检，默认 `true` |
 | `INSPECT_INTERVAL_HOURS` | 巡检间隔（小时），默认 `6` |
@@ -202,6 +203,8 @@ docker inspect mediapush --format '{{.State.Health.Status}}'
 | `/inspect [数量]` | 手动巡检一轮已推送分享（失效撤卡，默认 50 条，详见下节） |
 | `/refresh <tmdb_id>` | 清除该 TMDB 缓存，下次重新拉取（剧集更新集数时用） |
 | `/loglevel <级别>` | 运行时调整控制台日志级别（DEBUG/INFO/WARNING/ERROR），无需重启；文件恒为 DEBUG |
+| `/reload` | 重读 `.env` 热加载配置（间隔/通知开关/限速/cookie 文件），连接层变更会提示需重启 |
+| `/cookie` | 查看状态；`/cookie <串>` 直接在 bot 里更新 115 cookie（写文件 + 热加载 + 实时探活；需已配置 `PAN115_COOKIE_FILE`） |
 | `/status` | 运行状态（时长/推送统计）、配置与健康、后台服务一览 |
 | `/mon` | 频道监控管理（详见下节） |
 | `/help` | 帮助 |

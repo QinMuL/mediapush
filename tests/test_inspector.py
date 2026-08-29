@@ -3,16 +3,8 @@
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
-
 from app.providers.pan115 import ShareStatus
 from app.telegram.inspector import ShareInspector
-
-
-@pytest.fixture(autouse=True)
-def _fast_pacing(monkeypatch):
-    """巡检间隔清零（生产 1s/条），现有用例秒过；限速语义单独测。"""
-    monkeypatch.setattr("app.telegram.inspector._CHECK_PACING", 0.0)
 
 
 class _FakeCache:
@@ -219,21 +211,20 @@ class _CookieSettings(_FakeSettings):
         self.pan115_cookie_file = cookie_file
 
 
-def test_cookie_file_refresh_hot_reload(tmp_path):
-    """cookie 文件内容变化 → update_cookie 热生效；无变化/无文件不动。"""
-    f = tmp_path / "cookie.txt"
-    f.write_text("UID=9;CID=8;", encoding="utf-8")
-    pan115 = _CookiePan115(cookie="UID=1;CID=2;")
-    container = _FakeContainer(pan115, _FakeCache([]), _FakeTelegram(), _CookieSettings(str(f)))
+def test_cookie_file_refresh_delegates_to_container():
+    """巡检器 cookie 热更新已收敛到 Container.refresh_cookie_file 统一入口。"""
+    calls: list = []
+
+    class _Container(_FakeContainer):
+        def refresh_cookie_file(self):
+            calls.append(True)
+            return True
+
+    container = _Container(_CookiePan115(), _FakeCache([]), _FakeTelegram(), _CookieSettings())
     insp = ShareInspector(container, container.settings)
 
     insp._refresh_cookie_file()
-    assert pan115.updated == ["UID=9;CID=8;"]
-    assert pan115.cookie == "UID=9;CID=8;"
-
-    # 再刷：内容未变 → 不重复更新
-    insp._refresh_cookie_file()
-    assert len(pan115.updated) == 1
+    assert calls == [True]
 
 
 def test_cookie_health_alert_once_with_throttle():
@@ -289,26 +280,8 @@ def test_inspect_need_code_counts_alive():
 
 
 # -------------------- 限速与熔断：防 115 IP 限流（405） -------------------- #
-def test_inspect_pacing_between_checks(monkeypatch):
-    """每条检查之间留 1s 间隔（首条免等）——防匿名连发触发 IP 限流。"""
-    sleeps: list = []
-
-    async def fake_sleep(sec):
-        sleeps.append(sec)
-
-    monkeypatch.setattr("app.telegram.inspector.asyncio.sleep", fake_sleep)
-    monkeypatch.setattr("app.telegram.inspector._CHECK_PACING", 1.0)
-    rows = [_row(f"P{i}") for i in range(4)]
-    cache = _FakeCache(rows)
-    pan115 = _FakePan115({f"P{i}": ShareStatus() for i in range(4)})
-    container = _FakeContainer(pan115, cache, _FakeTelegram(), _FakeSettings())
-    insp = ShareInspector(container, container.settings)
-
-    _run(insp.run_once())
-
-    assert sleeps == [1.0, 1.0, 1.0]  # 4 条 = 3 个间隔
-
-
+# 请求节奏已收敛到统一限速器（app/core/rate_limiter.py，见 test_rate_limiter.py）；
+# 巡检层仅保留"连续异常中止本轮"熔断语义。
 def test_inspect_aborts_after_consecutive_errors():
     """连续 5 次查询异常 → 中止本轮，剩余不查（IP 疑似被限，别硬打）。"""
     rows = [_row(f"E{i}") for i in range(10)]

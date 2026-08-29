@@ -12,6 +12,7 @@ from app.telegram.handlers import (
     _BOT_COMMANDS,
     _get_session,
     _set_session,
+    cmd_cookie,
     cmd_edit,
     on_edit_callback,
     on_text,
@@ -46,7 +47,7 @@ def test_bot_commands_structure():
     cmds = [c.command for c in _BOT_COMMANDS]
     assert cmds == [
         "start", "help", "115", "edit", "cancel", "status", "refresh",
-        "loglevel", "mon", "inspect", "dir", "share",
+        "loglevel", "reload", "cookie", "mon", "inspect", "dir", "share",
     ]
     for c in _BOT_COMMANDS:
         assert c.description, f"{c.command} 描述为空"
@@ -430,6 +431,116 @@ def test_episode_sort_key_no_episode_and_115_sort_last_stable():
     assert ordered[0] is ed2k_ep  # 有集数排第一
     assert ordered[1] is ed2k_none  # 无集数保持原序
     assert ordered[2] is p115
+
+
+# ---------------------------------------------------------------------- #
+# /cookie：查看状态 / 写文件热更新 / 直配互斥保护
+# ---------------------------------------------------------------------- #
+class _CookiePan115:
+    def __init__(self, cookie="", health=True) -> None:
+        self.cookie = cookie
+        self.uid = 309130782
+        self._health = health
+
+    def update_cookie(self, cookie):
+        self.cookie = cookie
+
+    async def check_health(self):
+        return self._health
+
+
+class _CookieContainer:
+    def __init__(self, pan115, *, env_cookie="", cookie_file=""):
+        self.pan115 = pan115
+        self.refreshed: list = []
+        self.settings = MagicMock()
+        self.settings.pan115_cookie = env_cookie
+        self.settings.pan115_cookie_file = cookie_file
+
+    def refresh_cookie_file(self):
+        self.refreshed.append(True)
+        # 模拟 Container 行为：文件内容变化 → provider 热更新
+        if self.settings.pan115_cookie_file:
+            from pathlib import Path
+
+            try:
+                new = Path(self.settings.pan115_cookie_file).read_text(
+                    encoding="utf-8"
+                ).strip()
+            except OSError:
+                return False
+            if new and new != self.pan115.cookie:
+                self.pan115.update_cookie(new)
+                return True
+        return False
+
+
+def test_cmd_cookie_status_view():
+    """无参数：显示来源/长度/UID，不回显 cookie 原文。"""
+    pan = _CookiePan115(cookie="UID=1;CID=2;")
+    container = _CookieContainer(pan, cookie_file="./data/ck.txt")
+    ctx = _make_context(container)
+    msg = _make_message("/cookie")
+    update = _make_update(message=msg)
+
+    asyncio.run(cmd_cookie(update, ctx))
+
+    text = msg.reply_text.await_args.args[0]
+    assert "UID=1" not in text  # 不回显原文
+    assert "309130782" in text
+    assert "data/ck.txt" in text
+
+
+def test_cmd_cookie_set_writes_file_and_probes(tmp_path):
+    """带参数：写入 cookie 文件 → 热更新 provider → 探活反馈。"""
+    f = tmp_path / "ck.txt"
+    f.write_text("UID=old;", encoding="utf-8")
+    pan = _CookiePan115(cookie="UID=old;", health=True)
+    container = _CookieContainer(pan, cookie_file=str(f))
+    ctx = _make_context(container)
+    ctx.args = ["UID=9;CID=8;"]
+    msg = _make_message("/cookie UID=9;CID=8;")
+    update = _make_update(message=msg)
+
+    asyncio.run(cmd_cookie(update, ctx))
+
+    assert f.read_text(encoding="utf-8") == "UID=9;CID=8;"  # 持久化
+    assert pan.cookie == "UID=9;CID=8;"  # provider 热更新
+    assert container.refreshed == [True]
+    # 探活结果经 edit_text 反馈
+    edited = msg.reply_text.return_value.edit_text.await_args.args[0]
+    assert "探活通过" in edited
+
+
+def test_cmd_cookie_env_direct_blocks_setting():
+    """PAN115_COOKIE 直配非空：拒绝 bot 内设置（重启会回到旧值，防不一致）。"""
+    pan = _CookiePan115(cookie="UID=old;")
+    container = _CookieContainer(pan, env_cookie="UID=old;", cookie_file="./x.txt")
+    ctx = _make_context(container)
+    ctx.args = ["UID=9;"]
+    msg = _make_message("/cookie UID=9;")
+    update = _make_update(message=msg)
+
+    asyncio.run(cmd_cookie(update, ctx))
+
+    text = msg.reply_text.await_args.args[0]
+    assert "直配" in text
+    assert pan.cookie == "UID=old;"  # 未变更
+
+
+def test_cmd_cookie_no_file_configured():
+    """未配置 PAN115_COOKIE_FILE：提示先配置再 /reload。"""
+    pan = _CookiePan115()
+    container = _CookieContainer(pan)
+    ctx = _make_context(container)
+    ctx.args = ["UID=9;"]
+    msg = _make_message("/cookie UID=9;")
+    update = _make_update(message=msg)
+
+    asyncio.run(cmd_cookie(update, ctx))
+
+    text = msg.reply_text.await_args.args[0]
+    assert "PAN115_COOKIE_FILE" in text
 
 
 # -------------------- A4 处理中 60s 去重 -------------------- #
