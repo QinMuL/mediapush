@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
+from app.logging_config import make_trace_id, trace_id
 from app.monitor.store import (
     KEY_BATCH,
     KEY_TARGET,
@@ -116,6 +117,76 @@ class MonitorService:
         self._seen_mem: set[str] = set()  # 进程内去重（关补扫/实时并发窗口的竞态）
         self._push_lock = asyncio.Lock()
         self._login: _LoginFlow | None = None  # 进行中的登录会话
+        self._notifier = None  # AdminNotifier（懒建：bot 就绪后）
+        self._watchdog: asyncio.Task | None = None  # 断连/重连监测任务
+
+    # ------------------------------------------------------------------ #
+    # admin 私信通知（MONITOR_NOTIFY 开关）
+    # ------------------------------------------------------------------ #
+    def _get_notifier(self):
+        """通知器（懒建，需 container.telegram.bot 就绪）。"""
+        if not self.settings.monitor_notify:
+            return None
+        telegram = getattr(self.container, "telegram", None)
+        if telegram is None or not self.settings.tg_admin_ids:
+            return None
+        if self._notifier is None:
+            from app.telegram.notifier import AdminNotifier
+
+            self._notifier = AdminNotifier(
+                telegram.bot, self.settings.tg_admin_ids, throttle_seconds=1800
+            )
+        return self._notifier
+
+    async def _notify(self, text: str) -> None:
+        """发运行事件通知（开关关闭/无 admin 时静默）。"""
+        from app.telegram.notifier import notify_admins
+
+        telegram = getattr(self.container, "telegram", None)
+        if telegram is None or not self.settings.tg_admin_ids:
+            return
+        if not self.settings.monitor_notify:
+            return
+        await notify_admins(telegram.bot, self.settings.tg_admin_ids, text)
+
+    async def _watchdog_loop(self) -> None:
+        """连接状态监测：断连告警（节流）+ 重连恢复 + 持续断连升级。
+
+        Telethon 自带断线重连，这里只负责把状态变化告诉 admin，
+        避免监控静默失效而无人知晓。
+        """
+        was_connected = True
+        fail_since: float | None = None  # 首次断连时刻
+        while True:
+            await asyncio.sleep(30)
+            if self._client is None:
+                continue
+            connected = self._client.is_connected()
+            if connected and not was_connected:
+                notifier = self._get_notifier()
+                if notifier is not None:
+                    mins = round((time.time() - fail_since) / 60, 1) if fail_since else None
+                    await notifier.resolve(
+                        "monitor_disconnected",
+                        "✅ 频道监控连接已恢复"
+                        + (f"（断连约 {mins} 分钟）" if mins else ""),
+                    )
+                fail_since = None
+            elif not connected and was_connected:
+                fail_since = time.time()
+                await self._notify("⚠️ 频道监控与 Telegram 的连接已断开，正在自动重连…")
+            elif not connected and fail_since is not None:
+                # 持续断连：每 30 分钟升级提醒（notifier 节流 30min 天然覆盖）
+                notifier = self._get_notifier()
+                if notifier is not None:
+                    mins = int((time.time() - fail_since) / 60)
+                    await notifier.alert(
+                        "monitor_disconnected",
+                        f"🔴 频道监控持续断连已 {mins} 分钟，自动重连未见效。\n"
+                        f"可能 session 失效或网络故障：/mon 查看状态，"
+                        f"必要时 /mon login 重新登录。",
+                    )
+            was_connected = connected
 
     # ------------------------------------------------------------------ #
     # 只读状态（/mon 展示用）
@@ -224,12 +295,19 @@ class MonitorService:
         client.add_event_handler(self._on_new_message, events.NewMessage())
         self._client = client
         self.state = STATE_RUNNING
+        # 连接监测（断连/重连通知）
+        if self._watchdog is None or self._watchdog.done():
+            self._watchdog = asyncio.create_task(self._watchdog_loop())
 
     async def _post_login(self) -> None:
         """慢速初始化：清理去重 + 加载频道 + 补扫（可后台执行）。"""
         await self._cleanup_seen()
         await self._load_channels()
-        await self._catchup()
+        caught = await self._catchup()
+        await self._notify(
+            f"✅ 频道监控已就绪：{len(self._monitored)} 个频道"
+            + (f"，补扫停机漏档 {caught} 条链接" if caught else "")
+        )
 
     # ------------------------------------------------------------------ #
     # Bot 内交互式登录（/mon login → 手机号 → 验证码 → 两步密码）
@@ -369,9 +447,9 @@ class MonitorService:
 
     async def login_cancel(self) -> str:
         if self._login is None:
-            return "当前没有进行中的登录"
+            return "ℹ️ 当前没有进行中的登录"
         await self._login_discard("手动取消")
-        return "已取消登录，敏感消息可自行删除"
+        return "✅ 已取消登录，敏感消息可自行删除"
 
     async def _login_done(self) -> tuple[str, str]:
         """登录成功：接管为监控客户端，慢速初始化转后台。"""
@@ -401,6 +479,9 @@ class MonitorService:
 
     async def stop(self) -> None:
         """停止监控：冲刷待推送批次 → 断开客户端。"""
+        if self._watchdog is not None:
+            self._watchdog.cancel()
+            self._watchdog = None
         client = self._client
         if client is None:
             return
@@ -581,27 +662,29 @@ class MonitorService:
         """单链接推送：优先完整卡片（与手动推送一致），TMDB 未匹配回退纯文本。"""
         from app.core.link_parser import ParsedShare
 
-        try:
-            r = await processor.process(
-                ParsedShare("ed2k", item.link), chat_id=target or None
-            )
-            if r.ok:
-                await asyncio.sleep(_PUSH_INTERVAL)  # 限速，防 flood control
-                return True
-            if r.dup:
-                # 已推送过（手动或此前监控）：视为完成，不重推不回退
-                logger.info("监控跳过已推送链接：%s", r.message)
-                return True
-            logger.warning("监控卡片推送未成功（%s）：%s — 回退纯文本", r.message, item.filename)
-        except Exception:
-            logger.exception("监控卡片推送异常：%s", item.filename)
+        parsed = ParsedShare("ed2k", item.link)
+        # 链路 trace：监控推送与手动推送共用 tid 派生规则（ed2k hash 前缀）
+        with trace_id(make_trace_id(parsed)):
+            try:
+                r = await processor.process(parsed, chat_id=target or None)
+                if r.ok:
+                    await asyncio.sleep(_PUSH_INTERVAL)  # 限速，防 flood control
+                    return True
+                if r.dup:
+                    # 已推送过（手动或此前监控）：视为完成，不重推不回退
+                    logger.info("监控跳过已推送链接：%s", r.message)
+                    return True
+                logger.warning("监控卡片推送未成功（%s）：%s — 回退纯文本",
+                               r.message, item.filename)
+            except Exception:
+                logger.exception("监控卡片推送异常：%s", item.filename)
 
-        # 回退：TMDB 未匹配/卡片异常时仍以纯文本中继链接（不丢资源）
-        text = render_batch(source, [item], ts)
-        if await self._push_text(text):
-            return True
-        logger.error("监控回退纯文本推送失败：%s", item.filename)
-        return False
+            # 回退：TMDB 未匹配/卡片异常时仍以纯文本中继链接（不丢资源）
+            text = render_batch(source, [item], ts)
+            if await self._push_text(text):
+                return True
+            logger.error("监控回退纯文本推送失败：%s", item.filename)
+            return False
 
     async def _push_text(self, text: str) -> bool:
         """经 Bot 推送到目标频道：flood 自动等待 + 3 次退避重试 + 全局串行限速。"""
@@ -676,8 +759,12 @@ class MonitorService:
         except Exception as exc:  # noqa: BLE001
             logger.warning("加入频道异常：%s", exc)
 
-    async def _catchup(self) -> None:
-        """补扫停机期间漏掉的消息（每频道 ≤_CATCHUP_LIMIT 条，聚合为一条推送）。"""
+    async def _catchup(self) -> int:
+        """补扫停机期间漏掉的消息（每频道 ≤_CATCHUP_LIMIT 条，聚合为一条推送）。
+
+        返回捕获的链接总数（通知文案用）。
+        """
+        caught = 0
         for ch in await self.store.list_channels():
             if ch.chat_id not in self._monitored:
                 continue  # 不可达频道
@@ -697,12 +784,14 @@ class MonitorService:
                     await self.store.set_last_msg_id(ch.chat_id, max_id)
                 if pend.items:
                     logger.info("补扫 %s：捕获 %d 条新 ed2k", pend.title, len(pend.items))
+                    caught += len(pend.items)
                     self._pending[ch.chat_id] = pend
                     await self._flush(ch.chat_id)
             except ValueError:
                 logger.warning("补扫失败（实体无法解析）：%s", ch.title)
             except Exception:
                 logger.exception("补扫异常：%s", ch.title)
+        return caught
 
     async def _cleanup_seen(self) -> None:
         try:

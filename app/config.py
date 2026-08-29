@@ -76,6 +76,12 @@ class Settings:
     inspect_enabled: bool = True
     inspect_interval_hours: float = 6.0
     inspect_notify: bool = True
+    # 巡检网络异常连续 N 轮 → 私信告警（避免每轮网络抖动都打扰）
+    inspect_error_alert_rounds: int = 2
+    # 巡检发现缺访问码（存活但需补档）时私信提醒（/edit 可重推补档）
+    inspect_notify_code: bool = True
+    # 115 cookie 失效告警私信（随巡检循环，24h 节流）
+    cookie_alert: bool = True
     # 目录监控 → 自动建永久分享（见 app/core/share_watcher.py）
     share_watch_enabled: bool = True
     share_watch_interval_minutes: float = 10.0
@@ -83,6 +89,8 @@ class Settings:
     share_watch_notify: bool = True
     # 推送成功后移入的归档目录（须在监控目录之外；空=不移动仅标记）
     share_archive_dir: str = "/已分享"
+    # 频道监控（Telethon）断连/重连/补扫等运行事件私信 admin
+    monitor_notify: bool = True
 
     @classmethod
     def load(cls) -> Settings:
@@ -131,12 +139,16 @@ class Settings:
             inspect_enabled=_env_bool("INSPECT_ENABLED", True),
             inspect_interval_hours=_env_float("INSPECT_INTERVAL_HOURS", 6.0),
             inspect_notify=_env_bool("INSPECT_NOTIFY", True),
+            inspect_error_alert_rounds=_env_int("INSPECT_ERROR_ALERT_ROUNDS", 2),
+            inspect_notify_code=_env_bool("INSPECT_NOTIFY_CODE", True),
+            cookie_alert=_env_bool("COOKIE_ALERT", True),
             share_watch_enabled=_env_bool("SHARE_WATCH_ENABLED", True),
             share_watch_interval_minutes=_env_float(
                 "SHARE_WATCH_INTERVAL_MINUTES", 10.0
             ),
             share_watch_notify=_env_bool("SHARE_WATCH_NOTIFY", True),
             share_archive_dir=os.getenv("SHARE_ARCHIVE_DIR", "/已分享").strip(),
+            monitor_notify=_env_bool("MONITOR_NOTIFY", True),
         )
         settings._ensure_dirs()
         return settings

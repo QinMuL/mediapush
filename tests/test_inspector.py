@@ -56,6 +56,9 @@ class _FakeSettings:
     def __init__(self):
         self.inspect_interval_hours = 6.0
         self.inspect_notify = True
+        self.inspect_notify_code = True
+        self.inspect_error_alert_rounds = 2
+        self.cookie_alert = True
         self.tg_admin_ids = [123]
 
 

@@ -27,6 +27,7 @@ import logging
 from dataclasses import dataclass, field
 
 from app.core.link_parser import ParsedShare
+from app.logging_config import make_trace_id, trace_id
 from app.providers.exceptions import Pan115Error
 
 logger = logging.getLogger(__name__)
@@ -192,18 +193,20 @@ class ShareWatcher:
             logger.info("目录监控复用分享码重推：%s（%s）", name, share_code)
 
         parsed = ParsedShare("115", share_code, receive_code or None)
-        result = await processor.process(parsed)
-        if not result.ok:
-            # 推送失败但 is_pushed 命中（此前已推过）→ 视为完成
-            if result.dup:
-                await cache.mark_shared(dir_id, fid)
-                logger.info("目录监控：分享已推送过，直接标记完成：%s", name)
-                await self._try_archive(pan115, fid, name)
-                return
-            raise RuntimeError(result.message)
-        await cache.mark_shared(dir_id, fid)
-        logger.info("目录监控推送成功：%s（分享码 %s）", name, share_code)
-        await self._try_archive(pan115, fid, name)
+        # 链路 trace：与手动推送共用 tid 派生规则（分享码前缀），便于交叉排查
+        with trace_id(make_trace_id(parsed)):
+            result = await processor.process(parsed)
+            if not result.ok:
+                # 推送失败但 is_pushed 命中（此前已推过）→ 视为完成
+                if result.dup:
+                    await cache.mark_shared(dir_id, fid)
+                    logger.info("目录监控：分享已推送过，直接标记完成：%s", name)
+                    await self._try_archive(pan115, fid, name)
+                    return
+                raise RuntimeError(result.message)
+            await cache.mark_shared(dir_id, fid)
+            logger.info("目录监控推送成功：%s（分享码 %s）", name, share_code)
+            await self._try_archive(pan115, fid, name)
 
     # ------------------------------------------------------------------ #
     # 归档：推送成功后移入全局归档目录（SHARE_ARCHIVE_DIR，空=不启用）
@@ -261,6 +264,8 @@ class ShareWatcher:
     # ------------------------------------------------------------------ #
     async def notify_admin(self, report: WatchReport) -> None:
         """任务详情通知 admin：推送成功 + 失败明细（巡检器 notify_admin 同模式）。"""
+        from app.telegram.notifier import notify_admins
+
         telegram = getattr(self.container, "telegram", None)
         admins = getattr(self.settings, "tg_admin_ids", []) or []
         if telegram is None or not admins:
@@ -279,15 +284,7 @@ class ShareWatcher:
             lines.append(f"⚠️ {it['name']}（{it['dir']}）：{reason}")
         if len(report.failed_items) > 10:
             lines.append(f"… 共 {len(report.failed_items)} 个失败")
-        text = "\n".join(lines)
-        if len(text) > 3800:  # TG 上限 4096，留余量
-            text = text[:3800] + "\n…（明细过长已截断）"
-        bot = telegram.bot
-        for uid in admins:
-            try:
-                await bot.send_message(chat_id=uid, text=text)
-            except Exception as exc:  # noqa: BLE001 - 通知失败不影响监控主链路
-                logger.warning("目录监控通知 admin %s 失败：%s", uid, exc)
+        await notify_admins(telegram.bot, admins, "\n".join(lines))
 
     async def _loop(self) -> None:
         # 启动先歇 1 分钟（等 bot/巡检/监控全部就绪，避开启动高峰）

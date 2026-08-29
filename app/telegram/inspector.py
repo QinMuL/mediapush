@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from app.telegram.notifier import AdminNotifier, notify_admins
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,21 @@ class ShareInspector:
         self.settings = settings
         self.interval = max(0.5, settings.inspect_interval_hours)
         self._task: asyncio.Task | None = None
-        self._last_cookie_alert = float("-inf")  # 上次 cookie 告警时刻（24h 节流；-inf 保证首次必告警）
+        # 巡检异常轮计数（连续 N 轮异常 → 告警，恢复正常清零）
+        self._error_rounds = 0
+        # 延迟初始化（bot 启动后才有实例）：首次使用时从 container 取
+        self._notifier: AdminNotifier | None = None
+
+    def _get_notifier(self) -> AdminNotifier | None:
+        """告警通知器（cookie 告警 24h 节流 + 巡检异常告警）。"""
+        telegram = self.container.telegram
+        if telegram is None or not self.settings.tg_admin_ids:
+            return None
+        if self._notifier is None:
+            self._notifier = AdminNotifier(
+                telegram.bot, self.settings.tg_admin_ids, throttle_seconds=86400
+            )
+        return self._notifier
 
     # ------------------------------------------------------------------ #
     # Cookie 文件热更新 + 失效告警（借 P115-Share _check_cookie_freshness）
@@ -83,32 +98,31 @@ class ShareInspector:
             logger.info("cookie 文件已更新，热加载生效")
 
     async def _check_cookie_health(self) -> None:
-        """cookie 健康检查：失效 → admin 告警（24h 节流）。匿名（无 cookie）跳过。"""
+        """cookie 健康检查：失效 → admin 告警（COOKIE_ALERT 开关 + 24h 节流）。匿名跳过。"""
         pan115 = self.container.pan115
-        telegram = self.container.telegram
-        if pan115 is None or not pan115.cookie or telegram is None:
+        if pan115 is None or not pan115.cookie:
             return
         try:
             ok = await pan115.check_health()
         except Exception:  # noqa: BLE001
             ok = False
+        notifier = self._get_notifier() if self.settings.cookie_alert else None
         if ok is not False:  # None=匿名可用；True=健康
+            if notifier is not None:
+                await notifier.resolve(
+                    "cookie", "✅ 115 Cookie 已恢复有效（自动检测）"
+                )
             return
         logger.warning("115 cookie 已失效（仅影响健康检查与转存，匿名读取不受影响）")
-        now = time.monotonic()
-        if now - self._last_cookie_alert < 86400:
+        if notifier is None:
             return
-        self._last_cookie_alert = now
-        text = (
-            "⚠️ 115 Cookie 已失效（已 24h 告警节流）。\n"
+        await notifier.alert(
+            "cookie",
+            "⚠️ 115 Cookie 已失效（24h 告警节流）。\n"
             "仅影响 /status 健康检查；匿名读取分享不受影响。\n"
-            "更新方式：改 PAN115_COOKIE_FILE 文件内容（自动热加载）或 PAN115_COOKIE 环境变量后重启。"
+            "更新方式：改 PAN115_COOKIE_FILE 文件内容（自动热加载）"
+            "或 PAN115_COOKIE 环境变量后重启。",
         )
-        for uid in self.settings.tg_admin_ids:
-            try:
-                await telegram.bot.send_message(chat_id=uid, text=text)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("cookie 告警发送失败（admin=%s）：%s", uid, exc)
 
     # ------------------------------------------------------------------ #
     async def run_once(self, limit: int = 50) -> InspectReport:
@@ -206,13 +220,26 @@ class ShareInspector:
             lines.append(f"• {t}（{it['reason']}）")
         if len(report.dead_items) > 20:
             lines.append(f"… 共 {len(report.dead_items)} 条")
-        text = "\n".join(lines)
-        bot = telegram.bot
-        for uid in self.settings.tg_admin_ids:
-            try:
-                await bot.send_message(chat_id=uid, text=text)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("巡检通知 admin %s 失败：%s", uid, exc)
+        await notify_admins(telegram.bot, self.settings.tg_admin_ids, "\n".join(lines))
+
+    async def _notify_code_items(self, report: InspectReport) -> None:
+        """缺访问码明细通知（INSPECT_NOTIFY_CODE 开关；提醒 /edit 重推补档）。"""
+        telegram = self.container.telegram
+        if (
+            telegram is None
+            or not report.code_items
+            or not self.settings.tg_admin_ids
+            or not self.settings.inspect_notify_code
+        ):
+            return
+        lines = [f"🔑 巡检发现 {len(report.code_items)} 条分享缺/失访问码（卡片旧码已不可用）："]
+        for it in report.code_items[:10]:
+            t = it["title"] or it["share_code"]
+            lines.append(f"• {t}（{it['reason']}）")
+        if len(report.code_items) > 10:
+            lines.append(f"… 共 {len(report.code_items)} 条")
+        lines.append("补档方式：/edit <该分享链接> [新访问码] 重推即可刷新卡片。")
+        await notify_admins(telegram.bot, self.settings.tg_admin_ids, "\n".join(lines))
 
     # ------------------------------------------------------------------ #
     async def start(self) -> None:
@@ -239,6 +266,30 @@ class ShareInspector:
                 report = await self.run_once()
                 if report.dead and self.settings.inspect_notify:
                     await self.notify_admin(report)
+                if report.code_items:
+                    await self._notify_code_items(report)
+                # 巡检异常轮告警：连续 N 轮全异常（疑似 IP 被限/网络故障）才打扰
+                threshold = max(1, self.settings.inspect_error_alert_rounds)
+                if report.errors and report.total and report.errors == report.total:
+                    self._error_rounds += 1
+                    if self._error_rounds >= threshold:
+                        notifier = self._get_notifier()
+                        if notifier is not None:
+                            await notifier.alert(
+                                "inspect_errors",
+                                f"⚠️ 分享巡检已连续 {self._error_rounds} 轮全部失败"
+                                f"（每轮 {report.errors} 条查询异常）。\n"
+                                f"疑似 115 限流本机 IP 或网络故障；将按间隔继续重试。",
+                            )
+                elif self._error_rounds:
+                    rounds = self._error_rounds
+                    self._error_rounds = 0
+                    notifier = self._get_notifier()
+                    if notifier is not None:
+                        await notifier.resolve(
+                            "inspect_errors",
+                            f"✅ 分享巡检已恢复正常（此前连续 {rounds} 轮失败）",
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception:
