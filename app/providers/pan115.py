@@ -99,11 +99,15 @@ class Pan115Provider(BaseShareProvider):
         *,
         use_proxy: bool = False,
         proxy_url: str = "",
+        limiter=None,
     ) -> None:
         # cookie 可选：仅用于健康检查；读取分享走匿名 web，不需要 cookie
         self.cookie = (cookie or "").strip()
         self.use_proxy = use_proxy
         self.proxy_url = proxy_url
+        # 统一限速器（Container 注入）：所有 115 web 请求前 acquire，
+        # margin 限速信号驱动自适应降速/恢复（见 app/core/rate_limiter.py）
+        self.limiter = limiter
         if use_proxy:
             logger.warning("PAN115_USE_PROXY=true 但 p115client 代理未接线，115 仍走直连")
         self._client = None  # type: ignore[assignment]
@@ -174,6 +178,8 @@ class Pan115Provider(BaseShareProvider):
         app_client = self._app_login_client()
 
         for attempt in range(1, self._SNAP_MAX_RETRY + 1):
+            if self.limiter is not None:
+                await self.limiter.acquire()
             if app_client is not None:
                 resp = await app_client.share_snap_app(
                     payload, app="android", async_=True,
@@ -188,6 +194,8 @@ class Pan115Provider(BaseShareProvider):
                     "115 margin 限速：等待 %.0fs 后重试（%d/%d）",
                     wait, attempt, self._SNAP_MAX_RETRY,
                 )
+                if self.limiter is not None:
+                    self.limiter.hit_limit(reason="margin")
                 await asyncio.sleep(wait)
                 continue
             if "正在生成文件快照" in str(resp):
@@ -198,6 +206,8 @@ class Pan115Provider(BaseShareProvider):
                 )
                 await asyncio.sleep(wait)
                 continue
+            if self.limiter is not None:
+                self.limiter.success()
             return resp
         raise Pan115Error("115 限速或快照生成中，多次重试后仍失败", code=code)
 
@@ -288,6 +298,10 @@ class Pan115Provider(BaseShareProvider):
             # 通道选择：有 cookie 用登录态（proapi app 通道，webapi 匿名已 405）；
             # 无 client 匿名 web 读取（app='web' 支持不登录）
             client = self._app_login_client()
+            if self.limiter is not None:
+                # iterdir 内部自动翻页发多个请求，此处整体 acquire 一次
+                # 控制并发读分享的启动节奏（单分享内的翻页由 115 自身分页节奏限制）
+                await self.limiter.acquire()
             ait = share_iterdir_walk(
                 client, code, receive_code,
                 app="android" if client is not None else "web", async_=True,
@@ -302,6 +316,8 @@ class Pan115Provider(BaseShareProvider):
         except KeyError as exc:
             # check_response 对 margin 响应放行 → resp["data"] KeyError（读取途中被限速）
             if str(exc) == "'data'":
+                if self.limiter is not None:
+                    self.limiter.hit_limit(reason="margin")
                 raise Pan115Error("115 限速（margin），读取中断，请稍后重试", code=code) from exc
             raise Pan115Error(f"读取 115 分享失败：{exc!r}", code=code) from exc
         except Exception as exc:
@@ -311,6 +327,8 @@ class Pan115Provider(BaseShareProvider):
             if "not exist" in msg or "不存在" in msg or "失效" in msg or "expired" in msg:
                 raise Pan115Error("分享不存在或已失效", code=code) from exc
             if "margin" in msg:
+                if self.limiter is not None:
+                    self.limiter.hit_limit(reason="margin")
                 raise Pan115Error("115 限速（margin），请稍后重试", code=code) from exc
             raise Pan115Error(f"读取 115 分享失败：{exc}", code=code) from exc
 
@@ -326,6 +344,12 @@ class Pan115Provider(BaseShareProvider):
             is_dir=bool(d.get("is_dir", is_dir)),
             sha1=(str(d["sha1"]) if d.get("sha1") else None),
         )
+
+    # ------------------------------------------------------------------ #
+    @property
+    def uid(self) -> int:
+        """cookie 中的 UID（公开只读；/cookie 状态展示用）。"""
+        return self._uid
 
     # ------------------------------------------------------------------ #
     def update_cookie(self, cookie: str) -> None:
@@ -354,6 +378,8 @@ class Pan115Provider(BaseShareProvider):
         import asyncio as _aio
 
         for attempt in range(1, max_retry + 1):
+            if self.limiter is not None:
+                await self.limiter.acquire()
             resp = await coro_fn()
             if _is_margin_response(resp):
                 wait = min(float(resp.get("margin", 5) or 5), self._MARGIN_WAIT_CAP)
@@ -361,8 +387,12 @@ class Pan115Provider(BaseShareProvider):
                     "115 %s margin 限速：等待 %.0fs 重试（%d/%d）",
                     label, wait, attempt, max_retry,
                 )
+                if self.limiter is not None:
+                    self.limiter.hit_limit(reason="margin")
                 await _aio.sleep(wait)
                 continue
+            if self.limiter is not None:
+                self.limiter.success()
             return resp
         raise Pan115Error(f"115 {label} 限速，多次重试后仍失败")
 

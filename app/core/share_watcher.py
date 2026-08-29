@@ -291,6 +291,8 @@ class ShareWatcher:
         await asyncio.sleep(60)
         while True:
             try:
+                # 每轮重读 cookie 文件：目录监控建分享需登录态，换 cookie 无需重启
+                self.container.refresh_cookie_file()
                 report = await self.run_once()
                 # 静默轮（无成功/失败/审核事件）不打扰；详情推送成功与失败都通知
                 if report.has_events and getattr(

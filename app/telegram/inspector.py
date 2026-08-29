@@ -19,15 +19,13 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from app.telegram.notifier import AdminNotifier, notify_admins
 
 logger = logging.getLogger(__name__)
 
-# 匿名 share_snap 频繁会被 115 封 IP 一段时间（HTTP 405，p115client 文档
-# 明确警告"一旦过于频繁，会封禁 IP 一段时间"）→ 每条检查间留间隔
-_CHECK_PACING = 1.0
+# 匿名 share_snap 过于频繁会被 115 封 IP（405）→ 请求节奏由统一限速器
+# 管控（pan115_limiter，margin 限速时自动降速），此处不再单独 sleep
 # 连续异常 N 次 → 疑似 IP 已被限制，中止本轮（剩余下轮再查，别硬打）
 _ABORT_AFTER_ERRORS = 5
 
@@ -84,18 +82,7 @@ class ShareInspector:
     # ------------------------------------------------------------------ #
     def _refresh_cookie_file(self) -> None:
         """重读 PAN115_COOKIE_FILE：内容变化 → provider.update_cookie 热生效。"""
-        path = self.settings.pan115_cookie_file
-        pan115 = self.container.pan115
-        if not path or not pan115:
-            return
-        try:
-            new_cookie = Path(path).read_text(encoding="utf-8").strip()
-        except OSError as exc:
-            logger.warning("cookie 文件读取失败（%s）：%s", path, exc)
-            return
-        if new_cookie and new_cookie != pan115.cookie:
-            pan115.update_cookie(new_cookie)
-            logger.info("cookie 文件已更新，热加载生效")
+        self.container.refresh_cookie_file()
 
     async def _check_cookie_health(self) -> None:
         """cookie 健康检查：失效 → admin 告警（COOKIE_ALERT 开关 + 24h 节流）。匿名跳过。"""
@@ -143,9 +130,7 @@ class ShareInspector:
         bot = self.container.telegram.bot if self.container.telegram else None
         consecutive_errors = 0
         for idx, row in enumerate(rows):
-            # 间隔限速：防匿名 share_snap 连发触发 115 IP 限流（405）
-            if idx:
-                await asyncio.sleep(_CHECK_PACING)
+            # 请求节奏由统一限速器管控（margin 自适应，见 rate_limiter.py）
             code = row["share_code"]
             title = row["title"] or code
             try:

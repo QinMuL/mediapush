@@ -72,6 +72,8 @@ class Settings:
     monitor_session: str = "./data/monitor.session"
     monitor_db_path: str = "./data/monitor.db"
     monitor_batch_seconds: int = 0
+    # 115 请求稳态间隔（秒，令牌桶自适应的基准；margin 限速时自动翻倍回落）
+    pan115_request_interval: float = 1.0
     # 分享失效巡检（见 app/telegram/inspector.py）
     inspect_enabled: bool = True
     inspect_interval_hours: float = 6.0
@@ -93,12 +95,17 @@ class Settings:
     monitor_notify: bool = True
 
     @classmethod
-    def load(cls) -> Settings:
-        """从环境变量加载；dotenv 仅在本地存在 .env 时生效。"""
+    def load(cls, *, dotenv_override: bool = False) -> Settings:
+        """从环境变量加载；dotenv 仅在本地存在 .env 时生效。
+
+        dotenv_override=True 供 /reload 用：重读 .env 时覆盖进程内已有
+        变量（否则 load_dotenv 默认不覆盖启动时的值，改文件永远不生效）。
+        容器内 env_file 注入的变量不受影响（无 .env 文件时为 no-op）。
+        """
         try:  # 本地开发：读 .env；生产容器由 env_file 注入，无需 dotenv
             from dotenv import load_dotenv
 
-            load_dotenv()
+            load_dotenv(override=dotenv_override)
         except Exception:  # noqa: S110, BLE001 - dotenv 可选，失败静默
             pass
 
@@ -136,6 +143,9 @@ class Settings:
             monitor_db_path=os.getenv("MONITOR_DB_PATH", "./data/monitor.db").strip()
             or "./data/monitor.db",
             monitor_batch_seconds=_env_int("MONITOR_BATCH_SECONDS", 0),
+            pan115_request_interval=max(
+                0.0, _env_float("PAN115_REQUEST_INTERVAL", 1.0)
+            ),
             inspect_enabled=_env_bool("INSPECT_ENABLED", True),
             inspect_interval_hours=_env_float("INSPECT_INTERVAL_HOURS", 6.0),
             inspect_notify=_env_bool("INSPECT_NOTIFY", True),
@@ -178,3 +188,24 @@ class Settings:
 
     def is_admin(self, user_id: int | None) -> bool:
         return bool(user_id) and user_id in self.tg_admin_ids
+
+
+# /reload 可热加载的字段（其余变更需重启容器才生效）：
+# 各类间隔/开关/通知开关/限速参数/cookie。TG token、chat_id、代理、
+# TMDB key/language、服务启停等属于连接层或安全敏感项，不支持热加载。
+HOT_RELOAD_FIELDS: frozenset[str] = frozenset({
+    "log_level",
+    "pan115_request_interval",
+    "pan115_cookie",
+    "pan115_cookie_file",
+    "inspect_interval_hours",
+    "inspect_notify",
+    "inspect_notify_code",
+    "inspect_error_alert_rounds",
+    "cookie_alert",
+    "share_watch_interval_minutes",
+    "share_watch_notify",
+    "share_archive_dir",
+    "monitor_notify",
+    "monitor_batch_seconds",
+})

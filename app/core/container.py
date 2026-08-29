@@ -27,7 +27,31 @@ class Container:
         self.monitor = None
         self.inspector = None
         self.share_watcher = None
+        self.pan115_limiter = None
         self._built = False
+
+    # ------------------------------------------------------------------ #
+    def refresh_cookie_file(self) -> bool:
+        """重读 PAN115_COOKIE_FILE 并热更新 provider cookie。
+
+        供 /reload 立即生效 + 巡检/目录监控周期调用（统一入口）。
+        返回是否有更新（cookie 内容变化才算）。
+        """
+        cookie_file = self.settings.pan115_cookie_file
+        if not cookie_file or self.pan115 is None:
+            return False
+        try:
+            from pathlib import Path
+
+            new_cookie = Path(cookie_file).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            logger.warning("cookie 文件读取失败：%s", exc)
+            return False
+        if not new_cookie or new_cookie == self.pan115.cookie:
+            return False
+        self.pan115.update_cookie(new_cookie)
+        logger.info("115 cookie 已从文件热更新（长度 %d）", len(new_cookie))
+        return True
 
     # ------------------------------------------------------------------ #
     def build(self) -> None:
@@ -40,6 +64,11 @@ class Container:
         self.cache = Cache(self.settings.db_path)
 
         # 115 —— cookie 可选（读取分享走匿名 web；cookie 仅用于健康检查）
+        from app.core.rate_limiter import AdaptiveLimiter
+
+        self.pan115_limiter = AdaptiveLimiter(
+            self.settings.pan115_request_interval, name="pan115"
+        )
         try:
             from app.providers.pan115 import Pan115Provider
 
@@ -47,6 +76,7 @@ class Container:
                 self.settings.pan115_cookie,
                 use_proxy=self.settings.pan115_use_proxy,
                 proxy_url=self.settings.proxy_url,
+                limiter=self.pan115_limiter,
             )
         except Pan115Error as exc:
             logger.error("Pan115 构造失败：%s", exc)
@@ -114,6 +144,64 @@ class Container:
             logger.info("SHARE_WATCH_ENABLED=false，目录监控未启用")
 
         self._built = True
+
+    # ------------------------------------------------------------------ #
+    def reload_config(self, new_settings) -> tuple[list[str], list[str]]:
+        """/reload：应用新配置到运行中的服务，返回 (已热加载, 需重启) 字段名。
+
+        - 热加载项原地更新 self.settings（各服务持同一引用，即刻生效）
+        - 服务 __init__ 缓存的字段（巡检/扫描间隔、限速基准、控制台日志级别）
+          需单独同步
+        - cookie 文件重读立即生效；其余变更仅报告需重启
+        """
+        import dataclasses
+
+        from app.config import HOT_RELOAD_FIELDS
+
+        old = self.settings
+        changed = [
+            f.name
+            for f in dataclasses.fields(new_settings)
+            if getattr(old, f.name) != getattr(new_settings, f.name)
+        ]
+        hot = [n for n in changed if n in HOT_RELOAD_FIELDS]
+        restart = [n for n in changed if n not in HOT_RELOAD_FIELDS]
+
+        # 1) 原地更新热加载字段（服务引用同对象即刻可见）
+        for name in hot:
+            setattr(old, name, getattr(new_settings, name))
+
+        # 2) 同步服务缓存的派生值
+        if "inspect_interval_hours" in hot and self.inspector is not None:
+            self.inspector.interval = max(0.5, old.inspect_interval_hours)
+        if "share_watch_interval_minutes" in hot and self.share_watcher is not None:
+            self.share_watcher.interval = max(1.0, old.share_watch_interval_minutes)
+        if "pan115_request_interval" in hot and self.pan115_limiter is not None:
+            self.pan115_limiter.set_base_interval(old.pan115_request_interval)
+        if "log_level" in hot:
+            from app.logging_config import set_console_level
+
+            set_console_level(old.log_level)
+        # 3) cookie 热更新：
+        #    - PAN115_COOKIE 直配变化 → provider.update_cookie（重建内部 client）
+        #    - PAN115_COOKIE_FILE 文件内容变化 → refresh_cookie_file（统一入口）
+        if (
+            "pan115_cookie" in hot
+            and self.pan115 is not None
+            and new_settings.pan115_cookie
+            and new_settings.pan115_cookie != self.pan115.cookie
+        ):
+            self.pan115.update_cookie(new_settings.pan115_cookie)
+            logger.info(
+                "PAN115_COOKIE 直配已热更新（长度 %d）", len(new_settings.pan115_cookie)
+            )
+        self.refresh_cookie_file()
+
+        if hot:
+            logger.info("配置热加载：%s", ", ".join(hot))
+        if restart:
+            logger.info("配置变更需重启生效：%s", ", ".join(restart))
+        return hot, restart
 
     # ------------------------------------------------------------------ #
     @property
