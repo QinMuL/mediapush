@@ -125,3 +125,37 @@ def test_share_dirs_lifecycle(tmp_path):
         await cache.close()
 
     asyncio.run(run())
+
+
+# -------------------- 运行统计：stats（/status 展示） -------------------- #
+def test_stats_counts(tmp_path):
+    """stats()：按状态区分 pushed/dead，只统计 status='ok' 的 shared_items。"""
+    import asyncio
+
+    from app.db.cache import Cache
+
+    cache = Cache(str(tmp_path / "t.db"))
+
+    async def run():
+        await cache.mark_pushed("abc12345", provider="115")
+        await cache.mark_pushed("def67890", provider="115")
+        await cache.mark_pushed("dead0001", provider="115")
+        await cache.mark_dead("dead0001")
+        await cache.set_tmdb(42, "tv", {"name": "剧"}, ttl_days=1)  # TMDB 缓存 1 条
+
+        await cache.add_share_dir("/媒体", 100)
+        dirs = await cache.list_share_dirs()
+        dir_id = dirs[0]["id"]
+        await cache.record_share(dir_id, 11, "剧A", "swA1")
+        await cache.mark_shared(dir_id, 11)  # ok
+        await cache.record_share(dir_id, 12, "剧B", "swB1")  # 仍 pending
+
+        st = await cache.stats()
+        assert st["pushed"] == 2  # dead0001 已失效不计入
+        assert st["dead"] == 1
+        assert st["tmdb_cache"] == 1
+        assert st["share_dirs"] == 1
+        assert st["shared_items"] == 1  # 只算 ok，pending 不计
+        await cache.close()
+
+    asyncio.run(run())

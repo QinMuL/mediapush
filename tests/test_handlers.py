@@ -46,7 +46,7 @@ def test_bot_commands_structure():
     cmds = [c.command for c in _BOT_COMMANDS]
     assert cmds == [
         "start", "help", "115", "edit", "cancel", "status", "refresh",
-        "mon", "inspect", "dir", "share",
+        "loglevel", "mon", "inspect", "dir", "share",
     ]
     for c in _BOT_COMMANDS:
         assert c.description, f"{c.command} 描述为空"

@@ -317,3 +317,31 @@ class Cache:
             "WHERE dir_id=? AND file_id=?",
             (time.time(), dir_id, file_id),
         )
+
+    # ------------------------------------------------------------------ #
+    # 运行统计（/status 展示）
+    # ------------------------------------------------------------------ #
+    async def stats(self) -> dict:
+        """聚合各表行数：推送/失效/TMDB 缓存/监控目录/已分享子目录。"""
+        async def _count(sql: str) -> int:
+            row = await self._fetchone(sql)
+            return int(row[0]) if row else 0
+
+        pushed = await _count(
+            "SELECT COUNT(*) FROM pushed_shares WHERE status='ok'"
+        )
+        dead = await _count(
+            "SELECT COUNT(*) FROM pushed_shares WHERE status='dead'"
+        )
+        tmdb_cache = await _count("SELECT COUNT(*) FROM tmdb_cache")
+        dirs = await _count("SELECT COUNT(*) FROM share_dirs")
+        shared_items = await _count(
+            "SELECT COUNT(*) FROM shared_items WHERE status='ok'"
+        )
+        return {
+            "pushed": pushed,
+            "dead": dead,
+            "tmdb_cache": tmdb_cache,
+            "share_dirs": dirs,
+            "shared_items": shared_items,
+        }

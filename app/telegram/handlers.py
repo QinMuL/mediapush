@@ -1,6 +1,6 @@
 """Telegram Bot 命令处理。
 
-- /start /help /status /115 <链接> [密码] /refresh <tmdb_id>
+- /start /help /status /115 <链接> [密码] /refresh <tmdb_id> /loglevel <级别>
 - /edit <链接> — 预览编辑模式（追加推荐语/精品标记后推送）/cancel 取消
 - 裸链接消息自动当 /115 处理
 - 仅 TG_ADMIN_IDS 可用
@@ -27,6 +27,7 @@ from telegram.ext import (
 )
 
 from app.core.link_parser import ParsedShare, parse_share, parse_shares
+from app.logging_config import make_trace_id, set_console_level, trace_id
 from app.monitor.store import (
     KEY_BATCH,
     KEY_TARGET,
@@ -49,6 +50,9 @@ except Exception:  # noqa: BLE001
 logger = logging.getLogger(__name__)
 
 _SESSION_KEY = "edit_session"
+
+# 权限拒绝统一文案（所有 admin 命令共用，风格一致）
+_DENY_TEXT = "⛔ 仅管理员可用（在 .env 的 TG_ADMIN_IDS 中配置）"
 
 
 def _container(context: ContextTypes.DEFAULT_TYPE):
@@ -94,61 +98,131 @@ def _edit_keyboard(session: EditSession) -> InlineKeyboardMarkup:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "👋 我是网盘影视资源推送 Bot。\n"
-        "发送一个 115 分享链接（或裸码）或 ed2k 链接，我会读取内容、匹配 TMDB 并推送到频道。\n"
-        "输入 /help 查看用法。"
+        "👋 我是网盘影视资源推送 Bot。\n\n"
+        "🚀 快速上手三步：\n"
+        "1️⃣ 直接发送一个 115 分享链接（或 ed2k 链接）\n"
+        "2️⃣ 我会读取内容、自动匹配 TMDB（海报/评分/演职员）\n"
+        "3️⃣ 推送带海报的卡片到你的频道\n\n"
+        "输入 /help 查看全部用法。"
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "📖 用法：\n"
+        "📖 用法\n\n"
+        "【推送】\n"
         "• 直接发送 115 分享链接，例如：\n"
         "  https://115.com/s/xxxx?password=yyyy\n"
         "• 或发送裸码（8 位以上）\n"
         "• 发送 ed2k 单文件链接，例如：\n"
         "  ed2k://|file|片名.mkv|大小|hash|/\n"
-        "• /115 <链接> [访问码] — 显式触发\n"
-        "• /edit <链接> — 预览编辑模式：追加推荐语/精品标记后推送（精品资源区分）\n"
-        "• /cancel — 取消当前编辑\n"
-        "• /refresh <tmdb_id> — 清除该 TMDB 缓存后重拉\n"
-        "• /status — 查看配置与 115 健康状态\n"
-        "• /mon — 频道监控管理（/mon login 交互式登录，自动捕获 ed2k 推送）\n"
+        "• 链接未带访问码时，正文写「访问码：xxxx」自动提取\n"
+        "• 一条消息含多个链接会自动批量：按集数排序逐个推送，实时进度 + 汇总\n"
+        "• /115 <链接> [访问码] — 显式触发\n\n"
+        "【编辑】\n"
+        "• /edit <链接> — 预览编辑模式：追加推荐语/精品标记后推送（可重推补档）\n"
+        "• /cancel — 取消当前编辑或登录\n\n"
+        "【运维】\n"
+        "• /status — 运行状态、配置与健康一览\n"
+        "• /refresh <tmdb_id> — 清除该 TMDB 缓存后重拉（剧集更新集数时用）\n"
+        "• /loglevel <DEBUG|INFO|WARNING|ERROR> — 运行时调整控制台日志级别\n\n"
+        "【自动化】\n"
+        "• /mon — 频道监控（/mon login 交互式登录，自动捕获 ed2k 推送）\n"
         "• /inspect [数量] — 手动巡检已推送分享，失效撤卡（默认每 6 小时自动跑）\n"
-        "• /dir add <网盘路径> — 目录监控：新子目录自动建永久分享并推送（/share 立即扫描）"
+        "• /dir add <网盘路径> — 目录监控：新子目录自动建永久分享并推送\n"
+        "• /share — 立即扫描一轮监控目录"
     )
+
+
+def _fmt_uptime(seconds: float) -> str:
+    """运行时长人性化（X 秒 / X 分 X 秒 / X 小时 X 分 / X 天 X 小时）。"""
+    s = int(seconds)
+    if s < 60:
+        return f"{s} 秒"
+    m, sec = divmod(s, 60)
+    if m < 60:
+        return f"{m} 分 {sec} 秒"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h} 小时 {m} 分"
+    d, h = divmod(h, 24)
+    return f"{d} 天 {h} 小时"
+
+
+# 进程启动时刻（模块首次导入≈进程启动，供 /status 展示运行时长）
+_STARTED_AT = time.monotonic()
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin(update, context):
+        await update.message.reply_text(_DENY_TEXT)
         return
     container = _container(context)
     s = container.settings
-    lines = [
-        f"TG Bot：{'✅ 已配置' if s.tg_bot_token else '❌ 未配置'}",
-        f"默认频道：{s.tg_chat_id or '❌ 未配置'}",
-        f"网盘频道：{s.tg_chat_id_115 or '⬇️ 同默认'}",
-        f"ed2k 频道：{s.tg_chat_id_ed2k or '⬇️ 同默认'}",
-        f"TMDB Key：{'✅' if s.tmdb_api_key else '❌ 未配置'}",
-        f"115 Cookie：{'✅ 已配置（可选）' if s.pan115_cookie else '未配置（匿名读取，可用）'}",
-        f"代理：{s.proxy_url or '未配置'}",
-    ]
+    lines: list[str] = []
+
+    # 1) 运行信息（动态）
+    lines.append("🤖 运行状态")
+    lines.append(f"• 运行时长：{_fmt_uptime(time.monotonic() - _STARTED_AT)}")
+    try:
+        st = await container.cache.stats()
+        lines.append(
+            f"• 已推送分享：{st['pushed']} · 失效撤卡：{st['dead']}"
+            f" · TMDB 缓存：{st['tmdb_cache']} 条"
+        )
+        if st["share_dirs"]:
+            lines.append(
+                f"• 目录监控：{st['share_dirs']} 个目录 · 已分享 {st['shared_items']} 个子目录"
+            )
+    except Exception:  # noqa: BLE001 - 统计失败不阻断整体展示
+        lines.append("• 运行统计：暂不可用")
+    lines.append("")
+
+    # 2) 配置与健康（静态 + 实时探活）
+    lines.append("🩺 配置与健康")
+    lines.append(f"• TG Bot：{'✅ 已配置' if s.tg_bot_token else '❌ 未配置'}")
+    lines.append(f"• 默认频道：{s.tg_chat_id or '❌ 未配置'}")
+    lines.append(f"• 网盘频道：{s.tg_chat_id_115 or '⬇️ 同默认'}")
+    lines.append(f"• ed2k 频道：{s.tg_chat_id_ed2k or '⬇️ 同默认'}")
+    lines.append(f"• TMDB Key：{'✅' if s.tmdb_api_key else '❌ 未配置'}")
+    lines.append(
+        f"• 115 Cookie：{'✅ 已配置（可选）' if s.pan115_cookie else '未配置（匿名读取，可用）'}"
+    )
+    lines.append(f"• 代理：{s.proxy_url or '未配置'}")
     if container.pan115 is not None:
         try:
             ok = await container.pan115.check_health()
             if ok is None:
-                lines.append("115：✅ 匿名读取可用（cookie 未配置）")
+                lines.append("• 115 健康：✅ 匿名读取可用（cookie 未配置）")
             else:
-                lines.append(f"115 健康：{'✅' if ok else '❌ cookie 失效'}")
+                lines.append(f"• 115 健康：{'✅' if ok else '❌ cookie 失效'}")
         except Exception as exc:  # noqa: BLE001
-            lines.append(f"115：❌ {exc}")
+            lines.append(f"• 115 健康：❌ {exc}")
+    lines.append("")
+
+    # 3) 后台服务（启用 + 间隔 + 运行态）
+    lines.append("⚙️ 后台服务")
+    lines.append(
+        f"• 失效巡检：{'✅' if s.inspect_enabled else '⬜ 未启用'}"
+        + (f"（每 {s.inspect_interval_hours:g} 小时，/inspect 手动触发）"
+           if s.inspect_enabled else "（INSPECT_ENABLED=false）")
+    )
+    lines.append(
+        f"• 目录监控：{'✅' if s.share_watch_enabled else '⬜ 未启用'}"
+        + (f"（每 {s.share_watch_interval_minutes:g} 分钟，/share 手动触发）"
+           if s.share_watch_enabled else "（SHARE_WATCH_ENABLED=false）")
+    )
     monitor = getattr(container, "monitor", None)
     if monitor is None:
-        lines.append("频道监控：未启用（MONITOR_ENABLED=false）")
+        lines.append("• 频道监控：⬜ 未启用（MONITOR_ENABLED=false）")
     elif monitor.login_active:
-        lines.append(f"频道监控：⏳ 登录进行中（{monitor.login_stage_desc or '会话已过期'}）")
+        desc = monitor.login_stage_desc or "会话已过期"
+        lines.append(f"• 频道监控：⏳ 登录进行中（{desc}，/cancel 可中止）")
     else:
-        lines.append(f"频道监控：{await _monitor_state_line(monitor)}")
+        lines.append(f"• 频道监控：{await _monitor_state_line(monitor)}")
+    console_lvl = logging.getLogger().handlers[0].level if logging.getLogger().handlers else "?"
+    lines.append(f"• 控制台日志：{logging.getLevelName(console_lvl)}（/loglevel 调整）")
+
     await update.message.reply_text("\n".join(lines))
 
 
@@ -167,7 +241,7 @@ async def _monitor_state_line(monitor) -> str:
 
 async def cmd_115(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin(update, context):
-        await update.message.reply_text("⛔ 无权限")
+        await update.message.reply_text(_DENY_TEXT)
         return
     text = " ".join(context.args) if context.args else (update.message.text or "")
     parsed = parse_share(text)
@@ -180,7 +254,7 @@ async def cmd_115(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin(update, context):
-        await update.message.reply_text("⛔ 无权限")
+        await update.message.reply_text(_DENY_TEXT)
         return
     if not context.args:
         await update.message.reply_text("用法：/refresh <tmdb_id>")
@@ -192,6 +266,29 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     n = await _container(context).cache.delete_tmdb(tmdb_id)
     await update.message.reply_text(f"🗑 已清除 TMDB 缓存 {tmdb_id}（{n} 条）。下次匹配将重新拉取。")
+
+
+async def cmd_loglevel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/loglevel <级别>：运行时调整控制台日志级别（文件恒为 DEBUG 全量）。
+
+    出问题时无需重启即可切 DEBUG 看细节；只影响 stdout handler。
+    """
+    if not _is_admin(update, context):
+        await update.message.reply_text(_DENY_TEXT)
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "用法：/loglevel <DEBUG|INFO|WARNING|ERROR>（控制台级别；文件恒为 DEBUG）"
+        )
+        return
+    level = context.args[0].upper()
+    if set_console_level(level):
+        logger.info("控制台日志级别已切换为 %s", level)
+        await update.message.reply_text(f"✅ 控制台日志级别：{level}（文件恒为 DEBUG）")
+    else:
+        await update.message.reply_text(
+            "⚠️ 无效级别，可选：DEBUG / INFO / WARNING / ERROR / CRITICAL"
+        )
 
 
 # ---------------------------------------------------------------------- #
@@ -244,7 +341,7 @@ async def _mon_status(container) -> str:
         lines.append(f"• {ch.title}（{ch.chat_id}{uname}）")
     if not channels:
         lines.append("（空，/mon add @频道 添加）")
-    lines.append(f"推送目标：{target or '❌ 未配置'}")
+    lines.append(f"推送目标：{target or '❌ 未配置（/mon target <频道ID> 设置）'}")
     lines.append(f"聚合窗口：{batch} 秒（{'实时逐条' if batch == 0 else '同频道合并推送'}）")
     inc = [r.keyword for r in rules if r.kind == KIND_INCLUDE]
     exc = [r.keyword for r in rules if r.kind == KIND_EXCLUDE]
@@ -255,7 +352,7 @@ async def _mon_status(container) -> str:
 
 async def cmd_mon(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin(update, context):
-        await update.message.reply_text("⛔ 无权限")
+        await update.message.reply_text(_DENY_TEXT)
         return
     container = _container(context)
     monitor, store = container.monitor, container.monitor_store
@@ -487,10 +584,12 @@ async def _process(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed) -
         await update.message.reply_text("⏳ 该链接正在处理中，请稍候（勿在 1 分钟内重复发送）")
         return
     _mark_processing(parsed)
-    try:
-        await _process_locked(update, context, container, parsed)
-    finally:
-        _unmark_processing(parsed)
+    # 链路 trace：prepare/读取/TMDB/推送全程日志带 [tid=xxx]，grep 即拉全链路
+    with trace_id(make_trace_id(parsed)):
+        try:
+            await _process_locked(update, context, container, parsed)
+        finally:
+            _unmark_processing(parsed)
 
 
 async def _process_locked(update: Update, context, container, parsed) -> None:
@@ -610,19 +709,21 @@ async def _process_batch(update: Update, context, shares) -> None:
                 )
                 continue
             _mark_processing(parsed)
-            try:
+            # 链路 trace：批内逐条独立 tid，日志交错也可按条 grep
+            with trace_id(make_trace_id(parsed)):
                 try:
-                    result = await container.processor.process(parsed)
-                except Pan115Error as exc:
-                    lines.append(f"⚠️ {_short_id(parsed)}：{exc}".replace("\n", " "))
-                except Exception as exc:
-                    uid = update.effective_user.id if update.effective_user else None
-                    logger.exception("处理分享失败：user=%s", uid)
-                    lines.append(f"⚠️ {_short_id(parsed)}：{exc}".replace("\n", " "))
-                else:
-                    lines.append(_summarize_line(parsed, result))
-            finally:
-                _unmark_processing(parsed)
+                    try:
+                        result = await container.processor.process(parsed)
+                    except Pan115Error as exc:
+                        lines.append(f"⚠️ {_short_id(parsed)}：{exc}".replace("\n", " "))
+                    except Exception as exc:
+                        uid = update.effective_user.id if update.effective_user else None
+                        logger.exception("处理分享失败：user=%s", uid)
+                        lines.append(f"⚠️ {_short_id(parsed)}：{exc}".replace("\n", " "))
+                    else:
+                        lines.append(_summarize_line(parsed, result))
+                finally:
+                    _unmark_processing(parsed)
             await _edit(
                 placeholder,
                 _build_batch_summary(f"⏳ 处理中 ({done}/{total})", lines),
@@ -651,7 +752,7 @@ async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     去重检查在 prepare；标记已推送在确认推送成功后（取消不标记）。
     """
     if not _is_admin(update, context):
-        await update.message.reply_text("⛔ 无权限")
+        await update.message.reply_text(_DENY_TEXT)
         return
     text = " ".join(context.args) if context.args else (update.message.text or "")
     parsed = parse_share(text)
@@ -713,7 +814,7 @@ async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/cancel：取消当前编辑会话 / 登录会话（不推送、不标记已推送）。"""
     if not _is_admin(update, context):
-        await update.message.reply_text("⛔ 无权限")
+        await update.message.reply_text(_DENY_TEXT)
         return
     monitor = getattr(_container(context), "monitor", None)
     if monitor is not None and monitor.login_active:
@@ -721,11 +822,10 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     session = _get_session(context)
     if session is None:
-        await update.message.reply_text("当前没有进行中的编辑。")
+        await update.message.reply_text("ℹ️ 当前没有进行中的编辑或登录会话。")
         return
     _clear_session(context)
-    await _edit_preview_text(context.bot, session, "已取消编辑，未推送频道。")
-    await update.message.reply_text("已取消编辑。")
+    await _edit_preview_text(context.bot, session, "❌ 已取消编辑，未推送频道。")
 
 
 async def _send_preview(
@@ -842,7 +942,7 @@ async def on_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """
     q = update.callback_query
     if not _is_admin(update, context):
-        await q.answer("⛔ 无权限", show_alert=True)
+        await q.answer("⛔ 仅管理员可用", show_alert=True)
         return
 
     session = _get_session(context)
@@ -874,7 +974,7 @@ async def on_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if data == "cancel_edit":
         _clear_session(context)
-        await _edit_preview_text(bot, session, "已取消编辑，未推送频道。")
+        await _edit_preview_text(bot, session, "❌ 已取消编辑，未推送频道。")
         return
 
     if data == "confirm_push":
@@ -900,32 +1000,34 @@ async def _confirm_push(
         await _edit_preview_text(bot, session, "⚠️ 推送器未就绪")
         return
 
-    try:
-        ok, msg, message_id, push_chat_id = await pusher.push_share(
-            session.details, session.media, parsed.code, parsed.password,
-            session.files, provider=session.provider,
-            quality_extra=session.quality_extra, is_premium=session.is_premium,
-        )
-    except Exception as exc:
-        logger.exception("确认推送失败")
-        await _edit_preview_text(bot, session, f"⚠️ 推送失败：{exc}")
-        return
+    # 链路 trace：编辑模式确认推送与直推共用 tid 派生规则
+    with trace_id(make_trace_id(parsed)):
+        try:
+            ok, msg, message_id, push_chat_id = await pusher.push_share(
+                session.details, session.media, parsed.code, parsed.password,
+                session.files, provider=session.provider,
+                quality_extra=session.quality_extra, is_premium=session.is_premium,
+            )
+        except Exception as exc:
+            logger.exception("确认推送失败")
+            await _edit_preview_text(bot, session, f"⚠️ 推送失败：{exc}")
+            return
 
-    title = session.details.get("title") or session.media.title
-    if ok:
-        await container.cache.mark_pushed(
-            parsed.code,
-            provider=session.provider,
-            password=parsed.password,
-            chat_id=push_chat_id,
-            message_id=message_id,
-            title=title,
-        )
-        logger.info("编辑模式推送成功：%s", title)
-        _clear_session(context)
-        await _edit_preview_text(bot, session, f"✅ 已推送：{title}")
-    else:
-        await _edit_preview_text(bot, session, f"⚠️ 推送失败：{msg}")
+        title = session.details.get("title") or session.media.title
+        if ok:
+            await container.cache.mark_pushed(
+                parsed.code,
+                provider=session.provider,
+                password=parsed.password,
+                chat_id=push_chat_id,
+                message_id=message_id,
+                title=title,
+            )
+            logger.info("编辑模式推送成功：%s", title)
+            _clear_session(context)
+            await _edit_preview_text(bot, session, f"✅ 已推送：{title}")
+        else:
+            await _edit_preview_text(bot, session, f"⚠️ 推送失败：{msg}")
 
 
 async def _handle_quality_input(
@@ -963,6 +1065,7 @@ _DIR_USAGE = (
 async def cmd_dir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/dir add|del|list：目录监控管理（admin only）。"""
     if not _is_admin(update, context):
+        await update.message.reply_text(_DENY_TEXT)
         return
     container = _container(context)
     args = context.args or []
@@ -978,7 +1081,7 @@ async def cmd_dir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if sub == "list":
         dirs = await container.cache.list_share_dirs()
         if not dirs:
-            await reply("暂无监控目录。/dir add <网盘路径> 添加")
+            await reply("📁 暂无监控目录。用 /dir add <网盘路径> 添加（如 /dir add /媒体/新剧）")
             return
         lines = ["📁 监控目录："]
         for d in dirs:
@@ -1029,6 +1132,7 @@ async def cmd_dir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_share(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/share：手动扫描一轮监控目录（admin only）。"""
     if not _is_admin(update, context):
+        await update.message.reply_text(_DENY_TEXT)
         return
     container = _container(context)
     watcher = getattr(container, "share_watcher", None)
@@ -1047,7 +1151,8 @@ async def cmd_share(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(report.items) > 20:
         lines.append(f"… 共 {len(report.items)} 个")
     if not report.items and report.new_items == 0 and report.failed == 0:
-        lines.append("（监控目录下无新子目录，均已是分享状态）")
+        lines.append("ℹ️ 本轮无新子目录（均已分享或目录为空）")
+    lines.append(f"⏱ 下一轮自动扫描：{watcher.interval:g} 分钟后（SHARE_WATCH_INTERVAL_MINUTES）")
     await _edit(placeholder, "\n".join(lines))
 
 
@@ -1060,6 +1165,7 @@ async def cmd_inspect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     用法：/inspect [数量]（默认 50 条，最久未检查优先）
     """
     if not _is_admin(update, context):
+        await update.message.reply_text(_DENY_TEXT)
         return
     container = _container(context)
     inspector = getattr(container, "inspector", None)
@@ -1089,6 +1195,9 @@ async def cmd_inspect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         lines.append(f"🔑 {t}（{it['reason']}）—— /edit 重推可补档")
     if len(report.code_items) > 10:
         lines.append(f"… 共 {len(report.code_items)} 条缺访问码")
+    lines.append(
+        f"⏱ 下一轮自动巡检：{inspector.interval:g} 小时后（INSPECT_INTERVAL_HOURS）"
+    )
     await _edit(placeholder, "\n".join(lines))
 
 
@@ -1101,8 +1210,9 @@ _BOT_COMMANDS: list[BotCommand] = [
     BotCommand("115", "推送 115/ed2k 链接"),
     BotCommand("edit", "编辑画质后推送"),
     BotCommand("cancel", "取消当前编辑"),
-    BotCommand("status", "查看配置与健康"),
+    BotCommand("status", "运行状态与健康一览"),
     BotCommand("refresh", "清除 TMDB 缓存"),
+    BotCommand("loglevel", "调整控制台日志级别"),
     BotCommand("mon", "频道监控（login 登录/add 添加）"),
     BotCommand("inspect", "巡检失效分享并撤卡"),
     BotCommand("dir", "目录监控管理（add/del/list）"),
@@ -1142,6 +1252,7 @@ async def setup_commands(application: Application) -> None:
 # ---------------------------------------------------------------------- #
 # 网络异常降噪：异常风暴时 60s 窗口内只打 1 次详情，其余计数，恢复打汇总
 _NET_WARN_WINDOW = 60.0
+_NET_ALERT_COUNT = 20  # 窗口内次数达到该值 → 私信 admin（疑似代理/网络故障）
 _net_warn: dict[str, tuple[float, int]] = {}  # 类型名 -> (窗口起点, 计数)
 
 
@@ -1181,6 +1292,22 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> 
             logger.warning("TG 网络异常（PTB 将自动重连）%s：%s", hint, err)
         else:
             _net_warn[kind] = (start, count + 1)
+            # 持续风暴：私信 admin（== 阈值时只发一次，窗口滑动天然限频）
+            if count + 1 == _NET_ALERT_COUNT:
+                try:
+                    from app.telegram.notifier import notify_admins
+
+                    container = context.application.bot_data.get("container")
+                    admins = container.settings.tg_admin_ids if container else []
+                    if admins:
+                        await notify_admins(
+                            context.bot, admins,
+                            f"🔴 TG Bot 持续网络异常：60 秒内 {kind} 已 {count + 1} 次。\n"
+                            f"Bot 正在自动重连，但疑似代理不可达或网络故障，请尽快检查。\n"
+                            f"最近错误：{err}",
+                        )
+                except Exception:
+                    logger.exception("网络风暴告警发送失败")
         return
     user_id = None
     if isinstance(update, Update) and update.effective_user:
@@ -1197,6 +1324,7 @@ def register(application: Application) -> None:
     application.add_handler(CommandHandler("edit", cmd_edit))
     application.add_handler(CommandHandler("cancel", cmd_cancel))
     application.add_handler(CommandHandler("refresh", cmd_refresh))
+    application.add_handler(CommandHandler("loglevel", cmd_loglevel))
     application.add_handler(CommandHandler("mon", cmd_mon))
     application.add_handler(CommandHandler("inspect", cmd_inspect))
     application.add_handler(CommandHandler("dir", cmd_dir))

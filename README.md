@@ -75,6 +75,9 @@ cp .env.example .env
 | `INSPECT_ENABLED` | 是否启用分享失效巡检，默认 `true` |
 | `INSPECT_INTERVAL_HOURS` | 巡检间隔（小时），默认 `6` |
 | `INSPECT_NOTIFY` | 失效撤卡后是否私信 admin 告警，默认 `true` |
+| `INSPECT_NOTIFY_CODE` | 巡检发现缺/失访问码时私信提醒补档，默认 `true` |
+| `INSPECT_ERROR_ALERT_ROUNDS` | 巡检连续 N 轮全部失败才私信告警（疑似 IP 被限），默认 `2` |
+| `COOKIE_ALERT` | 115 cookie 失效私信告警（24h 节流，恢复自动通知），默认 `true` |
 | `SHARE_WATCH_ENABLED` | 是否启用目录监控自动建分享，默认 `true` |
 | `SHARE_WATCH_INTERVAL_MINUTES` | 目录扫描间隔（分钟），默认 `10` |
 | `SHARE_WATCH_NOTIFY` | 每轮扫描结果（成功/失败明细）私信 admin，默认 `true`（静默轮不打扰） |
@@ -84,6 +87,7 @@ cp .env.example .env
 | `LOG_FILE` | 文件日志路径，默认 `./data/logs/mediapush.log`（按天轮转，保留 14 天） |
 | `TG_API_ID` / `TG_API_HASH` | 频道监控用户账号凭证（my.telegram.org 申请，可选） |
 | `MONITOR_ENABLED` | 是否启用频道监控，默认 `true` |
+| `MONITOR_NOTIFY` | 频道监控断连/重连/就绪等运行事件私信 admin，默认 `true` |
 | `MONITOR_SESSION` | Telethon session 路径，默认 `./data/monitor.session` |
 | `MONITOR_DB_PATH` | 监控配置存储，默认 `./data/monitor.db` |
 | `MONITOR_BATCH_SECONDS` | 默认聚合窗口秒数（0=实时逐条），可被 `/mon batch` 覆盖 |
@@ -197,7 +201,8 @@ docker inspect mediapush --format '{{.State.Health.Status}}'
 | `/share` | 立即扫描一轮监控目录（不等定时） |
 | `/inspect [数量]` | 手动巡检一轮已推送分享（失效撤卡，默认 50 条，详见下节） |
 | `/refresh <tmdb_id>` | 清除该 TMDB 缓存，下次重新拉取（剧集更新集数时用） |
-| `/status` | 查看配置与 115 健康状态 |
+| `/loglevel <级别>` | 运行时调整控制台日志级别（DEBUG/INFO/WARNING/ERROR），无需重启；文件恒为 DEBUG |
+| `/status` | 运行状态（时长/推送统计）、配置与健康、后台服务一览 |
 | `/mon` | 频道监控管理（详见下节） |
 | `/help` | 帮助 |
 
