@@ -14,6 +14,7 @@ from app.telegram.handlers import (
     _set_session,
     cmd_cookie,
     cmd_edit,
+    cmd_status,
     on_edit_callback,
     on_text,
     setup_commands,
@@ -541,6 +542,75 @@ def test_cmd_cookie_no_file_configured():
 
     text = msg.reply_text.await_args.args[0]
     assert "PAN115_COOKIE_FILE" in text
+
+
+# ---------------------------------------------------------------------- #
+# /status：115 cookie 状态行按 provider 运行时状态显示（文件方式不误报）
+# ---------------------------------------------------------------------- #
+class _StatusPan115:
+    def __init__(self, cookie="") -> None:
+        self.cookie = cookie
+        self.uid = 309130782
+
+    async def check_health(self):
+        return bool(self.cookie) or None
+
+
+class _StatusCache:
+    async def stats(self):
+        return {"pushed": 0, "dead": 0, "tmdb_cache": 0, "share_dirs": 0, "shared_items": 0}
+
+
+class _StatusContainer:
+    def __init__(self, pan115, *, env_cookie="", cookie_file="") -> None:
+        self.pan115 = pan115
+        self.cache = _StatusCache()
+        self.monitor = None
+        self.settings = MagicMock()
+        self.settings.pan115_cookie = env_cookie
+        self.settings.pan115_cookie_file = cookie_file
+        self.settings.tg_bot_token = "t"
+        self.settings.tg_chat_id = "@c"
+        self.settings.tg_chat_id_115 = ""
+        self.settings.tg_chat_id_ed2k = ""
+        self.settings.tmdb_api_key = "k"
+        self.settings.proxy_url = ""
+        self.settings.inspect_enabled = False
+        self.settings.inspect_interval_hours = 6
+        self.settings.share_watch_enabled = False
+        self.settings.share_watch_interval_minutes = 10
+
+
+def _run_status(env_cookie="", cookie_file="", provider_cookie=""):
+    pan = _StatusPan115(provider_cookie)
+    container = _StatusContainer(pan, env_cookie=env_cookie, cookie_file=cookie_file)
+    ctx = _make_context(container)
+    msg = _make_message("/status")
+    update = _make_update(message=msg)
+    asyncio.run(cmd_status(update, ctx))
+    return msg.reply_text.await_args.args[0]
+
+
+def test_cmd_status_cookie_file_mode_not_misreported():
+    """文件方式：.env 直配为空但 provider 已加载 → 显示来源+UID，不误报未配置。"""
+    text = _run_status(
+        env_cookie="", cookie_file="./data/115cookie.txt", provider_cookie="UID=1;"
+    )
+    assert "115 Cookie：未配置" not in text
+    assert "115 Cookie：✅ 文件 ./data/115cookie.txt（UID 309130782）" in text
+
+
+def test_cmd_status_cookie_env_direct_shown():
+    """直配方式：显示“直配”来源 + UID。"""
+    text = _run_status(env_cookie="UID=1;", provider_cookie="UID=1;")
+    assert "直配" in text
+    assert "309130782" in text
+
+
+def test_cmd_status_cookie_absent_shows_anonymous():
+    """无任何 cookie：维持“未配置（匿名读取，可用）”。"""
+    text = _run_status()
+    assert "未配置（匿名读取，可用）" in text
 
 
 # -------------------- A4 处理中 60s 去重 -------------------- #

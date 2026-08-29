@@ -189,9 +189,19 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     lines.append(f"• 网盘频道：{s.tg_chat_id_115 or '⬇️ 同默认'}")
     lines.append(f"• ed2k 频道：{s.tg_chat_id_ed2k or '⬇️ 同默认'}")
     lines.append(f"• TMDB Key：{'✅' if s.tmdb_api_key else '❌ 未配置'}")
-    lines.append(
-        f"• 115 Cookie：{'✅ 已配置（可选）' if s.pan115_cookie else '未配置（匿名读取，可用）'}"
-    )
+    # cookie 状态按 provider 运行时状态显示（文件方式热加载后 .env 字段仍为空，
+    # 只读配置字段会误报"未配置"）
+    if container.pan115 is not None and container.pan115.cookie:
+        source = (
+            "直配" if s.pan115_cookie
+            else f"文件 {s.pan115_cookie_file}" if s.pan115_cookie_file
+            else "运行时"
+        )
+        lines.append(
+            f"• 115 Cookie：✅ {source}（UID {container.pan115.uid or '-'}）"
+        )
+    else:
+        lines.append("• 115 Cookie：未配置（匿名读取，可用）")
     lines.append(f"• 代理：{s.proxy_url or '未配置'}")
     if container.pan115 is not None:
         try:
