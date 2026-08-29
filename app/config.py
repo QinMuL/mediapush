@@ -58,6 +58,10 @@ class Settings:
     tmdb_api_key: str = ""
     tmdb_language: str = "zh-CN"
     pan115_cookie: str = ""
+    # cookie 真实来源标记：True=PAN115_COOKIE 环境变量直配；False=文件/未配置。
+    # 注意 pan115_cookie 字段可能被文件内容回填，判“直配”必须用本标记
+    # （/status 展示来源、/cookie 直配保护均依赖）
+    pan115_cookie_direct: bool = False
     pan115_cookie_file: str = ""  # cookie 文件路径（挂载更新免重建容器）
     pan115_use_proxy: bool = False
     proxy_url: str = ""
@@ -112,6 +116,7 @@ class Settings:
         # cookie：env 直配优先；否则从 PAN115_COOKIE_FILE 文件读（一整行字符串，
         # 容器挂载后改文件重启即生效；巡检器还会热更新）
         cookie = os.getenv("PAN115_COOKIE", "").strip()
+        cookie_direct = bool(cookie)
         cookie_file = os.getenv("PAN115_COOKIE_FILE", "").strip()
         if not cookie and cookie_file:
             try:
@@ -128,6 +133,7 @@ class Settings:
             tmdb_api_key=os.getenv("TMDB_API_KEY", "").strip(),
             tmdb_language=os.getenv("TMDB_LANGUAGE", "zh-CN").strip() or "zh-CN",
             pan115_cookie=cookie,
+            pan115_cookie_direct=cookie_direct,
             pan115_cookie_file=cookie_file,
             pan115_use_proxy=_env_bool("PAN115_USE_PROXY", False),
             proxy_url=os.getenv("PROXY_URL", "").strip(),

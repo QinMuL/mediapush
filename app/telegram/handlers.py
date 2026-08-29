@@ -193,7 +193,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # 只读配置字段会误报"未配置"）
     if container.pan115 is not None and container.pan115.cookie:
         source = (
-            "直配" if s.pan115_cookie
+            "直配" if s.pan115_cookie_direct
             else f"文件 {s.pan115_cookie_file}" if s.pan115_cookie_file
             else "运行时"
         )
@@ -360,7 +360,7 @@ async def cmd_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # ---- 查看模式：来源/长度/UID（不回显原文，cookie 是敏感凭证） ----
     if not context.args:
         source = (
-            "PAN115_COOKIE 直配（.env）" if container.settings.pan115_cookie
+            "PAN115_COOKIE 直配（.env）" if container.settings.pan115_cookie_direct
             else f"文件 {container.settings.pan115_cookie_file}"
             if container.settings.pan115_cookie_file else "未配置（匿名模式）"
         )
@@ -376,8 +376,8 @@ async def cmd_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
-    # ---- 设置模式 ----
-    if container.settings.pan115_cookie:
+    # ---- 设置模式：仅 PAN115_COOKIE 真直配时拒绝（文件内容回填不算直配） ----
+    if container.settings.pan115_cookie_direct:
         await update.message.reply_text(
             "⚠️ 当前使用 PAN115_COOKIE 直配（优先级高于文件，重启后会覆盖此处设置）。\n"
             "请先在 .env 中清空 PAN115_COOKIE、填好 PAN115_COOKIE_FILE 后 /reload，"

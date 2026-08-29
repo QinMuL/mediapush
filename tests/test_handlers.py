@@ -456,6 +456,7 @@ class _CookieContainer:
         self.refreshed: list = []
         self.settings = MagicMock()
         self.settings.pan115_cookie = env_cookie
+        self.settings.pan115_cookie_direct = bool(env_cookie)
         self.settings.pan115_cookie_file = cookie_file
 
     def refresh_cookie_file(self):
@@ -568,6 +569,7 @@ class _StatusContainer:
         self.monitor = None
         self.settings = MagicMock()
         self.settings.pan115_cookie = env_cookie
+        self.settings.pan115_cookie_direct = bool(env_cookie)
         self.settings.pan115_cookie_file = cookie_file
         self.settings.tg_bot_token = "t"
         self.settings.tg_chat_id = "@c"
@@ -611,6 +613,44 @@ def test_cmd_status_cookie_absent_shows_anonymous():
     """无任何 cookie：维持“未配置（匿名读取，可用）”。"""
     text = _run_status()
     assert "未配置（匿名读取，可用）" in text
+
+
+def test_cmd_status_cookie_file_backfilled_not_direct():
+    """回归（NAS 实测场景）：文件方式启动时 config 把文件内容回填进
+    pan115_cookie 字段——须按 direct 标记判来源，不得误标“直配”。"""
+    pan = _StatusPan115("UID=1;")
+    container = _StatusContainer(pan, env_cookie="", cookie_file="./data/115cookie.txt")
+    # 模拟 config.load 文件回填：字段有值但 direct=False
+    container.settings.pan115_cookie = "UID=1;"
+    container.settings.pan115_cookie_direct = False
+    ctx = _make_context(container)
+    msg = _make_message("/status")
+    update = _make_update(message=msg)
+    asyncio.run(cmd_status(update, ctx))
+
+    text = msg.reply_text.await_args.args[0]
+    assert "115 Cookie：✅ 文件 ./data/115cookie.txt（UID 309130782）" in text
+    assert "直配" not in text
+
+
+def test_cmd_cookie_file_backfilled_allows_update(tmp_path):
+    """回归：文件回填场景下 /cookie 设置不被“直配保护”误拒。"""
+    f = tmp_path / "ck.txt"
+    f.write_text("UID=old;", encoding="utf-8")
+    pan = _CookiePan115(cookie="UID=old;", health=True)
+    container = _CookieContainer(pan, cookie_file=str(f))
+    # 模拟文件回填：pan115_cookie 有值但非直配
+    container.settings.pan115_cookie = "UID=old;"
+    container.settings.pan115_cookie_direct = False
+    ctx = _make_context(container)
+    ctx.args = ["UID=9;CID=8;"]
+    msg = _make_message("/cookie UID=9;CID=8;")
+    update = _make_update(message=msg)
+
+    asyncio.run(cmd_cookie(update, ctx))
+
+    assert pan.cookie == "UID=9;CID=8;"  # 未被直配保护拦截
+    assert f.read_text(encoding="utf-8") == "UID=9;CID=8;"
 
 
 # -------------------- A4 处理中 60s 去重 -------------------- #
