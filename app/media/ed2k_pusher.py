@@ -302,10 +302,6 @@ class Ed2kPusherService:
                 logger.warning("ed2k 推送汇总 %s 发送失败：%s", cid, exc)
 
 
-def _time_now_proxy() -> float:
-    import time as _t
-    return _t.time()
-
     # ------------------------------------------------------------------ #
     async def start(self) -> None:
         if self._task and not self._task.done():
@@ -341,3 +337,8 @@ def _time_now_proxy() -> float:
             self._task = None
         self._save_state()
         logger.info("ed2k 推送已停止")
+
+
+def _time_now_proxy() -> float:
+    import time as _t
+    return _t.time()
