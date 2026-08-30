@@ -69,15 +69,8 @@ def pick_subtitles(video: Path) -> list[Path]:
 
 
 def build_dest_dir(result: NamingResult, output_dir: Path) -> Path:
-    """目标目录布局：电影平铺；剧集按"片名 (年份)/Sxx/"（均为净化后路径）。"""
-    details = result.details or {}
-    title = sanitize_name(details.get("title") or result.parsed.title or "未命名")
-    year = details.get("year") or result.parsed.year
-    if result.parsed.media_type != "tv":
-        return output_dir
-    season = result.parsed.season if result.parsed.season is not None else 1
-    folder = f"{title} ({year})" if year else title
-    return output_dir / sanitize_name(folder) / f"S{season:02d}"
+    """目标目录布局：电影/剧集均平铺在 output_dir 下（不建子目录）。"""
+    return output_dir
 
 
 @dataclass

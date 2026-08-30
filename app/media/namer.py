@@ -328,7 +328,10 @@ def render_name(parsed: MediaData, probe: ProbeTags | None, details: dict | None
         parts = [title] + ([str(year)] if year else []) + [se, f"第{ep:02d}集"]
         head = ".".join(parts)
         name = f"{head}.{quality}" if quality else head
-    return f"{name}{tail}{ext}"
+    # TMDB ID 标签（高置信命中时 details 非空）
+    tmdb_id = (details or {}).get("tmdb_id")
+    tmdb_tag = f" {{tmdb-{tmdb_id}}}" if tmdb_id else ""
+    return f"{name}{tail}{tmdb_tag}{ext}"
 
 
 # ---------------------------------------------------------------------- #
