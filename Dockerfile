@@ -8,6 +8,10 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# 系统依赖：ffmpeg（含 ffprobe，供媒体探测模块解析分辨率/编码/HDR/帧率/音频）
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 # 先装依赖（利用层缓存）
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

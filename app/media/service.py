@@ -122,6 +122,8 @@ class LocalMediaService:
         self._stable: dict[str, int] = {}
         # 低置信重试状态：path → {failures, next_retry, first_seen}
         self._retry_state: dict[str, dict] = {}
+        # DRY-RUN 已模拟处理的文件（内存级，重启清空；防同一文件无限循环）
+        self._dry_done: set[str] = set()
         self._load_state()
         self._task: asyncio.Task | None = None
 
@@ -186,6 +188,8 @@ class LocalMediaService:
         moved_sources: list[Path] = []
         for f in files:
             key = str(f)
+            if key in self._dry_done:
+                continue
             if self._stable.get(key, 0) < self.settings.local_media_stable_rounds:
                 continue
             if not self._retry_due(key, now):
@@ -237,6 +241,7 @@ class LocalMediaService:
         if self.settings.local_media_dry_run:
             report.dry_moved += 1
             logger.info("[DRY-RUN] %s → %s（字幕伴行 %d 个）", f.name, dest, len(subs))
+            self._dry_done.add(str(f))
             return True
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)

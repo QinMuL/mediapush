@@ -92,6 +92,8 @@ class Ed2kService:
         self._stable: dict[str, int] = {}
         self._retry_state: dict[str, dict] = {}
         self._busy: set[str] = set()  # 哈希进行中：防重复触发
+        # DRY-RUN 已模拟处理的文件（内存级，重启清空）
+        self._dry_done: set[str] = set()
         self._load_state()
         self._task: asyncio.Task | None = None
 
@@ -163,6 +165,8 @@ class Ed2kService:
         moved_sources: list[Path] = []
         for f in files:
             key = str(f)
+            if key in self._dry_done:
+                continue
             if self._stable.get(key, 0) < self.settings.ed2k_stable_rounds:
                 continue
             if key in self._busy:
@@ -227,6 +231,7 @@ class Ed2kService:
                 "[DRY-RUN] ed2k %s → %s（伴行 %d，链接=%s）",
                 f.name, dest, len(sides), uri,
             )
+            self._dry_done.add(str(f))
             return True
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
