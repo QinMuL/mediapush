@@ -122,6 +122,9 @@ class TelegramService:
             # ed2k 推送（JSONL→频道）：停止后台循环
             if self.container.ed2k_pusher is not None:
                 await self.container.ed2k_pusher.stop()
+            # CD2 上传（目录C→115）：停止后台循环
+            if self.container.cd2_uploader is not None:
+                await self.container.cd2_uploader.stop()
             if self.container.monitor is not None:
                 await self.container.monitor.stop()
             if self.container.monitor_store is not None:
@@ -174,6 +177,11 @@ class TelegramService:
             if self.container.ed2k_pusher is not None:
                 app.bot_data["_ed2k_push_task"] = asyncio.create_task(
                     self.container.ed2k_pusher.start()
+                )
+            # CD2 上传（目录C → 115）：后台循环（独立任务）
+            if self.container.cd2_uploader is not None:
+                app.bot_data["_cd2_upload_task"] = asyncio.create_task(
+                    self.container.cd2_uploader.start()
                 )
 
         builder = (

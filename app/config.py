@@ -120,6 +120,17 @@ class Settings:
     ed2k_push_stuck_days: float = 7.0              # 推送失败卡死告警（天）
     ed2k_push_report_admin: bool = True            # 每轮结束把汇总发给 TG_ADMIN_IDS
     ed2k_push_report_channel: bool = False         # 每轮结束把汇总同步发到 TG_CHAT_ID_ED2K（慎用，会刷频道）
+    # CD2 上传（目录C → CloudDrive2 CopyFile → 115，见 app/media/cd2_uploader.py）
+    cd2_enabled: bool = False
+    cd2_address: str = "192.168.1.202:19798"       # CD2 gRPC 地址
+    cd2_token: str = ""                           # API 令牌（推荐，UI 创建）
+    cd2_username: str = ""                         # 或账号密码（token 优先）
+    cd2_password: str = ""
+    cd2_upload_src: str = ""                       # 目录C 在 CD2 里的路径（本地挂载）
+    cd2_upload_dst: str = ""                       # 115 在 CD2 里的目标目录
+    cd2_upload_dry_run: bool = True                # 模拟：只查重+日志，不提交任务
+    cd2_upload_interval_seconds: float = 60.0      # 扫描周期
+    cd2_stuck_days: float = 7.0                     # 上传失败卡死告警（天）
 
     @classmethod
     def load(cls, *, dotenv_override: bool = False) -> Settings:
@@ -218,6 +229,19 @@ class Settings:
             ed2k_push_stuck_days=max(1.0, _env_float("ED2K_PUSH_STUCK_DAYS", 7.0)),
             ed2k_push_report_admin=_env_bool("ED2K_PUSH_REPORT_ADMIN", True),
             ed2k_push_report_channel=_env_bool("ED2K_PUSH_REPORT_CHANNEL", False),
+            cd2_enabled=_env_bool("CD2_ENABLED", False),
+            cd2_address=os.getenv("CD2_ADDRESS", "192.168.1.202:19798").strip()
+            or "192.168.1.202:19798",
+            cd2_token=os.getenv("CD2_TOKEN", "").strip(),
+            cd2_username=os.getenv("CD2_USERNAME", "").strip(),
+            cd2_password=os.getenv("CD2_PASSWORD", "").strip(),
+            cd2_upload_src=os.getenv("CD2_UPLOAD_SRC", "").strip(),
+            cd2_upload_dst=os.getenv("CD2_UPLOAD_DST", "").strip(),
+            cd2_upload_dry_run=_env_bool("CD2_UPLOAD_DRY_RUN", True),
+            cd2_upload_interval_seconds=max(
+                5.0, _env_float("CD2_UPLOAD_INTERVAL_SECONDS", 60.0)
+            ),
+            cd2_stuck_days=max(1.0, _env_float("CD2_STUCK_DAYS", 7.0)),
         )
         settings._ensure_dirs()
         return settings
@@ -269,6 +293,17 @@ class Settings:
                 warns.append(
                     "ED2K_PUSH_ENABLED 已开但 TG_CHAT_ID_ED2K/TG_CHAT_ID 均未配置——推送无目标频道。"
                 )
+        if self.cd2_enabled:
+            if not self.cd2_upload_src or not self.cd2_upload_dst:
+                warns.append("CD2_ENABLED 已开但 CD2_UPLOAD_SRC/DST 未配置，CD2 上传不启动。")
+            elif self.cd2_upload_src == self.cd2_upload_dst:
+                warns.append("CD2_UPLOAD_SRC 与 DST 不得相同（源=目标会死循环）。")
+            if not self.cd2_token and not (self.cd2_username and self.cd2_password):
+                warns.append(
+                    "CD2_ENABLED 已开但 CD2_TOKEN / CD2_USERNAME+PASSWORD 均未配置——无法认证。"
+                )
+            if self.cd2_upload_src and self.cd2_upload_dst and not self.cd2_token:
+                warns.append("CD2 建议使用 API 令牌（CD2_TOKEN）而非账号密码。")
         return warns
 
     def is_admin(self, user_id: int | None) -> bool:
@@ -304,4 +339,7 @@ HOT_RELOAD_FIELDS: frozenset[str] = frozenset({
     "ed2k_push_dry_run",
     "ed2k_push_interval_seconds",
     "ed2k_push_stuck_days",
+    "cd2_upload_dry_run",
+    "cd2_upload_interval_seconds",
+    "cd2_stuck_days",
 })

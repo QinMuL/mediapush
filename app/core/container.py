@@ -30,6 +30,7 @@ class Container:
         self.local_media = None
         self.ed2k_service = None   # B→C 哈希流水线（app.media.ed2k_service.Ed2kService）
         self.ed2k_pusher = None    # JSONL → 频道推送（app.media.ed2k_pusher.Ed2kPusherService）
+        self.cd2_uploader = None   # C → CD2 CopyFile → 115（app.media.cd2_uploader.Cd2UploaderService）
         self.pan115_limiter = None
         self._built = False
 
@@ -186,6 +187,20 @@ class Container:
         else:
             logger.info("ED2K_PUSH_ENABLED=false，ed2k 推送未启用")
 
+        # CD2 上传（目录C → CloudDrive2 CopyFile → 115，start 在 bot post_init）
+        if self.settings.cd2_enabled:
+            from app.media.cd2_uploader import Cd2UploaderService
+
+            self.cd2_uploader = Cd2UploaderService(self.settings)
+            logger.info(
+                "CD2 上传已创建：%s → %s（%s）",
+                self.settings.cd2_upload_src,
+                self.settings.cd2_upload_dst,
+                "DRY-RUN 模拟" if self.settings.cd2_upload_dry_run else "实际上传",
+            )
+        else:
+            logger.info("CD2_ENABLED=false，CD2 上传未启用")
+
         self._built = True
 
     # ------------------------------------------------------------------ #
@@ -225,6 +240,8 @@ class Container:
             self.ed2k_service.interval = max(1.0, old.ed2k_interval_seconds)
         if "ed2k_push_interval_seconds" in hot and self.ed2k_pusher is not None:
             self.ed2k_pusher.interval = max(1.0, old.ed2k_push_interval_seconds)
+        if "cd2_upload_interval_seconds" in hot and self.cd2_uploader is not None:
+            self.cd2_uploader.interval = max(5.0, old.cd2_upload_interval_seconds)
         if "pan115_request_interval" in hot and self.pan115_limiter is not None:
             self.pan115_limiter.set_base_interval(old.pan115_request_interval)
         if "log_level" in hot:
@@ -262,6 +279,8 @@ class Container:
         return self.telegram is not None
 
     async def close(self) -> None:
+        if self.cd2_uploader is not None:
+            await self.cd2_uploader.stop()
         if self.ed2k_pusher is not None:
             await self.ed2k_pusher.stop()
         if self.ed2k_service is not None:

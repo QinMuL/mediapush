@@ -104,7 +104,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🚀 快速上手：\n"
         "1️⃣ 发送 115 分享链接或 ed2k 链接，自动匹配 TMDB 推送卡片\n"
         "2️⃣ 频道监控自动捕获 ed2k 链接并推送\n"
-        "3️⃣ 本地媒体流水线：自动重命名 → ed2k 哈希 → 推送频道\n\n"
+        "3️⃣ 本地媒体流水线：重命名 → ed2k 哈希 → 推频道 → CD2 传 115\n\n"
         "输入 /help 查看全部用法。"
     )
 
@@ -137,11 +137,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /share — 立即扫描一轮监控目录\n\n"
         "【本地媒体流水线】\n"
         "• /ed2k_status — 查看 ed2k 推送状态（pending 队列/进度/卡死告警）\n"
+        "• /upload_status — 查看 CD2 上传状态（进度/退避/卡死告警）\n"
         "• A→B：监控本地目录，TMDB 高置信重命名 + ffprobe 实测画质标签\n"
         "• B→C：ed2k 哈希生成（MD4 Merkle），算完移入归档目录\n"
         "• C→频道：自动推送 ed2k 资源卡片到指定频道\n"
+        "• C→115：CD2 上传到 115 网盘（115 秒传命中秒完成），完成后删本地源\n"
         "• 文件名格式：片名 (年份) - 画质标签 {tmdb-ID}.ext\n"
-        "• 配置见 .env 的 LOCAL_MEDIA_* / ED2K_* 段"
+        "• 配置见 .env 的 LOCAL_MEDIA_* / ED2K_* / CD2_* 段"
     )
 
 
@@ -275,6 +277,18 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             # 内嵌一段 pusher status（缩进一下便于读）
             for line in pusher.status_text().splitlines()[1:]:
                 lines.append(f"  {line}")
+    if not s.cd2_enabled:
+        lines.append("• CD2 上传（C→115）：⬜ 未启用（CD2_ENABLED=false）")
+    else:
+        mode = "模拟上传" if s.cd2_upload_dry_run else "实际上传"
+        lines.append(
+            f"• CD2 上传（C→115）：✅（{mode}，每 {s.cd2_upload_interval_seconds:g}s）"
+            + f" {s.cd2_upload_src} → {s.cd2_upload_dst}"
+        )
+        uploader = getattr(container, "cd2_uploader", None)
+        if uploader is not None:
+            for line in uploader.status_lines():
+                lines.append(f"  {line}")
     lines.append(f"• 控制台日志：{logging.getLevelName(console_lvl)}（/loglevel 调整）")
 
     await update.message.reply_text("\n".join(lines))
@@ -320,6 +334,51 @@ async def cmd_ed2k_status(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         text += f"\n\n⏳ Pending Top {min(N, len(pendings))}（按等待时长倒序）：\n" + "\n".join(pending_lines)
         if len(pendings) > N:
             text += f"\n（剩 {len(pendings) - N} 条未列出）"
+    await update.message.reply_text(text, disable_web_page_preview=True)
+
+
+async def cmd_upload_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """CD2 上传详细状态 + 失败退避明细（admin only）。"""
+    if not _is_admin(update, context):
+        await update.message.reply_text(_DENY_TEXT)
+        return
+    container = _container(context)
+    uploader = getattr(container, "cd2_uploader", None)
+    if uploader is None:
+        await update.message.reply_text(
+            "⬜ CD2 上传未启用（CD2_ENABLED=false），或尚未完成容器 build。"
+        )
+        return
+    text = "\n".join(uploader.status_lines())
+    import time as _t
+
+    now = _t.time()
+    retry_items = []
+    for src, st in uploader._retry_state.items():
+        age_h = max(0.0, (now - float(st.get("first_seen", now))) / 3600.0)
+        retry_items.append((age_h, src, st))
+    retry_items.sort(key=lambda x: x[0], reverse=True)
+    N = 8
+    if retry_items:
+        retry_lines = []
+        for age_h, src, st in retry_items[:N]:
+            f = st.get("failures", 0)
+            nr = float(st.get("next_retry", 0) or 0)
+            left = max(0.0, (nr - now) / 3600.0)
+            name = src.rsplit("/", 1)[-1]
+            snippet = name if len(name) <= 72 else name[:69] + "..."
+            flag = (
+                " 🚨" if age_h / 24.0 >= container.settings.cd2_stuck_days else ""
+            )
+            retry_lines.append(
+                f"• {age_h:.1f}h｜失败{f}｜下次{left:.1f}h{flag}｜{snippet}"
+            )
+        text += (
+            f"\n\n⏳ 失败退避 Top {min(N, len(retry_items))}"
+            f"（按等待时长倒序）：\n" + "\n".join(retry_lines)
+        )
+        if len(retry_items) > N:
+            text += f"\n（剩 {len(retry_items) - N} 条未列出）"
     await update.message.reply_text(text, disable_web_page_preview=True)
 
 
@@ -1448,6 +1507,7 @@ _BOT_COMMANDS: list[BotCommand] = [
     BotCommand("dir", "目录监控管理（add/del/list）"),
     BotCommand("share", "扫描目录建永久分享并推送"),
     BotCommand("ed2k_status", "ed2k 推送状态与 pending 队列"),
+    BotCommand("upload_status", "CD2 上传状态（进度/退避）"),
 ]
 
 
@@ -1563,6 +1623,7 @@ def register(application: Application) -> None:
     application.add_handler(CommandHandler("dir", cmd_dir))
     application.add_handler(CommandHandler("share", cmd_share))
     application.add_handler(CommandHandler("ed2k_status", cmd_ed2k_status))
+    application.add_handler(CommandHandler("upload_status", cmd_upload_status))
     application.add_handler(
         CallbackQueryHandler(
             on_edit_callback,

@@ -49,7 +49,7 @@ def test_bot_commands_structure():
     assert cmds == [
         "start", "help", "115", "edit", "cancel", "status", "refresh",
         "loglevel", "reload", "cookie", "mon", "inspect", "dir", "share",
-        "ed2k_status",
+        "ed2k_status", "upload_status",
     ]
     for c in _BOT_COMMANDS:
         assert c.description, f"{c.command} 描述为空"
@@ -67,6 +67,14 @@ def test_setup_commands_clears_then_sets():
 # 编辑模式（/edit）流程 mock 测试
 # ---------------------------------------------------------------------- #
 class _FakeSettings:
+    def __init__(self) -> None:
+        # /status 展示的全部服务开关/参数（缺字段会 KeyError/Mock 格式化炸）
+        self.cd2_enabled = False
+        self.cd2_upload_dry_run = True
+        self.cd2_upload_interval_seconds = 60.0
+        self.cd2_upload_src = "/media/media/C"
+        self.cd2_upload_dst = "/115open/tmp"
+
     def is_admin(self, _uid) -> bool:
         return True
 
@@ -582,10 +590,11 @@ class _StatusContainer:
         self.settings.inspect_interval_hours = 6
         self.settings.share_watch_enabled = False
         self.settings.share_watch_interval_minutes = 10
-        # 本地媒体 / ed2k 流水线 / ed2k 推送：默认未启用（避免走进 :g 格式化分支）
+        # 本地媒体 / ed2k 流水线 / ed2k 推送 / CD2 上传：默认未启用（避免走进 :g 格式化分支）
         self.settings.local_media_enabled = False
         self.settings.ed2k_enabled = False
         self.settings.ed2k_push_enabled = False
+        self.settings.cd2_enabled = False
 
 
 def _run_status(env_cookie="", cookie_file="", provider_cookie=""):

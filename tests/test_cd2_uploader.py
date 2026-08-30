@@ -1,0 +1,233 @@
+﻿"""Cd2UploaderService 单元测试（不连真实 CD2，gRPC 层 mock）。"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from dataclasses import dataclass, field
+from types import SimpleNamespace
+
+import pytest
+
+from app.media.cd2_uploader import Cd2UploaderService, Cd2UploadReport
+
+
+# ---------------------------------------------------------------------- #
+# 测试工具
+# ---------------------------------------------------------------------- #
+@dataclass
+class FakeFile:
+    """模拟 CD2 CloudDriveFile。"""
+
+    name: str
+    fullPathName: str
+    size: int
+    isDirectory: bool = False
+    writeTime: SimpleNamespace = field(
+        default_factory=lambda: SimpleNamespace(seconds=1700000000)
+    )
+
+
+class FakeUploader(Cd2UploaderService):
+    """重写 gRPC 层的假实现。"""
+
+    def __init__(self, settings, src_files, dst_files):
+        super().__init__(settings)
+        self._src_files = src_files
+        self._dst_files = dst_files
+        self.submitted: list[str] = []
+        self.deleted: list[str] = []
+        self.tasks_result: list = []
+
+    def _ensure_conn(self):
+        return True
+
+    def _login(self):
+        return True
+
+    def _list_dir(self, path):
+        if path == self.src_dir:
+            return self._src_files
+        if path == self.dst_dir:
+            return self._dst_files
+        return []
+
+    def _submit_copy(self, src_path):
+        self.submitted.append(src_path)
+        return True
+
+    def _query_tasks(self):
+        return self.tasks_result
+
+    def _delete_file(self, src_path):
+        self.deleted.append(src_path)
+        return True
+
+
+def make_settings(**overrides) -> SimpleNamespace:
+    defaults = dict(  # noqa: C408
+        cd2_upload_interval_seconds=60.0,
+        cd2_address="127.0.0.1:19798",
+        cd2_token="test-token",
+        cd2_username="",
+        cd2_password="",
+        cd2_upload_src="/media/media/C",
+        cd2_upload_dst="/115open/tmp",
+        cd2_upload_dry_run=True,
+        cd2_stuck_days=7.0,
+    )
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
+def make_fake(tmp_path, src_files, dst_files, **overrides) -> FakeUploader:
+    u = FakeUploader(make_settings(**overrides), src_files, dst_files)
+    u.state_file = tmp_path / "cd2_state.json"
+    return u
+
+
+def _task(src="/media/media/C/a.mkv", status=3, uploaded=1024, total=1024):
+    return SimpleNamespace(
+        sourcePath=src,
+        destPath="/115open/tmp",
+        status=status,
+        uploadedBytes=uploaded,
+        totalBytes=total,
+        errors=[SimpleNamespace(path="/x", error="boom")],
+    )
+
+
+# ---------------------------------------------------------------------- #
+# 用例
+# ---------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_dry_run_submits_nothing(tmp_path):
+    """dry-run：只出日志记 completed，不提交 CopyFile。"""
+    u = make_fake(
+        tmp_path,
+        src_files=[FakeFile("a.mkv", "/media/media/C/a.mkv", 1024)],
+        dst_files=[],
+    )
+    r1 = await u.run_once()  # 第 1 轮：快照（不稳定）
+    assert r1.dry_submitted == 0
+    r2 = await u.run_once()  # 第 2 轮：稳定 → 模拟提交
+    assert r2.dry_submitted == 1
+    assert u.submitted == []
+    assert "/media/media/C/a.mkv" in u._completed
+    r3 = await u.run_once()  # 第 3 轮：已 completed 不重复
+    assert r3.dry_submitted == 0
+
+
+@pytest.mark.asyncio
+async def test_dedup_skips_existing(tmp_path):
+    """115 目标已有同名 → 跳过记完成。"""
+    u = make_fake(
+        tmp_path,
+        src_files=[FakeFile("a.mkv", "/media/media/C/a.mkv", 1024)],
+        dst_files=[FakeFile("a.mkv", "/115open/tmp/a.mkv", 1024)],
+    )
+    await u.run_once()
+    r = await u.run_once()
+    assert r.skipped == 1
+    assert u.submitted == []
+    assert "/media/media/C/a.mkv" in u._completed
+
+
+@pytest.mark.asyncio
+async def test_real_submit_and_task_complete(tmp_path):
+    """实际模式：提交 → 任务完成 → 删源 + 记完成。"""
+    u = make_fake(
+        tmp_path,
+        src_files=[FakeFile("a.mkv", "/media/media/C/a.mkv", 2048)],
+        dst_files=[],
+        cd2_upload_dry_run=False,
+    )
+    await u.run_once()
+    r = await u.run_once()
+    assert r.submitted == 1
+    assert u.submitted == ["/media/media/C/a.mkv"]
+    assert "/media/media/C/a.mkv" in u._tasks
+
+    u.tasks_result = [_task(status=3)]
+    r2 = await u.run_once()
+    await asyncio.sleep(0.05)  # 等 executor 删源
+    assert r2.completed == 1
+    assert u.deleted == ["/media/media/C/a.mkv"]
+    assert "/media/media/C/a.mkv" in u._completed
+    assert "/media/media/C/a.mkv" not in u._tasks
+
+
+@pytest.mark.asyncio
+async def test_serial_one_task_at_a_time(tmp_path):
+    """串行：有活跃任务时不再提交新的。"""
+    files = [
+        FakeFile("a.mkv", "/media/media/C/a.mkv", 1024),
+        FakeFile("b.mkv", "/media/media/C/b.mkv", 1024),
+    ]
+    u = make_fake(tmp_path, src_files=files, dst_files=[], cd2_upload_dry_run=False)
+    await u.run_once()
+    r = await u.run_once()
+    assert r.submitted == 1
+    assert len(u._tasks) == 1
+
+    u.tasks_result = [_task(status=0)]  # Pending 中
+    r2 = await u.run_once()
+    assert r2.submitted == 0
+    assert len(u._tasks) == 1
+
+
+@pytest.mark.asyncio
+async def test_task_failed_records_retry(tmp_path):
+    """任务失败（status=4）→ 记退避，不删源。"""
+    u = make_fake(
+        tmp_path,
+        src_files=[FakeFile("a.mkv", "/media/media/C/a.mkv", 1024)],
+        dst_files=[],
+        cd2_upload_dry_run=False,
+    )
+    await u.run_once()
+    await u.run_once()
+    u.tasks_result = [_task(status=4)]
+    r = await u.run_once()
+    assert r.failed == 1
+    assert u.deleted == []
+    assert u._retry_state["/media/media/C/a.mkv"]["failures"] == 1
+
+
+@pytest.mark.asyncio
+async def test_state_persistence(tmp_path):
+    """completed/退避状态落盘，重启恢复。"""
+    u = make_fake(
+        tmp_path,
+        src_files=[FakeFile("a.mkv", "/media/media/C/a.mkv", 1024)],
+        dst_files=[],
+    )
+    await u.run_once()
+    await u.run_once()
+    u._retry_state["/media/media/C/x.mkv"] = {
+        "failures": 2, "first_seen": time.time(), "next_retry": time.time() + 3600
+    }
+    u._save_state()
+    assert u.state_file.exists()
+
+    u2 = make_fake(tmp_path, src_files=[], dst_files=[])
+    u2._load_state()
+    assert "/media/media/C/a.mkv" in u2._completed
+    assert u2._retry_state["/media/media/C/x.mkv"]["failures"] == 2
+
+
+def test_report_summary():
+    r = Cd2UploadReport(scanned=5, completed=2, skipped=1, failed=1, stuck=1, active=1)
+    s = r.summary()
+    assert "扫描 5" in s
+    assert "上传完成 2" in s
+    assert "已存在跳过 1" in s
+    assert "失败退避 1" in s
+    assert "卡死" in s
+
+
+def test_status_lines(tmp_path):
+    u = make_fake(tmp_path, src_files=[], dst_files=[])
+    lines = u.status_lines()
+    assert any("CD2 上传" in x for x in lines)
+    assert any("DRY_RUN" in x for x in lines)

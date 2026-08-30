@@ -60,6 +60,8 @@ _NOISY_LOGGERS: dict[str, int] = {
     "urllib3": logging.WARNING,
     "asyncio": logging.WARNING,
     "p115client": logging.WARNING,
+    "telethon": logging.WARNING,      # "Got difference for channel ..." 心跳刷屏
+    "telethon.network.mtprotosender": logging.WARNING,
 }
 
 # ---------------------------------------------------------------------- #
