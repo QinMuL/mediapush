@@ -101,10 +101,10 @@ def _edit_keyboard(session: EditSession) -> InlineKeyboardMarkup:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 我是网盘影视资源推送 Bot。\n\n"
-        "🚀 快速上手三步：\n"
-        "1️⃣ 直接发送一个 115 分享链接（或 ed2k 链接）\n"
-        "2️⃣ 我会读取内容、自动匹配 TMDB（海报/评分/演职员）\n"
-        "3️⃣ 推送带海报的卡片到你的频道\n\n"
+        "🚀 快速上手：\n"
+        "1️⃣ 发送 115 分享链接或 ed2k 链接，自动匹配 TMDB 推送卡片\n"
+        "2️⃣ 频道监控自动捕获 ed2k 链接并推送\n"
+        "3️⃣ 本地媒体流水线：自动重命名 → ed2k 哈希 → 推送频道\n\n"
         "输入 /help 查看全部用法。"
     )
 
@@ -134,7 +134,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /mon — 频道监控（/mon login 交互式登录，自动捕获 ed2k 推送）\n"
         "• /inspect [数量] — 手动巡检已推送分享，失效撤卡（默认每 6 小时自动跑）\n"
         "• /dir add <网盘路径> — 目录监控：新子目录自动建永久分享并推送\n"
-        "• /share — 立即扫描一轮监控目录"
+        "• /share — 立即扫描一轮监控目录\n\n"
+        "【本地媒体流水线】\n"
+        "• /ed2k_status — 查看 ed2k 推送状态（pending 队列/进度/卡死告警）\n"
+        "• A→B：监控本地目录，TMDB 高置信重命名 + ffprobe 实测画质标签\n"
+        "• B→C：ed2k 哈希生成（MD4 Merkle），算完移入归档目录\n"
+        "• C→频道：自动推送 ed2k 资源卡片到指定频道\n"
+        "• 文件名格式：片名 (年份) - 画质标签 {tmdb-ID}.ext\n"
+        "• 配置见 .env 的 LOCAL_MEDIA_* / ED2K_* 段"
     )
 
 

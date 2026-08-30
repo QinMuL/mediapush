@@ -65,17 +65,17 @@ def test_build_dest_dir_movie_flat():
     assert build_dest_dir(_result("movie"), out) == out
 
 
-def test_build_dest_dir_tv_folder():
-    """剧集分夹：B/片名 (年份)/Sxx/。"""
+def test_build_dest_dir_tv_flat():
+    """剧集也平铺：直接进 B 根目录。"""
     out = Path("B")
-    assert build_dest_dir(_result("tv", 2), out) == out / "藏锋 (2026)" / "S02"
+    assert build_dest_dir(_result("tv", 2), out) == out
 
 
-def test_build_dest_dir_tv_illegal_title_sanitized():
-    """TMDB 标题含 Windows 非法字符时目录名净化（原文冒号后空格保留）。"""
+def test_build_dest_dir_tv_flat_any_title():
+    """无论标题如何，剧集目标目录都是平铺的 output_dir。"""
     r = _result("tv")
     r.details = {"title": "Mission: Impossible", "year": 1996}
-    assert build_dest_dir(r, Path("B")) == Path("B") / "Mission： Impossible (1996)" / "S01"
+    assert build_dest_dir(r, Path("B")) == Path("B")
 
 
 # ---------------- 文件名净化 ---------------- #
@@ -199,7 +199,7 @@ def test_smoke_real_move_flow(dirs, monkeypatch):
     asyncio.run(svc.run_once())
     asyncio.run(svc.run_once())
 
-    dest = b / "狂怒追缉 (2026)" / "S01" / "狂怒追缉.2026.S01E04.第04集.2160p.WEB-DL.H.265.mkv"
+    dest = b / "狂怒追缉.2026.S01E04.第04集.2160p.WEB-DL.H.265.mkv"
     assert dest.is_file()
     assert dest.with_suffix(".srt").is_file()  # 字幕伴行
     assert not sub.exists()  # 空目录已清理
@@ -254,8 +254,8 @@ def test_smoke_conflict_no_overwrite(dirs, monkeypatch):
         "app.media.service.analyze_file",
         lambda path, tmdb: asyncio.sleep(0, result=result),
     )
-    dest = b / "狂怒追缉 (2026)" / "S01" / result.proposed
-    dest.parent.mkdir(parents=True)
+    dest = b / result.proposed
+    dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(b"existing")
 
     asyncio.run(svc.run_once())

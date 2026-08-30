@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +27,7 @@ from app.media.service import (
     _TEMP_EXTS,
     _TEMP_TAILS,
     VIDEO_EXTS,
+    fast_move,
     retry_backoff_seconds,
 )
 
@@ -235,11 +235,11 @@ class Ed2kService:
             return True
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(f), str(dest))
+            fast_move(f, dest)
             for s in sides:
                 side_dest = dest.with_suffix(s.suffix)
                 if not side_dest.exists():
-                    shutil.move(str(s), str(side_dest))
+                    fast_move(s, side_dest)
             report.moved += 1 + len(sides)
         except OSError as exc:
             logger.error("ed2k 移动失败 %s → %s：%s", f.name, dest, exc)
@@ -302,7 +302,7 @@ class Ed2kService:
         while True:
             try:
                 report = await self.run_once()
-                if report.scanned or report.hashed or report.moved or report.dry_moved:
+                if report.hashed or report.moved or report.dry_moved or report.conflict or report.stuck:
                     logger.info("ed2k 扫描：%s", report.summary())
             except Exception as exc:
                 logger.error("ed2k 扫描轮异常：%s", exc, exc_info=exc)

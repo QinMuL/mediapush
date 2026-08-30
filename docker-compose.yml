@@ -18,6 +18,7 @@ services:
         max-file: "3"
     volumes:
       - ./data:/app/data
+      - /vol1/1000/media:/media
     # 健康检查：Bot 每 30s 写 /tmp/.heartbeat，此处检查文件是否在 120s 内更新过。
     # 连续 3 次失败（~2min）标记 unhealthy，配合 restart 策略自动恢复卡死场景。
     healthcheck:

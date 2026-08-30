@@ -4,7 +4,7 @@
 
 - 双通道分级：控制台 INFO（简洁故事线），文件 DEBUG（全量细节）
 - 单一 stdout handler（Docker 友好，日志走 Docker json-file 驱动）
-- 文件按天轮转（TimedRotatingFileHandler），保留 14 天，自动清理过期文件
+- 文件按大小轮转（RotatingFileHandler，5MB/文件 × 10 份），旧文件 gzip 压缩，自动清理过期文件
 - 彩色级别 + 缩短模块名（app.telegram.handlers → handlers），便于扫读
 - 第三方噪声库（telegram / httpx / urllib3 / asyncio）降级到 WARNING（两通道均抑制）
 - LOG_LEVEL 控制控制台级别；文件恒为 DEBUG
@@ -18,21 +18,21 @@
 
 from __future__ import annotations
 
+import gzip
 import logging
+import logging.handlers
+import os
 import re
 import sys
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime
-from logging.handlers import TimedRotatingFileHandler
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 # 日志时间戳固定用中国时区（容器 TZ 与本机无关，保证可读）
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
-
-# 本地文件轮转：按天（午夜切分），保留 14 天
-_FILE_BACKUP_DAYS = 14
 
 # ANSI 颜色
 _RESET = "\x1b[0m"
@@ -100,7 +100,7 @@ def make_trace_id(parsed) -> str:
 
 
 # ---------------------------------------------------------------------- #
-# 敏感信息兜底脱敏：防访问码/cookie/密钥意外落入日志（文件保留 14 天）
+# 敏感信息兜底脱敏：防访问码/cookie/密钥意外落入日志（文件留存多份压缩归档）
 # ---------------------------------------------------------------------- #
 _SENSITIVE_RE = re.compile(
     r"(?i)(password|passwd|passcode|token|api[_-]?key|secret|cookie"
@@ -165,18 +165,52 @@ class _ConsoleFormatter(logging.Formatter):
         return f"{ts} {tag} [{short}] {msg}"
 
 
+class _CompressedRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler + gzip 压缩：轮转时把旧文件压缩成 .gz，节省磁盘空间。
+
+    覆写 doRollover：先把已有 .N.gz 滚动（.N → .N+1），再把当前文件
+    gzip 成 .1.gz；保留最近 backupCount 份压缩文件，超出自动删除。
+    """
+
+    def doRollover(self) -> None:
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+        if self.backupCount > 0:
+            # 滚动已有压缩文件：.(N-1).gz → .N.gz，最老的丢弃
+            for i in range(self.backupCount - 1, 0, -1):
+                sfn = f"{self.baseFilename}.{i}.gz"
+                dfn = f"{self.baseFilename}.{i + 1}.gz"
+                if os.path.exists(sfn):
+                    if os.path.exists(dfn):
+                        os.remove(dfn)
+                    os.rename(sfn, dfn)
+            # 压缩当前文件 → .1.gz（失败则保留原文件，下一轮再试）
+            dfn = f"{self.baseFilename}.1.gz"
+            if os.path.exists(dfn):
+                os.remove(dfn)
+            try:
+                with open(self.baseFilename, "rb") as f_in, gzip.open(dfn, "wb") as f_out:
+                    f_out.writelines(f_in)
+                os.remove(self.baseFilename)
+            except Exception:  # noqa: BLE001,S110
+                pass
+        if not self.delay:
+            self.stream = self._open()
+
+
 def setup_logging(
     level: str = "INFO",
     *,
     use_color: bool | None = None,
     log_file: str | None = None,
 ) -> None:
-    """配置根日志：控制台 INFO 级 + 文件 DEBUG 级（按天轮转）。
+    """配置根日志：控制台 INFO 级 + 文件 DEBUG 级（按大小轮转 + gzip 压缩）。
 
     Args:
         level: 控制台日志级别字符串（DEBUG/INFO/WARNING/...），来自 LOG_LEVEL。
         use_color: 是否启用 ANSI 彩色（stdout）。None=按 stderr 是否 tty 自动判断。
-        log_file: 本地日志文件路径，启用文件持久化 + 按天轮转（保留 14 天）。
+        log_file: 本地日志文件路径，启用文件持久化 + 按大小轮转（5MB/文件 × 10 份，gzip 压缩）。
                   传 None 或空串则只输出 stdout。来自 LOG_FILE。
     """
     root = logging.getLogger()
@@ -201,20 +235,19 @@ def setup_logging(
     sh.addFilter(_SanitizeFilter())  # 兜底脱敏（handler 级：覆盖所有子 logger 记录）
     root.addHandler(sh)
 
-    # 2) 本地文件 handler（纯文本无颜色，按天轮转，持久化到挂载卷）——全量细节
+    # 2) 本地文件 handler（纯文本无颜色，按大小轮转 + gzip 压缩，持久化到挂载卷）——全量细节
     if log_file:
         try:
             Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-            fh = TimedRotatingFileHandler(
+            fh = _CompressedRotatingFileHandler(
                 log_file,
-                when="midnight",           # 每天午夜切分（容器 TZ）
-                backupCount=_FILE_BACKUP_DAYS,  # 保留 14 天，过期自动删除
+                maxBytes=5 * 1024 * 1024,   # 5MB per file
+                backupCount=10,               # 10 files = 50MB max（压缩后 ~15MB）
                 encoding="utf-8",
             )
-            fh.suffix = "%Y-%m-%d"         # 备份文件名：mediapush.log.2026-08-22
             fh.setLevel(logging.DEBUG)
             fh.setFormatter(_ConsoleFormatter(use_color=False))
-            fh.addFilter(_SanitizeFilter())  # 兜底脱敏（保留 14 天的文件更不能落敏感值）
+            fh.addFilter(_SanitizeFilter())  # 兜底脱敏（压缩文件同样不能落敏感值）
             root.addHandler(fh)
         except Exception as exc:  # noqa: BLE001 - 文件不可写不阻断启动
             # 退化：只 stdout，不写文件

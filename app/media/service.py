@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import shutil
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +42,25 @@ _TEMP_TAILS = (".!qb",)
 # 重试退避：1h 起指数翻倍，24h 封顶
 _RETRY_BASE_SECONDS = 3600
 _RETRY_CAP_SECONDS = 24 * 3600
+
+
+def fast_move(src: Path, dst: Path) -> None:
+    """快速移动：同文件系统用 rename（瞬时），跨挂载点用 hardlink+unlink（瞬时），
+    最终兜底 shutil.move（copy+delete，慢但通用）。
+
+    Docker bind-mount A/B/C 为独立挂载点时 os.rename 会 EXDEV，
+    但底层是同一物理文件系统 → os.link 硬链接可用且瞬时。
+    """
+    import errno
+    try:
+        os.rename(str(src), str(dst))
+        return
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+    # 跨挂载点：硬链接 + 删源（同物理文件系统下瞬时完成）
+    os.link(str(src), str(dst))
+    os.unlink(str(src))
 
 
 def retry_backoff_seconds(failures: int) -> int:
@@ -238,9 +257,9 @@ class LocalMediaService:
             return True
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(f), str(dest))
+            fast_move(f, dest)
             for s in subs:
-                shutil.move(str(s), str(dest.with_suffix(s.suffix)))
+                fast_move(s, dest.with_suffix(s.suffix))
             report.moved += 1 + len(subs)
         except OSError as exc:
             logger.error("本地媒体移动失败 %s → %s：%s", f.name, dest, exc)
@@ -307,7 +326,7 @@ class LocalMediaService:
         while True:
             try:
                 report = await self.run_once()
-                if report.scanned or report.moved or report.dry_moved:
+                if report.moved or report.dry_moved or report.stable or report.low_conf or report.conflict or report.stuck:
                     logger.info("本地媒体扫描：%s", report.summary())
             except Exception as exc:
                 logger.error("本地媒体扫描轮异常：%s", exc, exc_info=exc)
