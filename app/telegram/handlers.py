@@ -235,9 +235,85 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     else:
         lines.append(f"• 频道监控：{await _monitor_state_line(monitor)}")
     console_lvl = logging.getLogger().handlers[0].level if logging.getLogger().handlers else "?"
+    # 本地媒体 + ed2k 流水线 + ed2k 推送
+    if not s.local_media_enabled:
+        lines.append("• 本地媒体（A→B）：⬜ 未启用（LOCAL_MEDIA_ENABLED=false）")
+    else:
+        mode = "模拟" if s.local_media_dry_run else "实际重命名移动"
+        lines.append(
+            f"• 本地媒体（A→B）：✅（{mode}，每 {s.local_media_interval_seconds:g}s）"
+            + f" A={s.local_media_input_dir} B={s.local_media_output_dir}"
+        )
+    if not s.ed2k_enabled:
+        lines.append("• ed2k 哈希（B→C）：⬜ 未启用（ED2K_ENABLED=false）")
+    else:
+        mode = "模拟" if s.ed2k_dry_run else "实际移动"
+        lines.append(
+            f"• ed2k 哈希（B→C）：✅（{mode}，每 {s.ed2k_interval_seconds:g}s）"
+            + f" B={s.ed2k_input_dir} C={s.ed2k_output_dir}"
+        )
+    if not s.ed2k_push_enabled:
+        lines.append("• ed2k 推送（JSONL→频道）：⬜ 未启用（ED2K_PUSH_ENABLED=false）")
+    else:
+        mode = "模拟推送" if s.ed2k_push_dry_run else "实际推送"
+        report = "Admin 汇总：开" if s.ed2k_push_report_admin else ""
+        if s.ed2k_push_report_channel:
+            report += ("，" if report else "") + "频道同步：开"
+        lines.append(
+            f"• ed2k 推送（JSONL→频道）：✅（{mode}，每 {s.ed2k_push_interval_seconds:g}s"
+            + (f"；{report})" if report else "）")
+        )
+        pusher = getattr(container, "ed2k_pusher", None)
+        if pusher is not None:
+            # 内嵌一段 pusher status（缩进一下便于读）
+            for line in pusher.status_text().splitlines()[1:]:
+                lines.append(f"  {line}")
     lines.append(f"• 控制台日志：{logging.getLevelName(console_lvl)}（/loglevel 调整）")
 
     await update.message.reply_text("\n".join(lines))
+
+
+
+
+async def cmd_ed2k_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """ed2k 推送端详细状态 + pending（admin only）。"""
+    if not _is_admin(update, context):
+        await update.message.reply_text(_DENY_TEXT)
+        return
+    container = _container(context)
+    pusher = getattr(container, "ed2k_pusher", None)
+    if pusher is None:
+        await update.message.reply_text(
+            "⬜ ed2k 推送未启用（ED2K_PUSH_ENABLED=false），或尚未完成容器 build。"
+        )
+        return
+    text = pusher.status_text()
+    # pending 细节最多列出前 N 条
+    N = 8
+    pending_lines = []
+    import time as _t
+    now = _t.time()
+    pendings = []
+    for key, st in list(pusher._state.items()):
+        if key.startswith("_"):
+            continue
+        age_h = max(0.0, (now - float(st.get("first_seen", now))) / 3600.0)
+        pendings.append((age_h, key, st))
+    pendings.sort(key=lambda x: x[0], reverse=True)
+    for age_h, key, st in pendings[:N]:
+        f = st.get("failures", 0)
+        nr = float(st.get("next_retry", 0) or 0)
+        left = max(0.0, (nr - now) / 3600.0)
+        snippet = key if len(key) <= 72 else key[:69] + "..."
+        flag = " 🚨" if age_h / 24.0 >= container.settings.ed2k_push_stuck_days else ""
+        pending_lines.append(
+            f"• {age_h:.1f}h｜失败{f}｜下次{left:.1f}h{flag}｜{snippet}"
+        )
+    if pending_lines:
+        text += f"\n\n⏳ Pending Top {min(N, len(pendings))}（按等待时长倒序）：\n" + "\n".join(pending_lines)
+        if len(pendings) > N:
+            text += f"\n（剩 {len(pendings) - N} 条未列出）"
+    await update.message.reply_text(text, disable_web_page_preview=True)
 
 
 async def _monitor_state_line(monitor) -> str:
@@ -1364,6 +1440,7 @@ _BOT_COMMANDS: list[BotCommand] = [
     BotCommand("inspect", "巡检失效分享并撤卡"),
     BotCommand("dir", "目录监控管理（add/del/list）"),
     BotCommand("share", "扫描目录建永久分享并推送"),
+    BotCommand("ed2k_status", "ed2k 推送状态与 pending 队列"),
 ]
 
 
@@ -1478,6 +1555,7 @@ def register(application: Application) -> None:
     application.add_handler(CommandHandler("inspect", cmd_inspect))
     application.add_handler(CommandHandler("dir", cmd_dir))
     application.add_handler(CommandHandler("share", cmd_share))
+    application.add_handler(CommandHandler("ed2k_status", cmd_ed2k_status))
     application.add_handler(
         CallbackQueryHandler(
             on_edit_callback,

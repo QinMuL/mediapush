@@ -27,6 +27,9 @@ class Container:
         self.monitor = None
         self.inspector = None
         self.share_watcher = None
+        self.local_media = None
+        self.ed2k_service = None   # B→C 哈希流水线（app.media.ed2k_service.Ed2kService）
+        self.ed2k_pusher = None    # JSONL → 频道推送（app.media.ed2k_pusher.Ed2kPusherService）
         self.pan115_limiter = None
         self._built = False
 
@@ -143,6 +146,46 @@ class Container:
         else:
             logger.info("SHARE_WATCH_ENABLED=false，目录监控未启用")
 
+        # 本地媒体流水线（目录A → 重命名 → 目录B，start 在 bot post_init）
+        if self.settings.local_media_enabled:
+            from app.media.service import LocalMediaService
+
+            self.local_media = LocalMediaService(self, self.settings)
+            logger.info(
+                "本地媒体流水线已创建：A=%s → B=%s（%s）",
+                self.settings.local_media_input_dir,
+                self.settings.local_media_output_dir,
+                "DRY-RUN 模拟" if self.settings.local_media_dry_run else "实际移动",
+            )
+        else:
+            logger.info("LOCAL_MEDIA_ENABLED=false，本地媒体流水线未启用")
+
+        # ed2k 流水线（目录B → 哈希 → 目录C，start 在 bot post_init）
+        if self.settings.ed2k_enabled:
+            from app.media.ed2k_service import Ed2kService
+
+            self.ed2k_service = Ed2kService(self.settings)
+            logger.info(
+                "ed2k 流水线已创建：B=%s → C=%s（%s）",
+                self.settings.ed2k_input_dir,
+                self.settings.ed2k_output_dir,
+                "DRY-RUN 模拟" if self.settings.ed2k_dry_run else "实际移动",
+            )
+        else:
+            logger.info("ED2K_ENABLED=false，ed2k 流水线未启用")
+
+        # ed2k 推送（JSONL → ShareProcessor → 频道卡片，start 在 bot post_init）
+        if self.settings.ed2k_push_enabled:
+            from app.media.ed2k_pusher import Ed2kPusherService
+
+            self.ed2k_pusher = Ed2kPusherService(self, self.settings)
+            logger.info(
+                "ed2k 推送已创建：追读 data/ed2k_results.jsonl（%s）",
+                "DRY-RUN 模拟" if self.settings.ed2k_push_dry_run else "实际推送",
+            )
+        else:
+            logger.info("ED2K_PUSH_ENABLED=false，ed2k 推送未启用")
+
         self._built = True
 
     # ------------------------------------------------------------------ #
@@ -176,6 +219,12 @@ class Container:
             self.inspector.interval = max(0.5, old.inspect_interval_hours)
         if "share_watch_interval_minutes" in hot and self.share_watcher is not None:
             self.share_watcher.interval = max(1.0, old.share_watch_interval_minutes)
+        if "local_media_interval_seconds" in hot and self.local_media is not None:
+            self.local_media.interval = max(1.0, old.local_media_interval_seconds)
+        if "ed2k_interval_seconds" in hot and self.ed2k_service is not None:
+            self.ed2k_service.interval = max(1.0, old.ed2k_interval_seconds)
+        if "ed2k_push_interval_seconds" in hot and self.ed2k_pusher is not None:
+            self.ed2k_pusher.interval = max(1.0, old.ed2k_push_interval_seconds)
         if "pan115_request_interval" in hot and self.pan115_limiter is not None:
             self.pan115_limiter.set_base_interval(old.pan115_request_interval)
         if "log_level" in hot:
@@ -213,6 +262,12 @@ class Container:
         return self.telegram is not None
 
     async def close(self) -> None:
+        if self.ed2k_pusher is not None:
+            await self.ed2k_pusher.stop()
+        if self.ed2k_service is not None:
+            await self.ed2k_service.stop()
+        if self.local_media is not None:
+            await self.local_media.stop()
         if self.share_watcher is not None:
             await self.share_watcher.stop()
         if self.inspector is not None:

@@ -29,6 +29,7 @@ class MediaData:
     hdr: str = ""
     quality_info: list[str] = field(default_factory=list)
     raw: str = ""
+    release_group: str = ""  # 发布组（guessit release_group）
 
 
 @dataclass
@@ -88,6 +89,36 @@ def clean_name(name: str) -> str:
     s = _NOISE_TAG_RE.sub(" ", s)
     s = re.sub(r"\s{2,}", " ", s).strip()
     return s
+
+
+# ------------------------------------------------------------------ #
+# 发布组清洗：guessit 把帧率/色深/音轨数/H.264 残留误判为 release_group
+# ------------------------------------------------------------------ #
+_GROUP_TOKEN_NOISE_RE = re.compile(
+    r"^(?:\d+(?:[.,]\d+)?\s*fps|fps|h|hq|p\d+|10-?bit|\d*audios?|\d+)$",
+    re.IGNORECASE,
+)
+
+
+def clean_release_group(group: str) -> str:
+    """清洗 guessit 误判的发布组：噪音 token 过滤后取末 token。
+
+    实测样例：
+    - "4Audios HDVWEB" → "HDVWEB"（前 token 是音轨数误判）
+    - "23 976fps" / "H 1" / "P5" / "2Audio" → ""（全噪音）
+    - 末 token 需字母开头且 ≥3 字符（"H" / "265" 等无效）
+    """
+    g = (group or "").strip()
+    if not g:
+        return ""
+    tokens = [t for t in re.split(r"[\s._\-]+", g) if t]
+    kept = [t for t in tokens if not _GROUP_TOKEN_NOISE_RE.match(t)]
+    if not kept:
+        return ""
+    cand = kept[-1]
+    if len(cand) < 3 or not cand[0].isalpha():
+        return ""
+    return cand
 
 
 # ---------------------------------------------------------------------- #
@@ -167,6 +198,65 @@ def get_hdr(text: str) -> str:
     if "sdr" in t and not tags:
         tags.append("SDR")
     return " / ".join(tags)
+
+
+# ------------------------------------------------------------------ #
+# 播放平台标注：原文件名中的平台 token 参考保留，简称自动补全全称
+# ------------------------------------------------------------------ #
+# 长词在前防止短码先匹配截断（"Disney+" 优先于 "Disney"）。
+# 边界：前后不能是字母数字，保证是独立 token（防 "REMUX" 误含 "NF" 类）
+_PLATFORM_TOKENS = [
+    "Disney+", "Disney", "HBO Max", "HBO", "Max", "AppleTV+", "AppleTV",
+    "Netflix", "Amazon", "Peacock", "Paramount+", "Paramount",
+    "Crunchyroll", "Hulu", "Bilibili", "friDay", "Baha",
+    "NF", "AMZN", "DSNP", "ATVP", "PCOK", "PMTP", "HULU", "HMAX", "CR",
+]
+
+# 简称 → 全称补全表（不在表中的平台保留原写法）
+_PLATFORM_EXPAND = {
+    "nf": "Netflix",
+    "amzn": "Prime Video",
+    "dsnp": "Disney+",
+    "atvp": "Apple TV+",
+    "pcok": "Peacock",
+    "pmtp": "Paramount+",
+    "hulu": "Hulu",
+    "hmax": "Max",
+    "cr": "Crunchyroll",
+}
+
+
+def extract_platform(name: str) -> str:
+    """从原始文件名提取播放平台标注并补全简称（NF→Netflix、DSNP→Disney+…）。
+
+    匹配首命中的独立 token；简称走补全表，全称保留原写法；
+    无平台返回空。质量段如 "H.264"、"REMUX" 等由字母数字边界规则天然
+    排除误匹配。
+    """
+    best: tuple[int, str] | None = None
+    lowered = name.lower()
+    for tok in _PLATFORM_TOKENS:
+        idx = lowered.find(tok.lower())
+        while idx != -1:
+            lo, hi = idx, idx + len(tok)
+            if (
+                (idx == 0 or not (name[lo - 1].isalnum()))
+                and (hi >= len(name) or not (name[hi].isalnum()))
+            ):
+                # 多个命中取最靠前的（平台标注惯例在分辨率附近，靠标题更近）
+                if best is None or idx < best[0]:
+                    best = (idx, name[lo:hi])
+                break
+            idx = lowered.find(tok.lower(), idx + 1)
+    if best is None:
+        return ""
+    return _PLATFORM_EXPAND.get(best[1].lower(), best[1])
+
+
+def is_platform_token(text: str) -> bool:
+    """判断文本是否为平台 token（用于剔除被误判为发布组的平台名）。"""
+    t = (text or "").strip().lower()
+    return t in {p.lower() for p in _PLATFORM_TOKENS}
 
 
 # ---------------------------------------------------------------------- #
@@ -311,6 +401,8 @@ def parse_filename(name: str) -> MediaData:
         title = title[0] if title else cleaned
     title = str(title).strip()
 
+    release_group = str(_first(g.get("release_group")) or "").strip()
+
     year = _first(g.get("year"))
     year = int(year) if year else None
 
@@ -339,6 +431,7 @@ def parse_filename(name: str) -> MediaData:
         hdr=get_hdr(name),
         quality_info=get_quality_info(name),
         raw=name,
+        release_group=release_group,
     )
 
 

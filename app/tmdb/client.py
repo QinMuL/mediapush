@@ -72,8 +72,8 @@ class TMDBHelper:
             )
         return self._client
 
-    async def _get(self, path: str, params: dict) -> dict:
-        params = {**params, "language": self.language}
+    async def _get(self, path: str, params: dict, language: str | None = None) -> dict:
+        params = {**params, "language": language or self.language}
         # v3 key 走 query 参数（v4 token 已走 Bearer header，不重复注入）
         if not self.api_key.startswith("eyJ"):
             params["api_key"] = self.api_key
@@ -99,25 +99,36 @@ class TMDBHelper:
     # ------------------------------------------------------------------ #
     # 搜索
     # ------------------------------------------------------------------ #
-    async def search(self, title: str, year: int | None = None, media_type: str = "auto") -> list[dict]:
-        """搜索候选列表。带年无果回退无年。"""
-        if media_type == "auto":
-            res = await self._search_one(title, year, "movie")
-            res += await self._search_one(title, year, "tv")
-            return res
-        return await self._search_one(title, year, media_type)
+    async def search(
+        self,
+        title: str,
+        year: int | None = None,
+        media_type: str = "auto",
+        language: str | None = None,
+    ) -> list[dict]:
+        """搜索候选列表。带年无果回退无年。
 
-    async def _search_one(self, title: str, year: int | None, media_type: str) -> list[dict]:
+        language：覆盖实例默认语言（如英文查询词用 en-US 搜，匹配英文名）。
+        """
+        if media_type == "auto":
+            res = await self._search_one(title, year, "movie", language)
+            res += await self._search_one(title, year, "tv", language)
+            return res
+        return await self._search_one(title, year, media_type, language)
+
+    async def _search_one(
+        self, title: str, year: int | None, media_type: str, language: str | None = None
+    ) -> list[dict]:
         path = "/search/movie" if media_type == "movie" else "/search/tv"
         params: dict = {"query": title}
         year_key = "year" if media_type == "movie" else "first_air_date_year"
         if year:
             params[year_key] = year
-        data = await self._get(path, params)
+        data = await self._get(path, params, language)
         results = data.get("results", []) or []
         if not results and year:
             # 回退：不带年重搜
-            data = await self._get(path, {"query": title})
+            data = await self._get(path, {"query": title}, language)
             results = data.get("results", []) or []
         return results
 

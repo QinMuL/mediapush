@@ -97,6 +97,29 @@ class Settings:
     share_archive_dir: str = "/已分享"
     # 频道监控（Telethon）断连/重连/补扫等运行事件私信 admin
     monitor_notify: bool = True
+    # 本地媒体流水线（目录A监控 → namer 重命名 → 目录B，见 app/media/service.py）
+    local_media_enabled: bool = False
+    local_media_input_dir: str = ""    # 目录A：待处理资源（递归监控）
+    local_media_output_dir: str = ""   # 目录B：规范化输出（须在A之外）
+    local_media_dry_run: bool = True   # 模拟模式：只出日志不实际移动
+    local_media_interval_seconds: float = 10.0  # 扫描周期
+    local_media_stable_rounds: int = 3          # 稳定判定轮数（×周期）
+    local_media_stuck_days: float = 7.0          # 低置信卡死告警阈值（天）
+    # ed2k 流水线（目录B监控 → ed2k 哈希 → 目录C，见 app/media/ed2k_service.py）
+    ed2k_enabled: bool = False
+    ed2k_input_dir: str = ""                    # 目录B（= local_media_output_dir 通常一致）
+    ed2k_output_dir: str = ""                   # 目录C：ed2k 产出后归档（须在B之外）
+    ed2k_dry_run: bool = True                    # 模拟模式：只哈希+记 jsonl，不实际移动
+    ed2k_interval_seconds: float = 30.0          # 扫描周期（哈希重，30s 起步）
+    ed2k_stable_rounds: int = 3                  # 稳定判定轮数（×周期）
+    ed2k_stuck_days: float = 7.0                  # 哈希失败卡死告警（天）
+    # ed2k 推送（JSONL → ShareProcessor → TG_CHAT_ID_ED2K 频道）
+    ed2k_push_enabled: bool = False
+    ed2k_push_dry_run: bool = True                 # 模拟：只出日志不实际调用 processor
+    ed2k_push_interval_seconds: float = 60.0       # 推送扫描周期秒（60s 起步，卡片+TMDB 较慢）
+    ed2k_push_stuck_days: float = 7.0              # 推送失败卡死告警（天）
+    ed2k_push_report_admin: bool = True            # 每轮结束把汇总发给 TG_ADMIN_IDS
+    ed2k_push_report_channel: bool = False         # 每轮结束把汇总同步发到 TG_CHAT_ID_ED2K（慎用，会刷频道）
 
     @classmethod
     def load(cls, *, dotenv_override: bool = False) -> Settings:
@@ -165,6 +188,36 @@ class Settings:
             share_watch_notify=_env_bool("SHARE_WATCH_NOTIFY", True),
             share_archive_dir=os.getenv("SHARE_ARCHIVE_DIR", "/已分享").strip(),
             monitor_notify=_env_bool("MONITOR_NOTIFY", True),
+            local_media_enabled=_env_bool("LOCAL_MEDIA_ENABLED", False),
+            local_media_input_dir=os.getenv("LOCAL_MEDIA_INPUT_DIR", "").strip(),
+            local_media_output_dir=os.getenv("LOCAL_MEDIA_OUTPUT_DIR", "").strip(),
+            local_media_dry_run=_env_bool("LOCAL_MEDIA_DRY_RUN", True),
+            local_media_interval_seconds=max(
+                1.0, _env_float("LOCAL_MEDIA_INTERVAL_SECONDS", 10.0)
+            ),
+            local_media_stable_rounds=max(
+                1, _env_int("LOCAL_MEDIA_STABLE_ROUNDS", 3)
+            ),
+            local_media_stuck_days=max(
+                1.0, _env_float("LOCAL_MEDIA_STUCK_DAYS", 7.0)
+            ),
+            ed2k_enabled=_env_bool("ED2K_ENABLED", False),
+            ed2k_input_dir=os.getenv("ED2K_INPUT_DIR", "").strip(),
+            ed2k_output_dir=os.getenv("ED2K_OUTPUT_DIR", "").strip(),
+            ed2k_dry_run=_env_bool("ED2K_DRY_RUN", True),
+            ed2k_interval_seconds=max(
+                1.0, _env_float("ED2K_INTERVAL_SECONDS", 30.0)
+            ),
+            ed2k_stable_rounds=max(1, _env_int("ED2K_STABLE_ROUNDS", 3)),
+            ed2k_stuck_days=max(1.0, _env_float("ED2K_STUCK_DAYS", 7.0)),
+            ed2k_push_enabled=_env_bool("ED2K_PUSH_ENABLED", False),
+            ed2k_push_dry_run=_env_bool("ED2K_PUSH_DRY_RUN", True),
+            ed2k_push_interval_seconds=max(
+                1.0, _env_float("ED2K_PUSH_INTERVAL_SECONDS", 60.0)
+            ),
+            ed2k_push_stuck_days=max(1.0, _env_float("ED2K_PUSH_STUCK_DAYS", 7.0)),
+            ed2k_push_report_admin=_env_bool("ED2K_PUSH_REPORT_ADMIN", True),
+            ed2k_push_report_channel=_env_bool("ED2K_PUSH_REPORT_CHANNEL", False),
         )
         settings._ensure_dirs()
         return settings
@@ -190,6 +243,33 @@ class Settings:
             warns.append("PROXY_URL 未配置，TG/TMDB 在国内网络可能无法访问。")
         if self.monitor_enabled and not (self.tg_api_id and self.tg_api_hash):
             warns.append("TG_API_ID/TG_API_HASH 未配置，频道监控不启动。")
+        if self.local_media_enabled:
+            if not self.local_media_input_dir or not self.local_media_output_dir:
+                warns.append(
+                    "LOCAL_MEDIA_ENABLED 已开但 INPUT/OUTPUT 目录未配置，本地媒体流水线不启动。"
+                )
+            else:
+                inp, out = Path(self.local_media_input_dir), Path(self.local_media_output_dir)
+                if inp != out and out in inp.parents:
+                    warns.append("LOCAL_MEDIA_OUTPUT_DIR 不得位于 INPUT 目录内（会被反复扫描）。")
+        if self.ed2k_enabled:
+            if not self.ed2k_input_dir or not self.ed2k_output_dir:
+                warns.append("ED2K_ENABLED 已开但 INPUT/OUTPUT 目录未配置，ed2k 流水线不启动。")
+            else:
+                b, c = Path(self.ed2k_input_dir), Path(self.ed2k_output_dir)
+                if b != c and c in b.parents:
+                    warns.append("ED2K_OUTPUT_DIR 不得位于 INPUT 目录内（会被反复哈希）。")
+                bo = Path(self.local_media_output_dir) if self.local_media_enabled else None
+                if bo and b != bo and bo.exists() and b.exists() and b.resolve() != bo.resolve():
+                    warns.append(
+                        f"ED2K_INPUT_DIR={self.ed2k_input_dir} 与 LOCAL_MEDIA_OUTPUT_DIR="
+                        f"{self.local_media_output_dir} 不一致——A→B→C 链路需要衔接，确认你的配置。"
+                    )
+        if self.ed2k_push_enabled:
+            if not self.tg_chat_id_ed2k and not self.tg_chat_id:
+                warns.append(
+                    "ED2K_PUSH_ENABLED 已开但 TG_CHAT_ID_ED2K/TG_CHAT_ID 均未配置——推送无目标频道。"
+                )
         return warns
 
     def is_admin(self, user_id: int | None) -> bool:
@@ -214,4 +294,15 @@ HOT_RELOAD_FIELDS: frozenset[str] = frozenset({
     "share_archive_dir",
     "monitor_notify",
     "monitor_batch_seconds",
+    "local_media_dry_run",
+    "local_media_interval_seconds",
+    "local_media_stable_rounds",
+    "local_media_stuck_days",
+    "ed2k_dry_run",
+    "ed2k_interval_seconds",
+    "ed2k_stable_rounds",
+    "ed2k_stuck_days",
+    "ed2k_push_dry_run",
+    "ed2k_push_interval_seconds",
+    "ed2k_push_stuck_days",
 })

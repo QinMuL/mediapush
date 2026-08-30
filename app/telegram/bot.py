@@ -113,6 +113,15 @@ class TelegramService:
                 await self.container.inspector.stop()
             if self.container.share_watcher is not None:
                 await self.container.share_watcher.stop()
+            # 本地媒体流水线：停止后台循环
+            if self.container.local_media is not None:
+                await self.container.local_media.stop()
+            # ed2k B→C 哈希流水线：停止后台循环
+            if self.container.ed2k_service is not None:
+                await self.container.ed2k_service.stop()
+            # ed2k 推送（JSONL→频道）：停止后台循环
+            if self.container.ed2k_pusher is not None:
+                await self.container.ed2k_pusher.stop()
             if self.container.monitor is not None:
                 await self.container.monitor.stop()
             if self.container.monitor_store is not None:
@@ -150,6 +159,21 @@ class TelegramService:
             if self.container.share_watcher is not None:
                 app.bot_data["_share_watcher_task"] = asyncio.create_task(
                     self.container.share_watcher.start()
+                )
+            # 本地媒体流水线（目录A → 重命名 → 目录B）：后台循环（独立任务）
+            if self.container.local_media is not None:
+                app.bot_data["_local_media_task"] = asyncio.create_task(
+                    self.container.local_media.start()
+                )
+            # ed2k 流水线（目录B → 哈希 → 目录C）：后台循环（独立任务）
+            if self.container.ed2k_service is not None:
+                app.bot_data["_ed2k_hash_task"] = asyncio.create_task(
+                    self.container.ed2k_service.start()
+                )
+            # ed2k 推送（JSONL → 频道卡片）：后台循环（独立任务）
+            if self.container.ed2k_pusher is not None:
+                app.bot_data["_ed2k_push_task"] = asyncio.create_task(
+                    self.container.ed2k_pusher.start()
                 )
 
         builder = (

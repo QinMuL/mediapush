@@ -1,5 +1,7 @@
 from app.parser.media_parser import (
     analyze_share,
+    clean_release_group,
+    extract_platform,
     extract_season_episode,
     extract_tmdb_id,
     get_hdr,
@@ -8,6 +10,47 @@ from app.parser.media_parser import (
     parse_filename,
 )
 from app.providers.base import ShareFile
+
+
+# ---------------- 发布组清洗 ---------------- #
+def test_clean_release_group_noise():
+    """guessit 误判为发布组的噪音 token 全部清洗为空。"""
+    assert clean_release_group("23 976fps") == ""
+    assert clean_release_group("H 1") == ""
+    assert clean_release_group("P5") == ""
+    assert clean_release_group("2Audio") == ""
+    assert clean_release_group("H") == ""
+    assert clean_release_group("") == ""
+
+
+def test_clean_release_group_multitoken():
+    """多 token 误判取末有效 token（"4Audios HDVWEB" → "HDVWEB"）。"""
+    assert clean_release_group("4Audios HDVWEB") == "HDVWEB"
+
+
+def test_clean_release_group_normal():
+    assert clean_release_group("HiveWeb") == "HiveWeb"
+    assert clean_release_group("BlackTV") == "BlackTV"
+    assert clean_release_group("ZerTV") == "ZerTV"
+
+
+# ---------------- 播放平台提取 ---------------- #
+def test_extract_platform_common():
+    assert extract_platform("Mousetrap.S01E02.2026.2160p.NF.WEB-DL.H265.mkv") == "Netflix"
+    assert extract_platform("Flex.x.Cop.2024.S02E02.1080p.DSNP.WEB-DL.mkv") == "Disney+"
+    assert extract_platform("Lioness.S03E04.2026.2160p.AMZN.WEB-DL.H265.mkv") == "Prime Video"
+    assert extract_platform("Furious.S01E04.2026.2160p.Disney+.WEB-DL.H265.mkv") == "Disney+"
+    assert extract_platform("Lanterns.2026.S01E01.2160p.Max.WEB-DL.H265.mkv") == "Max"
+    assert extract_platform(
+        "共感细胞.2026.S01E04.第4集.1080p.friDay.WEB-DL.SDR.H.264.mkv"
+    ) == "friDay"
+
+
+def test_extract_platform_none():
+    """无平台标注返回空；质量 token（REMUX/H.264 等）不误匹配。"""
+    assert extract_platform("藏锋.2026.S01E01.2160p.WEB-DL.H265.DDP.2.0.mp4") == ""
+    assert extract_platform("Harakiri.1962.1080p.BluRay.REMUX.AVC.LPCM.mkv") == ""
+    assert extract_platform("仙逆.2023.WEB-DL.S01E154.mkv") == ""
 
 
 def test_extract_single_episode():
