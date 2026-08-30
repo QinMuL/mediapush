@@ -227,7 +227,6 @@ class Ed2kPusherService:
     # ------------------------------------------------------------------ #
     def status_text(self) -> str:
         """给 /ed2k_status 命令用的状态文本：offset、pending、卡死、最近汇总。"""
-        import datetime as _dt
         offset = self._state.get("_offset", 0)
         file_size = 0
         try:
@@ -266,7 +265,7 @@ class Ed2kPusherService:
             lines.append(f"• 最近一轮：{last}")
         return chr(10).join(lines)
 
-    async def _send_report(self, report: "PushReport") -> None:
+    async def _send_report(self, report: PushReport) -> None:
         """把本轮汇总发 admin / 目标频道（按配置）。发送失败只记日志，不中断循环。"""
         if not (self.settings.ed2k_push_report_admin or self.settings.ed2k_push_report_channel):
             return
@@ -275,11 +274,8 @@ class Ed2kPusherService:
             report.read or report.pushed or report.dry_pushed
             or report.skipped_dup or report.failed or report.stuck
         )
-        pending_count = sum(1 for k in self._state.keys() if not k.startswith("_"))
-        if not has_action and not (report.stuck or pending_count and False):
-            # 如果没任何动作，也没卡死，就静默（省 admin 消息量）
-            if not report.stuck:
-                return
+        if not has_action and not report.stuck:
+            return
         tg = getattr(self.container, "telegram", None)
         if tg is None:
             return
@@ -288,13 +284,11 @@ class Ed2kPusherService:
             if self.settings.ed2k_push_dry_run
             else "📤 ed2k 推送汇总"
         )
-        import datetime as _dt
-        ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
         text = f"<b>{header}</b>  <i>{ts}</i>" + chr(10) + report.summary()
         targets: list[int | str] = []
         if self.settings.ed2k_push_report_admin:
-            for uid in getattr(self.settings, "tg_admin_ids", []) or []:
-                targets.append(uid)
+            targets = list(getattr(self.settings, "tg_admin_ids", []) or [])
         if self.settings.ed2k_push_report_channel:
             cid = getattr(self.settings, "tg_chat_id_ed2k", None) or getattr(
                 self.settings, "tg_chat_id", None
@@ -333,7 +327,7 @@ def _time_now_proxy() -> float:
                         or report.skipped_dup or report.failed or report.stuck):
                     logger.info("ed2k 推送：%s", report.summary())
                     await self._send_report(report)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.error("ed2k 推送轮异常：%s", exc, exc_info=exc)
             await asyncio.sleep(self.interval)
 

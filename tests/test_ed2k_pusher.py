@@ -1,11 +1,14 @@
 ﻿"""Ed2kPusherService 单测。"""
 from __future__ import annotations
+
 import asyncio
 import json
 from pathlib import Path
+
 import pytest
+
 from app.core.processor import ProcessResult
-from app.media.ed2k_pusher import PushReport, Ed2kPusherService
+from app.media.ed2k_pusher import Ed2kPusherService, PushReport
 
 
 class _FakeSettings:

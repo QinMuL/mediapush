@@ -172,7 +172,7 @@ class Ed2kService:
                 continue
             try:
                 ok = await self._process(f, report, now)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.error("ed2k 处理异常 %s：%s", f.name, exc, exc_info=exc)
                 self._record_failure(f, f"未预期异常: {exc}", report, now)
                 continue
@@ -299,7 +299,7 @@ class Ed2kService:
                 report = await self.run_once()
                 if report.scanned or report.hashed or report.moved or report.dry_moved:
                     logger.info("ed2k 扫描：%s", report.summary())
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.error("ed2k 扫描轮异常：%s", exc, exc_info=exc)
             await asyncio.sleep(self.interval)
 

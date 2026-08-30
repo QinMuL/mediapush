@@ -265,8 +265,7 @@ class Settings:
                         f"ED2K_INPUT_DIR={self.ed2k_input_dir} 与 LOCAL_MEDIA_OUTPUT_DIR="
                         f"{self.local_media_output_dir} 不一致——A→B→C 链路需要衔接，确认你的配置。"
                     )
-        if self.ed2k_push_enabled:
-            if not self.tg_chat_id_ed2k and not self.tg_chat_id:
+        if self.ed2k_push_enabled and not self.tg_chat_id_ed2k and not self.tg_chat_id:
                 warns.append(
                     "ED2K_PUSH_ENABLED 已开但 TG_CHAT_ID_ED2K/TG_CHAT_ID 均未配置——推送无目标频道。"
                 )

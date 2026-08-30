@@ -95,7 +95,7 @@ async def ed2k_hash_file(path: str | Path, chunk_size: int = ED2K_CHUNK) -> tupl
         return md4_digest(b""), 0
 
     chunks: list[bytes] = []
-    with p.open("rb") as f:
+    with p.open("rb") as f:  # noqa: ASYNC230 文件打开轻量，读取已走 executor
         pending = bytearray()
         while True:
             buf = await loop.run_in_executor(None, f.read, _READ_BUF)
