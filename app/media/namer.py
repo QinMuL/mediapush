@@ -91,7 +91,10 @@ def parse_for_naming(name: str) -> MediaData:
 # ---------------------------------------------------------------------- #
 # TMDB 硬门槛匹配
 # ---------------------------------------------------------------------- #
-_TITLE_STRIP_RE = re.compile(r"[\s:：!！.·\-_''\"()（）]")
+# 标点折叠：全/半角逗号、冒号、句号、引号、括号、空格、连字符全部去掉后再
+# 小写比较——避免 "Four Hands, Two Sonatas" vs "Four Hands Two Sonatas"
+# 或 "四手联弹，两首奏鸣曲" vs "四手联弹两首奏鸣曲" 被判成不同。
+_TITLE_STRIP_RE = re.compile(r"[\s,，:：;；!！.。·\-_''\"()（）\[\]【】<>《》]")
 
 
 def _norm_title(s: str) -> str:
@@ -237,6 +240,10 @@ async def _search_round(
 
     返回 (匹配候选列表, 错误消息或 None)。搜索异常时 err 非空；
     候选为空/标题不匹配时返回 ([], None)，由调用方决定是否进入下一轮。
+
+    跨语种兜底：标题不过但类型/年份全对（near misses），对每条拉
+    TMDB 详情取 translations/AKA 别名后再跑一次标题匹配——覆盖韩剧/
+    外语片 zh-CN 搜索条目只有中文标题的情况。
     """
     candidates: list[dict] = []
     seen: set[int] = set()
@@ -252,14 +259,37 @@ async def _search_round(
         return [], f"TMDB 搜索失败：{exc}"
     if not candidates:
         return [], "TMDB 无搜索结果"
-    return _filter_candidates(candidates, parsed, queries), None
+
+    matched, near = _filter_candidates(candidates, parsed, queries)
+    if matched or not near:
+        return matched, None
+
+    # near 兜底：最多查 5 条详情，防大量候选打爆 TMDB 限流
+    for c in near[:5]:
+        try:
+            details = await tmdb.get_details(int(c["id"]), parsed.media_type)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("TMDB near-miss 详情 %s 失败：%s", c.get("id"), exc)
+            continue
+        alt_pool = _detail_title_pool(details)
+        if any(_title_match(q, alt_pool) for q in queries):
+            matched.append(c)
+    return matched, None
 
 
 def _filter_candidates(
     candidates: list[dict], parsed: MediaData, queries: list[str]
-) -> list[dict]:
-    """硬门槛过滤：类型 + 年份 + 标题匹配。"""
+) -> tuple[list[dict], list[dict]]:
+    """硬门槛过滤：类型 + 年份 + 标题匹配。
+
+    返回 (matched, near_misses)：
+    - matched：标题也命中
+    - near_misses：类型+年份命中，但 search 结果的 title/original_name
+      标题没命中（典型：zh-CN 返回中文，搜索词是英文发布名，需查详情
+      的 translations/AKA 拿英文别名再判定）。
+    """
     matched: list[dict] = []
+    near: list[dict] = []
     for c in candidates:
         if _kind(c) != parsed.media_type:
             continue
@@ -277,7 +307,19 @@ def _filter_candidates(
         ]
         if any(_title_match(q, titles) for q in queries):
             matched.append(c)
-    return matched
+        else:
+            near.append(c)
+    return matched, near
+
+
+def _detail_title_pool(details: dict) -> list[str]:
+    """详情级别的标题池：本地名 + 原名 + 别名。"""
+    pool = [
+        details.get("title") or "",
+        details.get("original_title") or "",
+    ]
+    pool.extend(details.get("alt_titles") or [])
+    return [t for t in pool if t]
 
 
 # ---------------------------------------------------------------------- #

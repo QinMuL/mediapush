@@ -65,10 +65,14 @@ class TMDBHelper:
             # v3 API key（32 位 hex）不支持 Bearer，改走 query 参数（_get 中注入）。
             if self.api_key.startswith("eyJ"):
                 headers["Authorization"] = f"Bearer {self.api_key}"
+            # trust_env=True：同时尊重 PROXY_URL（显式）和系统/进程的
+            # HTTP_PROXY/HTTPS_PROXY 环境变量——用户开了代理工具时 env 通常有，
+            # 避免"明明开代理 Python 还连不上 TMDB"。
             self._client = httpx.AsyncClient(
                 proxy=self.proxy_url or None,
                 timeout=httpx.Timeout(15.0),
                 headers=headers,
+                trust_env=True,
             )
         return self._client
 
@@ -187,7 +191,9 @@ class TMDBHelper:
                 return cached
 
         path = f"/{'movie' if media_type == 'movie' else 'tv'}/{tmdb_id}"
-        params = {"append_to_response": "credits,images"}
+        # translations（20 种语言标题）+ alternative_titles（AKA），是韩剧/
+        # 外语片名跨语种命中的关键（zh-CN 搜出中文标题≠英文名发布名）。
+        params = {"append_to_response": "credits,images,translations,alternative_titles"}
         data = await self._get(path, params)
         normalized = self._normalize(data, media_type)
 
@@ -196,12 +202,14 @@ class TMDBHelper:
         return normalized
 
     def _normalize(self, data: dict, media_type: str) -> dict:
+        alt_titles: list[str] = self._collect_alt_titles(data)
         if media_type == "movie":
             return {
                 "tmdb_id": data.get("id"),
                 "media_type": "movie",
                 "title": data.get("title") or data.get("original_title") or "",
                 "original_title": data.get("original_title") or "",
+                "alt_titles": alt_titles,
                 "year": self._year_of(data.get("release_date")),
                 "release_date": data.get("release_date") or "",
                 "overview": data.get("overview") or "",
@@ -234,6 +242,7 @@ class TMDBHelper:
             "media_type": "tv",
             "title": data.get("name") or data.get("original_name") or "",
             "original_title": data.get("original_name") or "",
+            "alt_titles": alt_titles,
             "year": self._year_of(data.get("first_air_date")),
             "release_date": data.get("first_air_date") or "",
             "overview": data.get("overview") or "",
@@ -251,6 +260,38 @@ class TMDBHelper:
             "countries": data.get("origin_country")
             or [c["iso_3166_1"] for c in data.get("production_countries", [])],
         }
+
+    @staticmethod
+    def _collect_alt_titles(data: dict) -> list[str]:
+        """从 translations + alternative_titles 收集别名，给跨语种标题匹配兜底。
+
+        只取英文（发布组通用）+ 中文（中文搜索）+ 无地区 AKA，过滤空串
+        与 title/original_name 的重复交给调用方去重。
+        """
+        titles: list[str] = []
+        for t in data.get("translations", {}).get("translations", []) or []:
+            lang = t.get("iso_639_1", "")
+            d = t.get("data") or {}
+            name = d.get("name") or d.get("title") or ""
+            if lang in ("en", "zh", "ko") and name:
+                titles.append(name.strip())
+        # TV: alternative_titles.results[], Movie: alternative_titles.titles[]
+        at = data.get("alternative_titles") or {}
+        for item in at.get("results", []) or at.get("titles", []) or []:
+            if isinstance(item, dict):
+                n = item.get("title") or ""
+            else:
+                n = str(item or "")
+            if n:
+                titles.append(n.strip())
+        # 去重保序
+        seen: set[str] = set()
+        uniq: list[str] = []
+        for n in titles:
+            if n and n not in seen:
+                seen.add(n)
+                uniq.append(n)
+        return uniq
 
     @staticmethod
     def _year_of(date_str: str | None) -> int | None:

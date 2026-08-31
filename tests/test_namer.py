@@ -342,7 +342,88 @@ def test_match_title_containment():
           "first_air_date": "2025-01-01"}],
         {"id": 1, "title": "九阳武神", "year": 2025},
     )
-    p = MediaData(title="九阳武神", year=2025, media_type="tv",
+    p = MediaData(title="九阳武神", year=2026, media_type="tv",
                   raw="x.mkv", season=1, episode=3)
     details, reasons = _run_match(tmdb, p)
     assert details is not None and not reasons
+
+
+# ================== 新韩剧标题匹配（多语言+标点折叠）==================
+def test_match_kdrama_en_name_zh_cn_candidate():
+    """zh-CN 搜索返回中文标题+韩语原名，查询词是英文名时通过
+    details translations/AKA 拿到英文标题后匹配。"""
+    class _TransFakeTMDB:
+        def __init__(self):
+            self.searched = []
+            self.detail_ids = []
+
+        async def search(self, title, year, media_type="auto", language=None):
+            self.searched.append((title, language))
+            # 真实 TMDB zh-CN 的返回：name 是中文，original_name 是韩语
+            return [{"id": 305644, "name": "四手联弹，两首奏鸣曲",
+                     "original_name": "포핸즈", "first_air_date": "2026-08-29"}]
+
+        async def get_details(self, tmdb_id, media_type):
+            self.detail_ids.append(tmdb_id)
+            # alt_titles 是 TMDBHelper._normalize 已规范化后的结果
+            return {
+                "id": 305644, "title": "四手联弹，两首奏鸣曲",
+                "year": 2026, "first_air_date": "2026-08-29",
+                "alt_titles": [
+                    "Four Hands, Two Sonatas",
+                    "四手联弹，两首奏鸣曲",
+                    "Four Hands",
+                    "Pohaenjeu",
+                ],
+            }
+
+    p = MediaData(title="Four Hands Two Sonatas", year=2026, media_type="tv",
+                  raw="Four.Hands.Two.Sonatas.2026.S01E01.1080p.NF.WEB-DL.AAC2.0.H.264-HiveWeb.mkv",
+                  season=1, episode=1)
+    details, reasons = _run_match(_TransFakeTMDB(), p)
+    assert details is not None and not reasons, f"reasons={reasons}"
+
+
+def test_match_title_punctuation_fold_commas():
+    """全角逗号「，」和半角「,」视为同一字符（含在_标题中匹配不上）。"""
+    tmdb = _FakeTMDB(
+        [{"id": 1, "name": "四手联弹，两首奏鸣曲", "original_name": "포핸즈",
+          "first_air_date": "2026-08-29"}],
+        {"id": 1, "title": "四手联弹，两首奏鸣曲", "year": 2026},
+    )
+    # 全角逗号 + 半角逗号（详情翻译名）都能与查询词「四手联弹，两首奏鸣曲」匹配
+    p = MediaData(title="四手联弹，两首奏鸣曲", year=2026, media_type="tv",
+                  raw="x.mkv", season=1, episode=1)
+    details, reasons = _run_match(tmdb, p)
+    assert details is not None and not reasons, f"reasons={reasons}"
+
+    # 标题里全角逗号，查询词无逗号（文件名自动把标点当空格剥离了）
+    p2 = MediaData(title="四手联弹 两首奏鸣曲", year=2026, media_type="tv",
+                   raw="x.mkv", season=1, episode=1)
+    details2, reasons2 = _run_match(tmdb, p2)
+    assert details2 is not None and not reasons2, f"reasons={reasons2}"
+
+
+def test_match_aka_titles_considered():
+    """AKA（alternative_titles）里有英文短名时，也进入标题匹配池。"""
+    class _AkaTMDB:
+        def __init__(self):
+            self.detail_ids = []
+
+        async def search(self, title, year, media_type="auto", language=None):
+            # 返回标题是中文，original_name 韩语，都对不上 Four Hands
+            return [{"id": 305644, "name": "四手联弹，两首奏鸣曲",
+                     "original_name": "포핸즈", "first_air_date": "2026-08-29"}]
+
+        async def get_details(self, tmdb_id, media_type):
+            self.detail_ids.append(tmdb_id)
+            return {
+                "id": 305644, "title": "四手联弹，两首奏鸣曲",
+                "year": 2026,
+                "alt_titles": ["Four Hands", "Pohaenjeu", "Po-haen-jeu"],
+            }
+
+    p = MediaData(title="Four Hands", year=2026, media_type="tv",
+                  raw="Four.Hands.2026.S01E01.mkv", season=1, episode=1)
+    details, reasons = _run_match(_AkaTMDB(), p)
+    assert details is not None and not reasons, f"reasons={reasons}"
