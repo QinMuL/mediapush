@@ -24,13 +24,22 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 
 from app.core.link_parser import ParsedShare
 from app.logging_config import make_trace_id, trace_id
+from app.media.service import retry_backoff_seconds
 from app.providers.exceptions import Pan115Error
 
 logger = logging.getLogger(__name__)
+
+# 不可恢复错误关键词（115 账号风控，重试无意义）→ 标记 blocked，不再自动重试
+_BLOCKED_KEYWORDS: tuple[str, ...] = ("违规", "禁止分享")
+# blocked 的 next_retry_at 设为 365 天后（实质不再自动重试，需人工复位）
+_BLOCKED_RETRY_OFFSET = 365 * 86400
+# next_retry_at 距当前超过此阈值视为 blocked（区分普通退避 vs 违规永久跳过）
+_BLOCKED_THRESHOLD = 30 * 86400
 
 
 @dataclass
@@ -40,10 +49,12 @@ class WatchReport:
     dirs: int = 0
     new_items: int = 0  # 发现的未分享子目录
     shared: int = 0  # 建分享+推送成功
-    retried: int = 0  # 复用已建分享码重推成功（此前 pending）
+    retried: int = 0  # 复用已建分享码重推成功（此前 pending/failed）
     auditing: int = 0  # 115 审核中/快照生成中（新分享正常中间态，非失败）
-    failed: int = 0  # 建分享/推送失败（下轮重试，复用已建的码）
+    failed: int = 0  # 本轮新失败（含违规 blocked）
     skipped: int = 0  # 已推送（ok）跳过
+    blocked: int = 0  # 不可恢复（违规等），不再自动重试
+    backoff: int = 0  # 退避中跳过（未到期，含 blocked 永久跳过）
     items: list[dict] = field(default_factory=list)  # 成功明细
     failed_items: list[dict] = field(default_factory=list)  # 失败明细（含原因）
     audit_items: list[dict] = field(default_factory=list)  # 审核中明细
@@ -58,7 +69,11 @@ class WatchReport:
         if self.auditing:
             s += f" · ⏳ 115 审核中 {self.auditing}（下轮复用码重试）"
         if self.failed:
-            s += f" · ⚠️ 失败 {self.failed}（下轮复用分享码重试）"
+            s += f" · ⚠️ 失败 {self.failed}"
+        if self.blocked:
+            s += f" · 🚫 违规 {self.blocked}（不再自动重试）"
+        if self.backoff:
+            s += f" · ⏳ 退避中 {self.backoff}"
         if self.skipped:
             s += f" · ⏭️ 已分享 {self.skipped}"
         return s
@@ -118,13 +133,23 @@ class ShareWatcher:
                     # ok 却仍在监控目录（上次移动失败/归档中途启用）→ 补移
                     await self._try_archive(pan115, fid, name)
                     continue
+                # failed 状态：退避中或违规 blocked → 未到期跳过
+                if record is not None and record["status"] == "failed":
+                    now = time.time()
+                    if record["next_retry_at"] > now:
+                        if record["next_retry_at"] - now > _BLOCKED_THRESHOLD:
+                            report.blocked += 1
+                        else:
+                            report.backoff += 1
+                        continue
+                    # 到期：放行重试（record 传下去；share_code 空则重建分享）
 
                 if record is None:
                     report.new_items += 1
                 # pending：复用已建的 share_code 重推（新分享常处审核/快照中，
                 # 读取失败 → 登记 pending → 下轮复用同码重试，绝不重复建分享）
                 try:
-                    is_retry = record is not None
+                    is_retry = record is not None and bool(record.get("share_code"))
                     await self._share_and_push(
                         processor, cache, pan115, dir_id, fid, name, record
                     )
@@ -140,18 +165,13 @@ class ShareWatcher:
                             path, name,
                         )
                     else:
-                        report.failed += 1
-                        report.failed_items.append(
-                            {"dir": path, "name": name, "reason": msg}
+                        await self._record_failure(
+                            cache, report, dir_id, fid, name, record, msg, path
                         )
-                        logger.warning(
-                            "目录监控处理失败（%s/%s）：%s", path, name, exc
-                        )
-                except Exception as exc:  # 失败保留 pending 记录，下轮复用码重试
-                    report.failed += 1
-                    report.failed_items.append(
-                        {"dir": path, "name": name, "reason": str(exc) or
-                         exc.__class__.__name__}
+                except Exception as exc:  # 推送失败等：登记退避，码留存下轮复用
+                    msg = str(exc) or exc.__class__.__name__
+                    await self._record_failure(
+                        cache, report, dir_id, fid, name, record, msg, path
                     )
                     logger.exception("目录监控处理失败（%s/%s）", path, name)
                 else:
@@ -167,19 +187,47 @@ class ShareWatcher:
             logger.info("目录监控完成：%s", report.summary())
         return report
 
+    async def _record_failure(
+        self, cache, report, dir_id: int, fid: int, name: str,
+        record: dict | None, msg: str, path: str,
+    ) -> None:
+        """登记失败：违规→blocked（不再自动重试）；否则指数退避（1h→…→24h）。
+
+        upsert 保留已有 share_code（pending 推送失败时码留存，下轮复用）。
+        """
+        now = time.time()
+        fail_count = (record or {}).get("fail_count", 0)
+        blocked = any(k in msg for k in _BLOCKED_KEYWORDS)
+        if blocked:
+            next_retry = now + _BLOCKED_RETRY_OFFSET
+            count = fail_count
+            report.blocked += 1
+            suffix = "（已标记违规，不再自动重试）"
+        else:
+            count = fail_count + 1
+            next_retry = now + retry_backoff_seconds(count)
+            suffix = f"（{retry_backoff_seconds(count) / 3600:.0f}h 后重试）"
+        await cache.record_share_failed(
+            dir_id, fid, name, fail_count=count, next_retry_at=next_retry, reason=msg
+        )
+        report.failed += 1
+        report.failed_items.append({"dir": path, "name": name, "reason": msg})
+        logger.warning("目录监控处理失败（%s/%s）：%s%s", path, name, msg, suffix)
+
     async def _share_and_push(
         self, processor, cache, pan115,
         dir_id: int, fid: int, name: str, record: dict | None,
     ) -> None:
-        """单个子目录：建永久分享（或复用 pending 码）→ 推卡片 → 标记 ok。
+        """单个子目录：建永久分享（或复用已有码）→ 推卡片 → 标记 ok。
 
-        两阶段防重复建分享：
-        1. record None → create_share → record_share(pending)【建分享即登记】
-        2. record pending → 复用 share_code/password 重推 → 成功 mark_shared(ok)
+        三阶段防重复建分享：
+        1. record None / failed 无码 → create_share → record_share(pending)
+        2. record pending / failed 有码 → 复用 share_code/password 重推 → mark_shared(ok)
+        3. record failed 退避中 → run_once 已跳过，不进入此方法
         新分享常处"审核中/快照生成中"（share_snap 预检不过），首次推送易失败
         ——登记后下轮复用同码重试，不会在账户里堆重复分享。
         """
-        if record is None:
+        if record is None or not record.get("share_code"):
             share_code, receive_code = await pan115.create_share(fid)
             # 建分享成功立即登记：即使推送失败，下轮也复用此码
             await cache.record_share(

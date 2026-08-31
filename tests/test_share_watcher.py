@@ -1,18 +1,21 @@
-"""ShareWatcher 目录监控测试：扫描→建分享→推卡片→标记 / 失败重试。"""
+"""ShareWatcher 目录监控测试：扫描→建分享→推卡片→标记 / 失败退避 / 违规 blocked。"""
 
 import asyncio
+import time
 
 from app.core.share_watcher import ShareWatcher
 from app.providers.exceptions import Pan115Error
 
 
 class _FakeCache:
-    """两阶段桩：record_share 登记 pending → mark_shared 置 ok。"""
+    """两阶段桩：record_share 登记 pending → mark_shared 置 ok；
+    record_share_failed 登记 failed（保留已有 share_code 供下轮复用）。"""
 
     def __init__(self, dirs):
         self.dirs = dirs
         self.records: dict[tuple[int, int], dict] = {}
         self.recorded: list[tuple] = []
+        self.failed_records: list[tuple] = []
 
     async def list_share_dirs(self):
         return self.dirs
@@ -24,8 +27,24 @@ class _FakeCache:
         self.records[(dir_id, file_id)] = {
             "file_id": file_id, "dir_id": dir_id, "name": name,
             "share_code": share_code, "password": password, "status": "pending",
+            "fail_count": 0, "next_retry_at": 0.0, "fail_reason": "",
         }
         self.recorded.append((dir_id, file_id, share_code, password))
+
+    async def record_share_failed(
+        self, dir_id, file_id, name, *, fail_count, next_retry_at, reason
+    ):
+        existing = self.records.get((dir_id, file_id), {})
+        self.records[(dir_id, file_id)] = {
+            "file_id": file_id, "dir_id": dir_id, "name": name,
+            "share_code": existing.get("share_code", ""),
+            "password": existing.get("password", ""),
+            "status": "failed",
+            "fail_count": fail_count,
+            "next_retry_at": next_retry_at,
+            "fail_reason": reason,
+        }
+        self.failed_records.append((dir_id, file_id, fail_count, next_retry_at, reason))
 
     async def mark_shared(self, dir_id, file_id):
         rec = self.records.get((dir_id, file_id))
@@ -136,9 +155,9 @@ def test_run_once_shares_and_pushes_new_dirs(monkeypatch):
     assert cache.records[(1, 11)]["status"] == "ok"
 
 
-def test_run_once_share_failure_not_marked(monkeypatch):
+def test_run_once_share_failure_backoff_not_retry_next_round(monkeypatch):
     _fast(monkeypatch)
-    """建分享失败（fid=999 模拟风控）→ 不标记 → 下轮重扫重试。"""
+    """建分享失败（普通错误，非违规）→ 登记 failed 退避 → 下轮未到期跳过。"""
     cache = _FakeCache([_dir(1, "/媒体", 100)])
     pan115 = _FakePan115({100: [
         {"fid": 999, "name": "剧C", "is_dir": True, "size": 0},
@@ -149,9 +168,21 @@ def test_run_once_share_failure_not_marked(monkeypatch):
     report = asyncio.run(watcher.run_once())
 
     assert report.failed == 1
+    assert report.blocked == 0
     assert report.shared == 0
-    assert cache.recorded == []  # 建分享失败：无登记
+    assert cache.recorded == []  # record_share 未调（建分享失败）
+    assert cache.failed_records  # record_share_failed 被调
     assert proc.process_calls == []  # 未推送
+    rec = cache.records[(1, 999)]
+    assert rec["status"] == "failed"
+    assert rec["fail_count"] == 1
+
+    # 第二轮：退避未到期 → 跳过，不再 create_share
+    pan115.share_calls.clear()
+    report2 = asyncio.run(watcher.run_once())
+    assert report2.backoff == 1
+    assert report2.failed == 0
+    assert pan115.share_calls == []
 
 
 def test_run_once_auditing_counted_not_failed(monkeypatch):
@@ -183,9 +214,9 @@ def test_run_once_auditing_counted_not_failed(monkeypatch):
     assert "审核中" in report.summary()
 
 
-def test_run_once_push_failure_not_marked(monkeypatch):
+def test_run_once_push_failure_backoff_keeps_share_code(monkeypatch):
     _fast(monkeypatch)
-    """推送失败（process 返回 ok=False）→ 不标记 → 下轮重试。"""
+    """推送失败（process 返回 ok=False）→ 登记 failed 退避，但 share_code 留存，下轮复用码。"""
     cache = _FakeCache([_dir(1, "/媒体", 100)])
     pan115 = _FakePan115({100: [
         {"fid": 21, "name": "剧D", "is_dir": True, "size": 0},
@@ -197,10 +228,103 @@ def test_run_once_push_failure_not_marked(monkeypatch):
 
     assert report.failed == 1
     assert pan115.share_calls == [21]  # 分享已建
-    # 关键：已登记 pending（码留存），下轮复用此码重推，绝不再建新分享
+    # 关键：登记 pending（码留存）→ 推送失败转 failed 退避，但 share_code 保留
     assert cache.recorded == [(1, 21, "code21", "pwd21")]
-    assert cache.records[(1, 21)]["status"] == "pending"
+    assert cache.records[(1, 21)]["status"] == "failed"
+    assert cache.records[(1, 21)]["share_code"] == "code21"  # 码留存，下轮复用
+    assert cache.records[(1, 21)]["fail_count"] == 1
     assert report.shared == 0
+
+
+def test_run_once_violation_marks_blocked_no_retry(monkeypatch):
+    """建分享遇'违规'→ 标记 blocked → 下一轮不再 create_share（静默跳过）。"""
+    _fast(monkeypatch)
+    cache = _FakeCache([_dir(1, "/待分享目录", 100)])
+
+    class _ViolatePan115(_FakePan115):
+        async def create_share(self, fid):
+            self.share_calls.append(fid)
+            raise Pan115Error("创建分享失败：分享含违规文件")
+
+    pan115 = _ViolatePan115({100: [{"fid": 500, "name": "蜘蛛侠", "is_dir": True}]})
+    proc = _FakeProcessor()
+    watcher = ShareWatcher(_FakeContainer(pan115, cache, proc), _FakeSettings())
+
+    report = asyncio.run(watcher.run_once())
+    assert report.failed == 1
+    assert report.blocked == 1
+    assert pan115.share_calls == [500]  # 试过一次
+    assert cache.failed_records  # 登记了失败
+    rec = cache.records[(1, 500)]
+    assert rec["status"] == "failed"
+    assert "违规" in rec["fail_reason"]
+
+    # 第二轮：blocked → 跳过，不再 create_share
+    pan115.share_calls.clear()
+    report2 = asyncio.run(watcher.run_once())
+    assert report2.blocked == 1
+    assert report2.failed == 0
+    assert pan115.share_calls == []  # 关键：不再重试
+
+
+def test_backoff_due_retries_create_share_again(monkeypatch):
+    """退避到期 → 重新 create_share → 成功 → mark_shared。"""
+    _fast(monkeypatch)
+    cache = _FakeCache([_dir(1, "/媒体", 100)])
+
+    class _FlakyPan115(_FakePan115):
+        def __init__(self):
+            super().__init__({100: [{"fid": 600, "name": "剧X", "is_dir": True}]})
+            self.attempts = 0
+
+        async def create_share(self, fid):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise Pan115Error("创建分享失败：网络超时")
+            return f"code{fid}", f"pwd{fid}"
+
+    pan115 = _FlakyPan115()
+    proc = _FakeProcessor()
+    watcher = ShareWatcher(_FakeContainer(pan115, cache, proc), _FakeSettings())
+
+    report = asyncio.run(watcher.run_once())
+    assert report.failed == 1
+    assert cache.records[(1, 600)]["status"] == "failed"
+
+    # 退避未到期 → 跳过
+    pan115.share_calls.clear()
+    asyncio.run(watcher.run_once())
+    assert pan115.share_calls == []
+
+    # 模拟退避到期 → 重新建分享成功
+    cache.records[(1, 600)]["next_retry_at"] = time.time() - 1
+    report3 = asyncio.run(watcher.run_once())
+    assert report3.failed == 0
+    assert report3.shared == 1  # 重建分享成功
+    assert cache.records[(1, 600)]["status"] == "ok"
+
+
+def test_pending_push_failure_backoff_due_reuses_code(monkeypatch):
+    """pending 推送失败 → 退避到期 → 复用 share_code 重推成功（不重建分享）。"""
+    _fast(monkeypatch)
+    cache = _FakeCache([_dir(1, "/媒体", 100)])
+    pan115 = _FakePan115({100: [{"fid": 700, "name": "剧Y", "is_dir": True}]})
+    proc = _FakeProcessor(fail_codes={"code700"})  # 第一次推送失败
+    watcher = ShareWatcher(_FakeContainer(pan115, cache, proc), _FakeSettings())
+
+    # 第一轮：建分享成功（pending）→ 推送失败 → failed 退避（码保留）
+    asyncio.run(watcher.run_once())
+    assert cache.records[(1, 700)]["status"] == "failed"
+    assert cache.records[(1, 700)]["share_code"] == "code700"
+
+    # 退避到期 → 复用码重推
+    cache.records[(1, 700)]["next_retry_at"] = time.time() - 1
+    proc._fail = set()  # 第二次推送成功
+    report2 = asyncio.run(watcher.run_once())
+    assert report2.failed == 0
+    assert report2.retried == 1  # 复用码重推成功
+    assert pan115.share_calls == [700]  # 只建过一次分享（没重建）
+    assert cache.records[(1, 700)]["status"] == "ok"
 
 
 def test_run_once_no_dirs_nop():
@@ -288,6 +412,12 @@ def test_watcher_report_summary():
     assert "推送 2" in s
     assert "失败 1" in s
     assert "已分享 4" in s
+
+    # blocked + backoff 展示
+    r2 = WatchReport(blocked=1, backoff=2)
+    s2 = r2.summary()
+    assert "违规" in s2
+    assert "退避" in s2
 
 
 # ==================== 归档：推送成功后移入 SHARE_ARCHIVE_DIR ====================

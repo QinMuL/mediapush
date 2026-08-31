@@ -39,8 +39,11 @@ CREATE TABLE IF NOT EXISTS shared_items (
     name        TEXT NOT NULL,
     share_code  TEXT NOT NULL,
     password    TEXT NOT NULL DEFAULT '',
-    status      TEXT NOT NULL DEFAULT 'ok',  -- pending=已建分享未推成 / ok=已推送
+    status      TEXT NOT NULL DEFAULT 'ok',  -- pending/ok/failed（退避或违规 blocked）
     pushed_at   REAL NOT NULL,
+    fail_count  INTEGER NOT NULL DEFAULT 0,   -- 连续失败次数（退避指数）
+    next_retry_at REAL NOT NULL DEFAULT 0,   -- 下次可重试时间戳（0=立即可试）
+    fail_reason TEXT NOT NULL DEFAULT '',     -- 最近失败原因
     PRIMARY KEY (file_id, dir_id)
 );
 CREATE TABLE IF NOT EXISTS pushed_shares (
@@ -67,10 +70,13 @@ _PUSHED_MIGRATE = [
     ("last_checked_at", "REAL"),
 ]
 
-# shared_items 补列（建分享登记与推送成功两阶段）
+# shared_items 补列（建分享登记与推送成功两阶段 + 失败退避）
 _SHARED_MIGRATE = [
     ("password", "TEXT NOT NULL DEFAULT ''"),
     ("status", "TEXT NOT NULL DEFAULT 'ok'"),
+    ("fail_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("next_retry_at", "REAL NOT NULL DEFAULT 0"),
+    ("fail_reason", "TEXT NOT NULL DEFAULT ''"),
 ]
 
 
@@ -287,15 +293,17 @@ class Cache:
         return [dict(zip(keys, r)) for r in rows]
 
     async def get_shared_item(self, dir_id: int, file_id: int) -> dict | None:
-        """查子目录的分享记录（含 pending）：有记录即不再新建分享。"""
+        """查子目录的分享记录（含 pending/failed）：有记录即不再新建分享。"""
         row = await self._fetchone(
-            "SELECT file_id, dir_id, name, share_code, password, status "
+            "SELECT file_id, dir_id, name, share_code, password, status, "
+            "fail_count, next_retry_at, fail_reason "
             "FROM shared_items WHERE dir_id=? AND file_id=?",
             (dir_id, file_id),
         )
         if not row:
             return None
-        keys = ("file_id", "dir_id", "name", "share_code", "password", "status")
+        keys = ("file_id", "dir_id", "name", "share_code", "password", "status",
+                "fail_count", "next_retry_at", "fail_reason")
         return dict(zip(keys, row))
 
     async def record_share(
@@ -316,6 +324,29 @@ class Cache:
             "UPDATE shared_items SET status='ok', pushed_at=? "
             "WHERE dir_id=? AND file_id=?",
             (time.time(), dir_id, file_id),
+        )
+
+    async def record_share_failed(
+        self, dir_id: int, file_id: int, name: str, *,
+        fail_count: int, next_retry_at: float, reason: str,
+    ) -> None:
+        """登记失败：status='failed' + 退避时间戳 + 原因。
+
+        upsert 语义：
+        - 无记录（建分享失败）：插入 share_code='' 的 failed 行
+        - 有记录（pending 推送失败）：ON CONFLICT 不动 share_code/password → 码留存复用
+        """
+        now = time.time()
+        await self._execute(
+            "INSERT INTO shared_items "
+            "(file_id, dir_id, name, share_code, password, status, pushed_at, "
+            " fail_count, next_retry_at, fail_reason) "
+            "VALUES (?,?,?,?,?, 'failed', ?, ?, ?, ?) "
+            "ON CONFLICT(file_id, dir_id) DO UPDATE SET "
+            "status='failed', fail_count=excluded.fail_count, "
+            "next_retry_at=excluded.next_retry_at, fail_reason=excluded.fail_reason, "
+            "pushed_at=excluded.pushed_at",
+            (file_id, dir_id, name, "", "", now, fail_count, next_retry_at, reason),
         )
 
     # ------------------------------------------------------------------ #
