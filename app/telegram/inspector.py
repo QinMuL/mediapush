@@ -196,19 +196,24 @@ class ShareInspector:
     # ------------------------------------------------------------------ #
     async def notify_admin(self, report: InspectReport) -> None:
         """撤卡明细通知 admin（每 admin 一条汇总）。"""
+        from app.telegram.notifier import format_round_report
+
         telegram = self.container.telegram
         if telegram is None or not report.dead_items or not self.settings.tg_admin_ids:
             return
-        lines = [f"⚰️ 分享失效巡检：{report.summary()}"]
+        details: list[str] = []
         for it in report.dead_items[:20]:
             t = it["title"] or it["share_code"]
-            lines.append(f"• {t}（{it['reason']}）")
+            details.append(f"• {t}（{it['reason']}）")
         if len(report.dead_items) > 20:
-            lines.append(f"… 共 {len(report.dead_items)} 条")
-        await notify_admins(telegram.bot, self.settings.tg_admin_ids, "\n".join(lines))
+            details.append(f"… 共 {len(report.dead_items)} 条")
+        text = format_round_report("⚰️", "分享失效巡检", report.summary(), details)
+        await notify_admins(telegram.bot, self.settings.tg_admin_ids, text)
 
     async def _notify_code_items(self, report: InspectReport) -> None:
         """缺访问码明细通知（INSPECT_NOTIFY_CODE 开关；提醒 /edit 重推补档）。"""
+        from app.telegram.notifier import format_round_report
+
         telegram = self.container.telegram
         if (
             telegram is None
@@ -217,14 +222,19 @@ class ShareInspector:
             or not self.settings.inspect_notify_code
         ):
             return
-        lines = [f"🔑 巡检发现 {len(report.code_items)} 条分享缺/失访问码（卡片旧码已不可用）："]
+        details: list[str] = []
         for it in report.code_items[:10]:
             t = it["title"] or it["share_code"]
-            lines.append(f"• {t}（{it['reason']}）")
+            details.append(f"• {t}（{it['reason']}）")
         if len(report.code_items) > 10:
-            lines.append(f"… 共 {len(report.code_items)} 条")
-        lines.append("补档方式：/edit <该分享链接> [新访问码] 重推即可刷新卡片。")
-        await notify_admins(telegram.bot, self.settings.tg_admin_ids, "\n".join(lines))
+            details.append(f"… 共 {len(report.code_items)} 条")
+        details.append("补档方式：/edit <该分享链接> [新访问码] 重推即可刷新卡片。")
+        text = format_round_report(
+            "🔑", "巡检访问码提醒",
+            f"发现 {len(report.code_items)} 条分享缺/失访问码（卡片旧码已不可用）",
+            details,
+        )
+        await notify_admins(telegram.bot, self.settings.tg_admin_ids, text)
 
     # ------------------------------------------------------------------ #
     async def start(self) -> None:

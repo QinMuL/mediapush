@@ -312,27 +312,28 @@ class ShareWatcher:
     # ------------------------------------------------------------------ #
     async def notify_admin(self, report: WatchReport) -> None:
         """任务详情通知 admin：推送成功 + 失败明细（巡检器 notify_admin 同模式）。"""
-        from app.telegram.notifier import notify_admins
+        from app.telegram.notifier import format_round_report, notify_admins
 
         telegram = getattr(self.container, "telegram", None)
         admins = getattr(self.settings, "tg_admin_ids", []) or []
         if telegram is None or not admins:
             return
-        lines = [f"📂 目录监控：{report.summary()}"]
+        details: list[str] = []
         for it in report.items[:20]:
-            lines.append(f"✅ {it['name']}（{it['dir']}）")
+            details.append(f"✅ {it['name']}（{it['dir']}）")
         if len(report.items) > 20:
-            lines.append(f"… 共 {len(report.items)} 个")
+            details.append(f"… 共 {len(report.items)} 个")
         for it in report.audit_items[:10]:
-            lines.append(f"⏳ {it['name']}（{it['dir']}）审核中")
+            details.append(f"⏳ {it['name']}（{it['dir']}）审核中")
         for it in report.failed_items[:10]:
             reason = it["reason"]
             if len(reason) > 120:
                 reason = reason[:120] + "…"
-            lines.append(f"⚠️ {it['name']}（{it['dir']}）：{reason}")
+            details.append(f"⚠️ {it['name']}（{it['dir']}）：{reason}")
         if len(report.failed_items) > 10:
-            lines.append(f"… 共 {len(report.failed_items)} 个失败")
-        await notify_admins(telegram.bot, admins, "\n".join(lines))
+            details.append(f"… 共 {len(report.failed_items)} 个失败")
+        text = format_round_report("📂", "目录监控扫描", report.summary(), details)
+        await notify_admins(telegram.bot, admins, text)
 
     async def _loop(self) -> None:
         # 启动先歇 1 分钟（等 bot/巡检/监控全部就绪，避开启动高峰）

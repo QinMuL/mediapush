@@ -4,7 +4,10 @@
 
 - 双通道分级：控制台 INFO（简洁故事线），文件 DEBUG（全量细节）
 - 单一 stdout handler（Docker 友好，日志走 Docker json-file 驱动）
-- 文件按大小轮转（RotatingFileHandler，5MB/文件 × 10 份），旧文件 gzip 压缩，自动清理过期文件
+- 双文件分流：mediapush.log（核心系统）+ media.log（本地媒体流水线 app.media.*），
+  两文件互不重复（按 logger 名过滤）
+- 文件按固定字节轮转（默认 5MB/文件，LOG_MAX_BYTES 可配），旧文件 gzip 压缩
+- 归档保留 7 天（LOG_RETENTION_DAYS 可配，按 mtime 到期即删，不受份数限制）
 - 彩色级别 + 缩短模块名（app.telegram.handlers → handlers），便于扫读
 - 第三方噪声库（telegram / httpx / urllib3 / asyncio）降级到 WARNING（两通道均抑制）
 - LOG_LEVEL 控制控制台级别；文件恒为 DEBUG
@@ -24,6 +27,7 @@ import logging.handlers
 import os
 import re
 import sys
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime
@@ -126,6 +130,22 @@ class _SanitizeFilter(logging.Filter):
         return True
 
 
+class _MediaLogFilter(logging.Filter):
+    """只放行本地媒体流水线（app.media.*）日志 → media.log。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        name = record.name or ""
+        return name == "app.media" or name.startswith("app.media.")
+
+
+class _ExcludeMediaFilter(logging.Filter):
+    """排除本地媒体流水线日志 → 核心日志只记系统内容，双文件互不重复。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        name = record.name or ""
+        return not (name == "app.media" or name.startswith("app.media."))
+
+
 def set_console_level(level: str) -> bool:
     """运行时调整控制台 handler 级别（/loglevel 命令）。
 
@@ -168,11 +188,26 @@ class _ConsoleFormatter(logging.Formatter):
 
 
 class _CompressedRotatingFileHandler(RotatingFileHandler):
-    """RotatingFileHandler + gzip 压缩：轮转时把旧文件压缩成 .gz，节省磁盘空间。
+    """RotatingFileHandler + gzip 压缩 + 按时间清理归档。
 
     覆写 doRollover：先把已有 .N.gz 滚动（.N → .N+1），再把当前文件
-    gzip 成 .1.gz；保留最近 backupCount 份压缩文件，超出自动删除。
+    gzip 成 .1.gz；backupCount 为份数硬上限，另按 mtime 清理超过
+    retention_days 的过期归档（时间优先，保证"保留 7 天"语义）。
     """
+
+    def __init__(
+        self,
+        filename: str,
+        *,
+        max_bytes: int = 5 * 1024 * 1024,
+        backup_count: int = 200,
+        retention_days: float = 7.0,
+        encoding: str = "utf-8",
+    ) -> None:
+        super().__init__(
+            filename, maxBytes=max_bytes, backupCount=backup_count, encoding=encoding
+        )
+        self.retention_days = max(0.0, retention_days)
 
     def doRollover(self) -> None:
         if self.stream:
@@ -197,8 +232,27 @@ class _CompressedRotatingFileHandler(RotatingFileHandler):
                 os.remove(self.baseFilename)
             except Exception:  # noqa: BLE001,S110
                 pass
+        # 按保留天数清理过期归档（启动时也调一次，见 prune_archives）
+        self._prune_expired_archives()
         if not self.delay:
             self.stream = self._open()
+
+    def _prune_expired_archives(self) -> None:
+        """删除 mtime 超过 retention_days 的归档（.N.gz 与旧时间戳命名均覆盖）。"""
+        if self.retention_days <= 0:
+            return
+        cutoff = time.time() - self.retention_days * 86400
+        base = Path(self.baseFilename)
+        for p in base.parent.glob(base.name + ".*"):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+            except OSError:
+                pass
+
+    def prune_archives(self) -> None:
+        """启动时主动清理一次过期归档（无需等到首次轮转）。"""
+        self._prune_expired_archives()
 
 
 def setup_logging(
@@ -206,14 +260,19 @@ def setup_logging(
     *,
     use_color: bool | None = None,
     log_file: str | None = None,
+    log_media_file: str | None = None,
+    log_max_bytes: int = 5 * 1024 * 1024,
+    log_retention_days: float = 7.0,
 ) -> None:
-    """配置根日志：控制台 INFO 级 + 文件 DEBUG 级（按大小轮转 + gzip 压缩）。
+    """配置根日志：控制台 INFO 级 + 双文件 DEBUG 级（按字节轮转 + gzip + 7 天保留）。
 
     Args:
         level: 控制台日志级别字符串（DEBUG/INFO/WARNING/...），来自 LOG_LEVEL。
         use_color: 是否启用 ANSI 彩色（stdout）。None=按 stderr 是否 tty 自动判断。
-        log_file: 本地日志文件路径，启用文件持久化 + 按大小轮转（5MB/文件 × 10 份，gzip 压缩）。
-                  传 None 或空串则只输出 stdout。来自 LOG_FILE。
+        log_file: 核心日志文件（系统内容，排除 app.media.*）。传 None 或空串则不写。
+        log_media_file: 媒体流水线日志文件（只记 app.media.*）。传 None 或空串则不写。
+        log_max_bytes: 单文件轮转阈值（字节，达到即刻轮转），来自 LOG_MAX_BYTES。
+        log_retention_days: 归档保留天数（按 mtime 到期即删），来自 LOG_RETENTION_DAYS。
     """
     root = logging.getLogger()
     # 清理已有 handler，避免容器重启/重复调用时叠加
@@ -230,30 +289,100 @@ def setup_logging(
     # root 放开到 DEBUG，由各 handler 自行过滤（控制台 level / 文件 DEBUG）
     root.setLevel(logging.DEBUG)
 
-    # 1) stdout handler（彩色，Docker 走 json-file 驱动捕获）——故事线
+    # 1) stdout handler（彩色，Docker 走 json-file 驱动捕获，控制台双份内容都看）——故事线
     sh = logging.StreamHandler(sys.stdout)
     sh.setLevel(level.upper())
     sh.setFormatter(_ConsoleFormatter(use_color=use_color))
     sh.addFilter(_SanitizeFilter())  # 兜底脱敏（handler 级：覆盖所有子 logger 记录）
     root.addHandler(sh)
 
-    # 2) 本地文件 handler（纯文本无颜色，按大小轮转 + gzip 压缩，持久化到挂载卷）——全量细节
+    # 2) 核心文件 handler（系统内容，排除媒体流水线）——按字节轮转 + gzip + 时间保留
     if log_file:
         try:
             Path(log_file).parent.mkdir(parents=True, exist_ok=True)
             fh = _CompressedRotatingFileHandler(
                 log_file,
-                maxBytes=5 * 1024 * 1024,   # 5MB per file
-                backupCount=10,               # 10 files = 50MB max（压缩后 ~15MB）
-                encoding="utf-8",
+                max_bytes=log_max_bytes,
+                retention_days=log_retention_days,
             )
             fh.setLevel(logging.DEBUG)
             fh.setFormatter(_ConsoleFormatter(use_color=False))
-            fh.addFilter(_SanitizeFilter())  # 兜底脱敏（压缩文件同样不能落敏感值）
+            fh.addFilter(_SanitizeFilter())       # 兜底脱敏
+            fh.addFilter(_ExcludeMediaFilter())   # 媒体流水线日志只进 media.log
+            fh.prune_archives()                   # 启动清理一次过期归档
             root.addHandler(fh)
         except Exception as exc:  # noqa: BLE001 - 文件不可写不阻断启动
             # 退化：只 stdout，不写文件
             logging.getLogger(__name__).warning("本地日志文件不可写 %s：%s", log_file, exc)
 
+    # 3) 媒体流水线文件 handler（只记 app.media.*）——同样按字节轮转 + 7 天保留
+    if log_media_file:
+        try:
+            Path(log_media_file).parent.mkdir(parents=True, exist_ok=True)
+            mfh = _CompressedRotatingFileHandler(
+                log_media_file,
+                max_bytes=log_max_bytes,
+                retention_days=log_retention_days,
+            )
+            mfh.setLevel(logging.DEBUG)
+            mfh.setFormatter(_ConsoleFormatter(use_color=False))
+            mfh.addFilter(_SanitizeFilter())
+            mfh.addFilter(_MediaLogFilter())      # 只放行 app.media.*
+            mfh.prune_archives()
+            root.addHandler(mfh)
+        except Exception as exc:  # noqa: BLE001 - 文件不可写不阻断启动
+            logging.getLogger(__name__).warning(
+                "媒体日志文件不可写 %s：%s", log_media_file, exc
+            )
+
     for name, lvl in _NOISY_LOGGERS.items():
         logging.getLogger(name).setLevel(lvl)
+
+
+def purge_log_files(
+    level: str,
+    *,
+    use_color: bool | None = None,
+    log_file: str | None = None,
+    log_media_file: str | None = None,
+    log_max_bytes: int = 5 * 1024 * 1024,
+    log_retention_days: float = 7.0,
+) -> list[str]:
+    """清空本地日志（当前文件 + 全部归档）并重建 handler，返回删除的文件路径。
+
+    /reset 一键清空数据用：先摘除并关闭 root 上全部 handler（释放文件句柄），
+    再删除两个日志文件及其 .N.gz 归档，最后按原参数重建日志。
+    """
+    root = logging.getLogger()
+    handlers = list(root.handlers)
+    for h in handlers:
+        root.removeHandler(h)
+        try:
+            h.close()
+        except Exception:  # noqa: BLE001,S110
+            pass
+
+    removed: list[str] = []
+    for path in (log_file, log_media_file):
+        if not path:
+            continue
+        base = Path(path)
+        candidates = list(base.parent.glob(base.name + ".*")) if base.parent.exists() else []
+        if base.exists():
+            candidates.append(base)
+        for p in candidates:
+            try:
+                p.unlink()
+                removed.append(str(p))
+            except OSError:
+                pass
+
+    setup_logging(
+        level,
+        use_color=use_color,
+        log_file=log_file,
+        log_media_file=log_media_file,
+        log_max_bytes=log_max_bytes,
+        log_retention_days=log_retention_days,
+    )
+    return removed

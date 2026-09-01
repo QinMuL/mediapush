@@ -1,4 +1,4 @@
-﻿"""程序入口：加载配置 → 构建容器 → 启动 Telegram Bot（run_polling）。"""
+"""程序入口：加载配置 → 构建容器 → 启动 Telegram Bot（run_polling）。"""
 
 from __future__ import annotations
 
@@ -44,6 +44,9 @@ def main() -> None:
         settings.log_level,
         use_color=settings.log_color,
         log_file=settings.log_file,
+        log_media_file=settings.log_media_file,
+        log_max_bytes=settings.log_max_bytes,
+        log_retention_days=settings.log_retention_days,
     )
 
     logger = logging.getLogger("app")

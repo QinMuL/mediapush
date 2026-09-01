@@ -597,7 +597,7 @@ def test_notify_admin_success_and_failure_details():
 
     assert len(telegram.bot.sent) == 2  # 两个 admin 各一条
     text = telegram.bot.sent[0][1]
-    assert text.startswith("📂 目录监控：")
+    assert text.startswith("📂 目录监控扫描 · ")  # 统一汇总模板头
     assert "✅ 剧A（/待分享）" in text
     assert "⏳ 剧B（/待分享）审核中" in text
     assert "⚠️ 剧C（/待分享）：推送失败：超时" in text

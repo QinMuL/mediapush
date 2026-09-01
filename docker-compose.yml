@@ -1,26 +1,58 @@
 services:
   mediapush:
-    image: ghcr.io/qinmul/mediapush:latest   # CI 自动发布镜像；docker compose pull 拉取
-    build: .                                  # 本地开发：docker compose up -d --build
+    # 镜像二选一：
+    #   - CI 自动发布（推 main 触发）：docker compose pull && up -d 升级
+    #   - 本地构建：docker compose up -d --build
+    image: ghcr.io/qinmul/mediapush:latest
+    build: .
     container_name: mediapush
-    restart: always   # always：即使 Docker daemon/WSL2 重启后也自动恢复，比 unless-stopped 更可靠
+
+    # always：Docker daemon/宿主机重启后自动恢复（比 unless-stopped 更可靠）
+    restart: always
+
     env_file:
       - .env
+
     environment:
-      TZ: Asia/Shanghai   # 容器时区，日志/时间相关一致用中国时区
-    # host 网络：代理只监听 127.0.0.1，host 模式让容器直连宿主机 loopback
+      # 统一时区，日志/巡检/流水线的时间显示保持一致
+      TZ: Asia/Shanghai
+
+    # host 网络（与宿主机共享网络栈，无 NAT 隔离）：
+    #   - PROXY_URL 可直填 http://127.0.0.1:7890（宿主机代理只监听 loopback 也够用）
+    #   - CD2 gRPC（CD2_ADDRESS=192.168.x.x:19798）局域网直达，无需端口映射
     network_mode: host
-    # Docker 日志轮转：stdout 走 json-file 驱动，限制单文件 10MB、保留 3 份（共 ≤30MB）
+
+    # Docker stdout 日志：持久化控制台输出（INFO 故事线），容器重启后
+    # docker logs 仍可追溯启动/崩溃记录（崩溃瞬间的控制台输出应用文件日志拿不到）。
+    # 与应用内双文件日志（data/logs/，DEBUG 全量 + 双文件分流 + 按字节轮转
+    # gzip + 7 天保留）层级互补；json-file 驱动兜底限制：单文件 10MB × 3 份 ≤30MB
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+
     volumes:
+      # 数据持久化：cache.db / state.db / monitor.db / monitor.session /
+      # 115cookie.txt / ed2k_results.jsonl / logs（双文件 + gzip 归档）
       - ./data:/app/data
+      # 本地媒体流水线（链路 B）三级目录挂载：
+      #   本容器把宿主机 /vol1/1000/media 挂为 /media，A/B/C 即其下三个子目录。
+      #   .env 填容器内路径：目录A=/media/A（待处理）→ B=/media/B（已重命名）
+      #   → C=/media/C（已哈希，待上传）；A/B/C 互不重叠，B 是①的输出也是②的输入。
+      #
+      #   CD2 上传源路径的"双层 media"说明：CD2 容器把宿主机 /vol1/1000 挂为
+      #   自己的 /media，所以同一个物理目录 C 的两容器视角不同——
+      #     物理位置 /vol1/1000/media/C
+      #       本容器视角 → LOCAL_MEDIA_INPUT/OUTPUT、ED2K_*_DIR 用 /media/C
+      #       CD2 容器视角 → CD2_UPLOAD_SRC 填 /media/media/C
+      #   若 CD2 挂载点不同，按其实际视角填 CD2_UPLOAD_SRC 即可。
       - /vol1/1000/media:/media
-    # 健康检查：Bot 每 30s 写 /tmp/.heartbeat，此处检查文件是否在 120s 内更新过。
-    # 连续 3 次失败（~2min）标记 unhealthy，配合 restart 策略自动恢复卡死场景。
+
+    # 健康检查：应用每 30s 写 /tmp/.heartbeat 心跳文件，
+    # 此处检查 mtime 是否在 120s 内（覆盖事件循环冻结 / polling 静默死亡等卡死场景）。
+    # 连续 3 次失败（~2min）标记 unhealthy，配合 restart: always 自动恢复；
+    # 纯网络断联由应用内 90s 探活自愈（连续 3 次失败 os._exit → Docker 重启）
     healthcheck:
       test: ["CMD", "python3", "-c", "import os,time; exit(0 if time.time()-os.path.getmtime('/tmp/.heartbeat')<120 else 1)"]
       interval: 30s

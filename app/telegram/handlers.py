@@ -1,10 +1,18 @@
 """Telegram Bot 命令处理。
 
-- /start /help /status /115 <链接> [密码] /refresh <tmdb_id> /loglevel <级别>
+- /start /help /status — 入口、帮助、运行状态一览（5 大块 + 流水线 4 阶段）
+- /115 <链接> [访问码] — 推送 115/ed2k 分享（裸链接消息自动当 /115 处理）
+- /edit <链接> — 预览编辑模式（追加推荐语/精品标记后推送）/cancel 取消
+- /refresh <tmdb_id> — 清除 TMDB 缓存重拉
+- /loglevel <级别> — 运行时调整控制台日志级别
 - /reload — 重读 .env 热加载配置（间隔/开关/cookie；连接层变更提示需重启）
 - /cookie — 在 bot 里查看/设置 115 cookie（写 PAN115_COOKIE_FILE + 热更新 + 探活）
-- /edit <链接> — 预览编辑模式（追加推荐语/精品标记后推送）/cancel 取消
-- 裸链接消息自动当 /115 处理
+- /reset — 一键清空业务数据（缓存/去重/状态/日志，保留配置；/reset 确认 执行）
+- /mon — 频道监控管理（login/add/del/target/batch/filter）
+- /inspect [数量] — 手动巡检失效分享并撤卡
+- /dir add|del|list — 目录监控登记（新子目录自动建永久分享）
+- /share — 立即扫描一轮监控目录
+- /ed2k_status /upload_status — 本地媒体流水线状态（哈希推送/CD2 上传）
 - 仅 TG_ADMIN_IDS 可用
 - Pan115Error 顶部容错导入（p115client 装坏不拖垮 bot）
 - 通过 context.application.bot_data["container"] 注入，不访问私有属性
@@ -129,7 +137,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /refresh <tmdb_id> — 清除该 TMDB 缓存后重拉（剧集更新集数时用）\n"
         "• /loglevel <DEBUG|INFO|WARNING|ERROR> — 运行时调整控制台日志级别\n"
         "• /reload — 改 .env 后热加载配置（间隔/开关/cookie 等，无需重启）\n"
-        "• /cookie — 查看状态；/cookie <串> 直接更新 115 cookie（写文件+探活）\n\n"
+        "• /cookie — 查看状态；/cookie <串> 直接更新 115 cookie（写文件+探活）\n"
+        "• /reset — 一键清空数据（缓存/去重/状态/日志，保留配置；/reset 确认 执行）\n\n"
         "【自动化】\n"
         "• /mon — 频道监控（/mon login 交互式登录，自动捕获 ed2k 推送）\n"
         "• /inspect [数量] — 手动巡检已推送分享，失效撤卡（默认每 6 小时自动跑）\n"
@@ -166,6 +175,20 @@ def _fmt_uptime(seconds: float) -> str:
 _STARTED_AT = time.monotonic()
 
 
+def _count_dir_files(path: str) -> int | None:
+    """目录内普通文件数（队列深度参考）；目录不可访问返回 None。"""
+    from pathlib import Path
+
+    try:
+        return sum(1 for p in Path(path).iterdir() if p.is_file())
+    except OSError:
+        return None
+
+
+def _fmt_kb(n: int | None) -> str:
+    return "?" if n is None else str(n)
+
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin(update, context):
         await update.message.reply_text(_DENY_TEXT)
@@ -174,30 +197,38 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     s = container.settings
     lines: list[str] = []
 
-    # 1) 运行信息（动态）
-    lines.append("🤖 运行状态")
+    # 1) 运行概览（动态统计）
+    lines.append("🤖 运行概览")
     lines.append(f"• 运行时长：{_fmt_uptime(time.monotonic() - _STARTED_AT)}")
     try:
         st = await container.cache.stats()
         lines.append(
-            f"• 已推送分享：{st['pushed']} · 失效撤卡：{st['dead']}"
-            f" · TMDB 缓存：{st['tmdb_cache']} 条"
+            f"• 已推送分享 {st['pushed']} · 失效撤卡 {st['dead']}"
+            f" · TMDB 缓存 {st['tmdb_cache']} 条"
         )
         if st["share_dirs"]:
             lines.append(
-                f"• 目录监控：{st['share_dirs']} 个目录 · 已分享 {st['shared_items']} 个子目录"
+                f"• 监控目录 {st['share_dirs']} 个 · 已分享子目录 {st['shared_items']} 个"
             )
     except Exception:  # noqa: BLE001 - 统计失败不阻断整体展示
         lines.append("• 运行统计：暂不可用")
     lines.append("")
 
-    # 2) 配置与健康（静态 + 实时探活）
-    lines.append("🩺 配置与健康")
-    lines.append(f"• TG Bot：{'✅ 已配置' if s.tg_bot_token else '❌ 未配置'}")
-    lines.append(f"• 默认频道：{s.tg_chat_id or '❌ 未配置'}")
-    lines.append(f"• 网盘频道：{s.tg_chat_id_115 or '⬇️ 同默认'}")
-    lines.append(f"• ed2k 频道：{s.tg_chat_id_ed2k or '⬇️ 同默认'}")
-    lines.append(f"• TMDB Key：{'✅' if s.tmdb_api_key else '❌ 未配置'}")
+    # 2) 健康与配置（静态 + 实时探活）
+    lines.append("🩺 健康与配置")
+    lines.append(
+        f"• TG Bot：{'✅' if s.tg_bot_token else '❌ 未配置'}"
+        f" · TMDB Key：{'✅' if s.tmdb_api_key else '❌ 未配置'}"
+    )
+    if container.pan115 is not None:
+        try:
+            ok = await container.pan115.check_health()
+            if ok is None:
+                lines.append("• 115 健康：✅ 匿名读取可用（cookie 未配置）")
+            else:
+                lines.append(f"• 115 健康：{'✅ 正常' if ok else '❌ cookie 失效'}")
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"• 115 健康：❌ {exc}")
     # cookie 状态按 provider 运行时状态显示（文件方式热加载后 .env 字段仍为空，
     # 只读配置字段会误报"未配置"）
     if container.pan115 is not None and container.pan115.cookie:
@@ -206,25 +237,21 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             else f"文件 {s.pan115_cookie_file}" if s.pan115_cookie_file
             else "运行时"
         )
-        lines.append(
-            f"• 115 Cookie：✅ {source}（UID {container.pan115.uid or '-'}）"
-        )
+        lines.append(f"• 115 Cookie：✅ {source}（UID {container.pan115.uid or '-'}）")
     else:
         lines.append("• 115 Cookie：未配置（匿名读取，可用）")
     lines.append(f"• 代理：{s.proxy_url or '未配置'}")
-    if container.pan115 is not None:
-        try:
-            ok = await container.pan115.check_health()
-            if ok is None:
-                lines.append("• 115 健康：✅ 匿名读取可用（cookie 未配置）")
-            else:
-                lines.append(f"• 115 健康：{'✅' if ok else '❌ cookie 失效'}")
-        except Exception as exc:  # noqa: BLE001
-            lines.append(f"• 115 健康：❌ {exc}")
     lines.append("")
 
-    # 3) 后台服务（启用 + 间隔 + 运行态）
-    lines.append("⚙️ 后台服务")
+    # 3) 频道
+    lines.append("📡 频道")
+    lines.append(f"• 默认：{s.tg_chat_id or '❌ 未配置'}")
+    lines.append(f"• 网盘：{s.tg_chat_id_115 or '⬇️ 同默认'}")
+    lines.append(f"• ed2k：{s.tg_chat_id_ed2k or '⬇️ 同默认'}")
+    lines.append("")
+
+    # 4) 常驻任务（115 侧 + 频道侧）
+    lines.append("⚙️ 常驻任务")
     lines.append(
         f"• 失效巡检：{'✅' if s.inspect_enabled else '⬜ 未启用'}"
         + (f"（每 {s.inspect_interval_hours:g} 小时，/inspect 手动触发）"
@@ -244,54 +271,115 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     else:
         lines.append(f"• 频道监控：{await _monitor_state_line(monitor)}")
     console_lvl = logging.getLogger().handlers[0].level if logging.getLogger().handlers else "?"
-    # 本地媒体 + ed2k 流水线 + ed2k 推送
-    if not s.local_media_enabled:
-        lines.append("• 本地媒体（A→B）：⬜ 未启用（LOCAL_MEDIA_ENABLED=false）")
-    else:
-        mode = "模拟" if s.local_media_dry_run else "实际重命名移动"
-        lines.append(
-            f"• 本地媒体（A→B）：✅（{mode}，每 {s.local_media_interval_seconds:g}s）"
-            + f" A={s.local_media_input_dir} B={s.local_media_output_dir}"
-        )
-    if not s.ed2k_enabled:
-        lines.append("• ed2k 哈希（B→C）：⬜ 未启用（ED2K_ENABLED=false）")
-    else:
-        mode = "模拟" if s.ed2k_dry_run else "实际移动"
-        lines.append(
-            f"• ed2k 哈希（B→C）：✅（{mode}，每 {s.ed2k_interval_seconds:g}s）"
-            + f" B={s.ed2k_input_dir} C={s.ed2k_output_dir}"
-        )
-    if not s.ed2k_push_enabled:
-        lines.append("• ed2k 推送（JSONL→频道）：⬜ 未启用（ED2K_PUSH_ENABLED=false）")
-    else:
-        mode = "模拟推送" if s.ed2k_push_dry_run else "实际推送"
-        report = "Admin 汇总：开" if s.ed2k_push_report_admin else ""
-        if s.ed2k_push_report_channel:
-            report += ("，" if report else "") + "频道同步：开"
-        lines.append(
-            f"• ed2k 推送（JSONL→频道）：✅（{mode}，每 {s.ed2k_push_interval_seconds:g}s"
-            + (f"；{report})" if report else "）")
-        )
-        pusher = getattr(container, "ed2k_pusher", None)
-        if pusher is not None:
-            # 内嵌一段 pusher status（缩进一下便于读）
-            for line in pusher.status_text().splitlines()[1:]:
-                lines.append(f"  {line}")
-    if not s.cd2_enabled:
-        lines.append("• CD2 上传（C→115）：⬜ 未启用（CD2_ENABLED=false）")
-    else:
-        mode = "模拟上传" if s.cd2_upload_dry_run else "实际上传"
-        lines.append(
-            f"• CD2 上传（C→115）：✅（{mode}，每 {s.cd2_upload_interval_seconds:g}s）"
-            + f" {s.cd2_upload_src} → {s.cd2_upload_dst}"
-        )
-        uploader = getattr(container, "cd2_uploader", None)
-        if uploader is not None:
-            for line in uploader.status_lines():
-                lines.append(f"  {line}")
     lines.append(f"• 控制台日志：{logging.getLevelName(console_lvl)}（/loglevel 调整）")
+    lines.append("")
+
+    # 5) 本地媒体流水线（A→B→C→频道→115，每阶段：状态 + 队列深度 + 最近一轮）
+    lines.append("🎬 本地媒体流水线")
+    if not (s.local_media_enabled or s.ed2k_enabled or s.ed2k_push_enabled or s.cd2_enabled):
+        lines.append("⬜ 未启用（LOCAL_MEDIA / ED2K / ED2K_PUSH / CD2 的 *_ENABLED 均为 false）")
+    else:
+        # ① A→B：TMDB 重命名
+        if not s.local_media_enabled:
+            lines.append("① A→B 重命名：⬜ 未启用（LOCAL_MEDIA_ENABLED=false）")
+        else:
+            mode = "模拟" if s.local_media_dry_run else "实际移动"
+            svc = getattr(container, "local_media", None)
+            queue = _count_dir_files(s.local_media_input_dir) if svc else None
+            retrying = len(getattr(svc, "_retry_state", {})) if svc else 0
+            lines.append(
+                f"① A→B 重命名：✅ 每 {s.local_media_interval_seconds:g}s · {mode}"
+                f" · A 待处理 {_fmt_kb(queue)} · 低置信退避 {retrying}"
+            )
+            if svc:
+                lines.append(f"   A={s.local_media_input_dir} → B={s.local_media_output_dir}")
+                last = getattr(svc, "_last_report", None)
+                if last:
+                    lines.append(f"   最近一轮：{last}")
+        # ② B→C：ed2k 哈希
+        if not s.ed2k_enabled:
+            lines.append("② B→C 哈希：⬜ 未启用（ED2K_ENABLED=false）")
+        else:
+            mode = "模拟" if s.ed2k_dry_run else "实际移动"
+            svc = getattr(container, "ed2k_service", None)
+            queue = _count_dir_files(s.ed2k_input_dir) if svc else None
+            retrying = len(getattr(svc, "_retry_state", {})) if svc else 0
+            lines.append(
+                f"② B→C 哈希：✅ 每 {s.ed2k_interval_seconds:g}s · {mode}"
+                f" · B 待处理 {_fmt_kb(queue)} · 失败退避 {retrying}"
+            )
+            if svc:
+                lines.append(f"   B={s.ed2k_input_dir} → C={s.ed2k_output_dir}")
+                last = getattr(svc, "_last_report", None)
+                if last:
+                    lines.append(f"   最近一轮：{last}")
+        # ③ C→频道：ed2k 推送
+        if not s.ed2k_push_enabled:
+            lines.append("③ C→频道推送：⬜ 未启用（ED2K_PUSH_ENABLED=false）")
+        else:
+            mode = "模拟推送" if s.ed2k_push_dry_run else "实际推送"
+            pusher = getattr(container, "ed2k_pusher", None)
+            extra = ""
+            if pusher is not None:
+                pending, stuck = _ed2k_pending(pusher)
+                extra = f" · 追读 {_ed2k_progress(pusher):.0f}% · 待推 {pending}（🚨 卡死 {stuck}）"
+            lines.append(
+                f"③ C→频道推送：✅ 每 {s.ed2k_push_interval_seconds:g}s · {mode}{extra}"
+            )
+            last = getattr(pusher, "_last_report", None) if pusher else None
+            if last:
+                lines.append(f"   最近一轮：{last}")
+        # ④ C→115：CD2 上传
+        if not s.cd2_enabled:
+            lines.append("④ C→115 上传（CD2）：⬜ 未启用（CD2_ENABLED=false）")
+        else:
+            mode = "模拟上传" if s.cd2_upload_dry_run else "实际上传"
+            note = " · Admin 汇总开" if s.cd2_report_admin else ""
+            lines.append(
+                f"④ C→115 上传（CD2）：✅ 每 {s.cd2_upload_interval_seconds:g}s · {mode}{note}"
+            )
+            lines.append(f"   {s.cd2_upload_src} → {s.cd2_upload_dst}")
+            up = getattr(container, "cd2_uploader", None)
+            if up is not None:
+                now = time.time()
+                for info in list(up._tasks.values())[:3]:
+                    pct = info.uploaded_bytes / max(1, info.size) * 100
+                    mins = (now - info.submitted_at) / 60
+                    lines.append(
+                        f"   🔄 传输中：{info.name} {pct:.0f}%"
+                        f"（{mins:.0f} 分钟）"
+                    )
+                lines.append(
+                    f"   已完成 {len(up._completed)} · 退避中 {len(up._retry_state)}"
+                )
+                last = getattr(up, "_last_report", None)
+                if last:
+                    lines.append(f"   最近一轮：{last}")
 
     await update.message.reply_text("\n".join(lines))
+
+
+def _ed2k_pending(pusher) -> tuple[int, int]:
+    """(待推/退避中条数, 卡死条数)。"""
+    now = time.time()
+    pending = stuck = 0
+    for key, st in list(pusher._state.items()):
+        if key.startswith("_"):
+            continue
+        pending += 1
+        if now - float(st.get("first_seen", now)) > pusher.settings.ed2k_push_stuck_days * 86400:
+            stuck += 1
+    return pending, stuck
+
+
+def _ed2k_progress(pusher) -> float:
+    """JSONL 追读百分比（0-100）。"""
+    try:
+        size = pusher.results_file.stat().st_size if pusher.results_file.is_file() else 0
+    except OSError:
+        size = 0
+    offset = pusher._state.get("_offset", 0)
+    return (offset / size * 100.0) if size else 0.0
 
 
 
@@ -478,6 +566,161 @@ async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         lines.append("ℹ️ 无变更（与当前运行配置一致）")
     lines.append("\nℹ️ cookie 文件（PAN115_COOKIE_FILE）内容变化已即时生效")
     await update.message.reply_text("\n".join(lines))
+
+
+# /reset 二次确认关键词（防止误触一键清空）
+_RESET_CONFIRM_WORDS = ("确认", "confirm", "yes", "y")
+
+
+async def _stop_quietly(svc) -> None:
+    """/reset 停后台服务：失败只记日志（不阻断清理流程）。"""
+    if svc is None:
+        return
+    try:
+        await svc.stop()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("/reset 停止服务 %s 失败：%s", type(svc).__name__, exc)
+
+
+async def _reset_all_data(container) -> list[str]:
+    """一键清空业务数据：停服务 → 清 DB/状态/文件/日志 → 重建重启。
+
+    保留（配置）：.env、115 cookie 文件、监控频道（monitor.db）、
+    /dir add 的监控目录（share_dirs 表）。
+    清空（数据）：TMDB 缓存、推送去重历史、分享登记、
+    统一状态存储（state.db）、ed2k_results.jsonl、全部日志。
+    """
+    from pathlib import Path
+
+    from app.db.state import StateStore
+    from app.logging_config import purge_log_files
+
+    s = container.settings
+
+    # 1) 停后台服务（必须先停：内存态会把已清空的数据写回 DB）
+    for svc in (
+        container.cd2_uploader,
+        container.ed2k_pusher,
+        container.ed2k_service,
+        container.local_media,
+        container.share_watcher,
+        container.inspector,
+    ):
+        await _stop_quietly(svc)
+
+    summary: list[str] = []
+
+    # 2) 清业务数据库（share_dirs 为用户配置，保留）
+    if container.cache is not None:
+        counts = await container.cache.clear_all()
+        summary.append(
+            "数据库：tmdb_cache {tmdb_cache} · pushed_shares {pushed_shares} · shared_items {shared_items} 行已清".format(**counts)
+        )
+
+    # 3) 清统一状态存储（data/state.db 全部服务行）
+    StateStore(s.state_db_path).clear()
+    summary.append(f"状态存储：{s.state_db_path} 已清空")
+
+    # 4) 删散落数据文件（ed2k 结果 JSONL + 旧状态 JSON 残留/迁移备份）
+    data_dir = Path(s.state_db_path).resolve().parent
+    removed = 0
+    for pattern in ("ed2k_results.jsonl", "*_state.json", "*.migrated"):
+        for p in data_dir.glob(pattern):
+            try:
+                p.unlink()
+                removed += 1
+            except OSError as exc:
+                logger.warning("/reset 删除文件失败 %s：%s", p, exc)
+    if removed:
+        summary.append(f"数据文件：{removed} 个已删除（ed2k 结果/旧状态残留）")
+
+    # 5) 清日志（当前 + 全部归档，随后重建 handler）
+    removed_logs = purge_log_files(
+        s.log_level,
+        use_color=s.log_color,
+        log_file=s.log_file,
+        log_media_file=s.log_media_file,
+        log_max_bytes=s.log_max_bytes,
+        log_retention_days=s.log_retention_days,
+    )
+    summary.append(f"日志：{len(removed_logs)} 个文件已清空（含归档）")
+
+    # 6) 重建媒体流水线（全新实例 = 全新内存态）并重启
+    restarted: list[str] = []
+    if s.local_media_enabled:
+        from app.media.service import LocalMediaService
+
+        container.local_media = LocalMediaService(container, s)
+        await container.local_media.start()
+        restarted.append("本地媒体 A→B")
+    if s.ed2k_enabled:
+        from app.media.ed2k_service import Ed2kService
+
+        container.ed2k_service = Ed2kService(s)
+        await container.ed2k_service.start()
+        restarted.append("ed2k 哈希 B→C")
+    if s.ed2k_push_enabled:
+        from app.media.ed2k_pusher import Ed2kPusherService
+
+        container.ed2k_pusher = Ed2kPusherService(container, s)
+        await container.ed2k_pusher.start()
+        restarted.append("ed2k 推送")
+    if s.cd2_enabled:
+        from app.media.cd2_uploader import Cd2UploaderService
+
+        container.cd2_uploader = Cd2UploaderService(container, s)
+        await container.cd2_uploader.start()
+        restarted.append("CD2 上传 C→115")
+    # 巡检/目录监控无内存态缓存，直接重启原实例
+    if container.inspector is not None:
+        await container.inspector.start()
+        restarted.append("分享巡检")
+    if container.share_watcher is not None:
+        await container.share_watcher.start()
+        restarted.append("目录监控")
+    summary.append("已重启：" + " · ".join(restarted))
+    logger.warning("/reset 数据清空完成：%s", "；".join(summary))
+    return summary
+
+
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/reset：一键清空除配置外的所有数据（二次确认防误触）。
+
+    /reset        — 查看将清空/保留的内容
+    /reset 确认    — 执行清空（不可恢复）
+    """
+    if not _is_admin(update, context):
+        await update.message.reply_text(_DENY_TEXT)
+        return
+    if not context.args or context.args[0].lower() not in _RESET_CONFIRM_WORDS:
+        await update.message.reply_text(
+            "⚠️ <b>一键重置（不可恢复）</b>\n\n"
+            "<b>将清空：</b>\n"
+            "  • TMDB 元数据缓存\n"
+            "  • 已推送分享去重历史（同资源可能被重新推送）\n"
+            "  • 分享登记与失败退避状态\n"
+            "  • 流水线状态存储（completed/offset/退避）\n"
+            "  • ed2k 哈希结果（ed2k_results.jsonl）\n"
+            "  • 全部本地日志（含归档）\n\n"
+            "<b>保留（配置）：</b>\n"
+            "  • .env 与 115 cookie 文件\n"
+            "  • 频道监控（/mon）与目录监控（/dir）配置\n\n"
+            "确认执行请发送：<code>/reset 确认</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    container = _container(context)
+    try:
+        summary = await _reset_all_data(container)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("/reset 执行失败")
+        await update.message.reply_text(f"❌ 重置失败：{exc}\n建议重启容器后重试")
+        return
+    await update.message.reply_text(
+        "🧹 <b>重置完成</b>（服务已自动重启）\n" + "\n".join(f"• {line}" for line in summary),
+        parse_mode="HTML",
+    )
 
 
 async def cmd_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1508,6 +1751,7 @@ _BOT_COMMANDS: list[BotCommand] = [
     BotCommand("share", "扫描目录建永久分享并推送"),
     BotCommand("ed2k_status", "ed2k 推送状态与 pending 队列"),
     BotCommand("upload_status", "CD2 上传状态（进度/退避）"),
+    BotCommand("reset", "一键清空数据（二次确认）"),
 ]
 
 
@@ -1624,6 +1868,7 @@ def register(application: Application) -> None:
     application.add_handler(CommandHandler("share", cmd_share))
     application.add_handler(CommandHandler("ed2k_status", cmd_ed2k_status))
     application.add_handler(CommandHandler("upload_status", cmd_upload_status))
+    application.add_handler(CommandHandler("reset", cmd_reset))
     application.add_handler(
         CallbackQueryHandler(
             on_edit_callback,

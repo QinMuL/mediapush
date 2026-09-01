@@ -68,7 +68,11 @@ class Settings:
     log_level: str = "INFO"
     log_color: bool = True
     log_file: str = "./data/logs/mediapush.log"
+    log_media_file: str = "./data/logs/media.log"      # 本地媒体流水线独立日志
+    log_max_bytes: int = 5 * 1024 * 1024               # 单文件轮转阈值（字节）
+    log_retention_days: float = 7.0                     # 轮转归档保留天数（按 mtime 清理）
     db_path: str = "./data/cache.db"
+    state_db_path: str = "./data/state.db"              # 各服务统一状态存储
     # 频道监控（Telethon 用户账号，见 app/monitor/）
     tg_api_id: int = 0
     tg_api_hash: str = ""
@@ -132,6 +136,7 @@ class Settings:
     cd2_upload_dry_run: bool = True                # 模拟：只查重+日志，不提交任务
     cd2_upload_interval_seconds: float = 60.0      # 扫描周期
     cd2_stuck_days: float = 7.0                     # 上传失败卡死告警（天）
+    cd2_report_admin: bool = True                   # 有动作的轮次把汇总+明细发给 TG_ADMIN_IDS
 
     @classmethod
     def load(cls, *, dotenv_override: bool = False) -> Settings:
@@ -175,7 +180,18 @@ class Settings:
             log_level=(os.getenv("LOG_LEVEL", "INFO").strip() or "INFO").upper(),
             log_color=_env_bool("LOG_COLOR", True),
             log_file=os.getenv("LOG_FILE", "./data/logs/mediapush.log").strip(),
+            log_media_file=os.getenv(
+                "LOG_MEDIA_FILE", "./data/logs/media.log"
+            ).strip(),
+            log_max_bytes=max(
+                64 * 1024, _env_int("LOG_MAX_BYTES", 5 * 1024 * 1024)
+            ),
+            log_retention_days=max(
+                0.5, _env_float("LOG_RETENTION_DAYS", 7.0)
+            ),
             db_path=os.getenv("DB_PATH", "./data/cache.db").strip() or "./data/cache.db",
+            state_db_path=os.getenv("STATE_DB_PATH", "./data/state.db").strip()
+            or "./data/state.db",
             tg_api_id=_env_int("TG_API_ID", 0),
             tg_api_hash=os.getenv("TG_API_HASH", "").strip(),
             monitor_enabled=_env_bool("MONITOR_ENABLED", True),
@@ -246,6 +262,7 @@ class Settings:
                 5.0, _env_float("CD2_UPLOAD_INTERVAL_SECONDS", 60.0)
             ),
             cd2_stuck_days=max(1.0, _env_float("CD2_STUCK_DAYS", 7.0)),
+            cd2_report_admin=_env_bool("CD2_REPORT_ADMIN", True),
         )
         settings._ensure_dirs()
         return settings
@@ -346,4 +363,5 @@ HOT_RELOAD_FIELDS: frozenset[str] = frozenset({
     "cd2_upload_dry_run",
     "cd2_upload_interval_seconds",
     "cd2_stuck_days",
+    "cd2_report_admin",
 })

@@ -34,6 +34,33 @@ async def notify_admins(bot, admin_ids: list[int], text: str) -> None:
             logger.warning("私信 admin %s 失败：%s", uid, exc)
 
 
+def render_progress_bar(pct: float, width: int = 20) -> str:
+    """进度条：render_progress_bar(46.5) -> '█████████░░░░░░░░░░░'（超界自动截断）。"""
+    pct = max(0.0, min(100.0, pct))
+    filled = round(pct / 100.0 * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def format_round_report(icon: str, title: str, summary: str,
+                        details: list[str] | None = None, *,
+                        dry_run: bool = False) -> str:
+    """轮次汇总通知统一模板（纯文本，各后台服务共用，风格一致）：
+
+        {icon} [DRY-RUN] {title} · {MM-DD HH:MM}
+        {summary}
+        {明细行...}
+
+    - icon/title 由调用方给（📂 目录监控 / ⚰️ 巡检 / 📤 ed2k 推送汇总 / 📤 CD2 上传汇总）
+    - 纯文本不用 HTML 粗体：与 notify_admins 渲染路径一致，转发/复制不丢格式
+    """
+    tag = " [DRY-RUN]" if dry_run else ""
+    ts = time.strftime("%m-%d %H:%M")
+    lines = [f"{icon}{tag} {title} · {ts}", summary]
+    if details:
+        lines.extend(details)
+    return "\n".join(lines)
+
+
 class AdminNotifier:
     """带节流的 admin 告警器（巡检/监控循环共用）。
 

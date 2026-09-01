@@ -23,12 +23,25 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
+from app.db.state import StateStore, load_with_legacy
 from app.media.service import retry_backoff_seconds
+from app.telegram.notifier import render_progress_bar
 
 logger = logging.getLogger(__name__)
+
+
+def _fmt_dur(seconds: float) -> str:
+    """时长友好显示（进度条 ETA/已传时长用）。"""
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return f"{seconds:.0f} 秒"
+    mins = seconds / 60
+    if mins < 60:
+        return f"{mins:.0f} 分钟"
+    return f"{mins // 60:.0f} 小时 {mins % 60:.0f} 分"
 
 
 @dataclass
@@ -43,6 +56,8 @@ class Cd2UploadReport:
     failed: int = 0         # 本轮失败（退避）
     stuck: int = 0           # 超 STUCK_DAYS 告警
     active: int = 0          # 当前传输中任务数
+    details: list[str] = field(default_factory=list)  # 本轮事件明细（admin 通知用）
+    progress_notified: int = 0  # 已通过进度消息单独通知的事件数（提交/完成/失败）
 
     def summary(self) -> str:
         s = f"扫描 {self.scanned} 个文件"
@@ -79,7 +94,8 @@ class _TaskInfo:
 class Cd2UploaderService:
     """目录C → CD2 CopyFile → 115 上传服务。"""
 
-    def __init__(self, settings) -> None:
+    def __init__(self, container, settings) -> None:
+        self.container = container   # 取 telegram bot 发 admin 通知（未 build 时为 None）
         self.settings = settings
         self.interval = max(5.0, settings.cd2_upload_interval_seconds)
         self.address = settings.cd2_address
@@ -88,7 +104,11 @@ class Cd2UploaderService:
         self.password = settings.cd2_password
         self.src_dir = settings.cd2_upload_src.rstrip("/")
         self.dst_dir = settings.cd2_upload_dst.rstrip("/")
-        self.state_file = Path("./data/cd2_state.json")
+        # 统一状态存储（data/state.db，service=cd2；旧 cd2_state.json 自动迁移）
+        self._store = StateStore(getattr(settings, "state_db_path", "./data/state.db"))
+        # DRY-RUN 已模拟处理的文件（内存级：dry 期间防重复出日志；
+        # 不落盘——切回实际模式后这些文件正常上传，不被"已完成"污染）
+        self._dry_done: set[str] = set()
 
         # 运行态
         self._jwt: str | None = None            # GetToken 缓存（token 模式无需）
@@ -102,6 +122,12 @@ class Cd2UploaderService:
         # 列目录失败 warning 冷却（同路径 5min 内 1 条，防刷屏）
         self._list_dir_warn_cooldown: float = 300.0
         self._last_list_dir_warn_at: dict[str, float] = {}
+        # 最近一轮汇总（/upload_status 与 /status 展示用）
+        self._last_report: str | None = None
+        # 任务进度消息（进度条通知）：每个 admin 一条，随轮次 edit 更新
+        self._progress_msgs: list[tuple[int, int]] = []  # (chat_id, message_id)
+        self._progress_src: str | None = None            # 进度消息跟随的任务 src
+        self._progress_last_text: str = ""                # 防重复编辑（同文不 edit）
 
     # ------------------------------------------------------------------ #
     # gRPC 连接层（同步，统一走 executor）
@@ -160,29 +186,17 @@ class Cd2UploaderService:
     # 状态持久化
     # ------------------------------------------------------------------ #
     def _load_state(self) -> None:
-        try:
-            data = json.loads(self.state_file.read_text(encoding="utf-8"))
-            self._retry_state = {
-                k: v for k, v in data.get("retry", {}).items() if isinstance(v, dict)
-            }
-            self._completed = set(data.get("completed", []))
-        except FileNotFoundError:
-            pass
-        except (OSError, ValueError) as exc:
-            logger.warning("CD2 状态加载失败（按空启动）：%s", exc)
+        data = load_with_legacy(self._store, "cd2", "./data/cd2_state.json")
+        self._retry_state = {
+            k: v for k, v in (data.get("retry") or {}).items() if isinstance(v, dict)
+        }
+        self._completed = set(data.get("completed") or [])
 
     def _save_state(self) -> None:
-        try:
-            self.state_file.parent.mkdir(parents=True, exist_ok=True)
-            self.state_file.write_text(
-                json.dumps(
-                    {"retry": self._retry_state, "completed": list(self._completed)},
-                    ensure_ascii=False, indent=1,
-                ),
-                encoding="utf-8",
-            )
-        except OSError as exc:
-            logger.warning("CD2 状态保存失败：%s", exc)
+        self._store.save(
+            "cd2",
+            {"retry": self._retry_state, "completed": list(self._completed)},
+        )
 
     # ------------------------------------------------------------------ #
     # gRPC 操作封装（同步方法，由 executor 调用）
@@ -276,10 +290,13 @@ class Cd2UploaderService:
         names_dst: set[str] | None = None  # 115 目标目录文件名集（懒加载）
 
         # 3) 稳定检测 + 新任务提交（串行：有活跃任务时不提交新的）
+        dry_run = bool(self.settings.cd2_upload_dry_run)
         for f in videos:
             src = f.fullPathName
             if src in self._completed or src in self._tasks:
                 continue
+            if dry_run and src in self._dry_done:
+                continue  # dry 期间已模拟过（内存去重，防每轮刷日志）
             st = self._retry_state.get(src)
             if st is not None and st.get("next_retry", 0) > now:
                 continue
@@ -302,16 +319,22 @@ class Cd2UploaderService:
             if f.name in names_dst:
                 self._completed.add(src)
                 report.skipped += 1
+                report.details.append(f"⏭️ {f.name}：115 目标已存在同名，跳过")
                 logger.info("CD2 上传跳过 %s：115 目标已存在同名", f.name)
                 continue
             # 提交
-            if self.settings.cd2_upload_dry_run:
+            if dry_run:
                 report.dry_submitted += 1
+                report.details.append(
+                    f"🔍 [DRY-RUN] 将上传 {f.name}（{f.size / 1024**3:.2f}GB）"
+                )
                 logger.info(
                     "[DRY-RUN] CD2 将上传 %s（%.2fGB）→ %s",
                     f.name, f.size / 1024**3, self.dst_dir,
                 )
-                self._completed.add(src)  # 模拟完成后不再重复
+                # 只记内存级去重（不落盘）：dry→real 切换后该文件正常上传，
+                # 不会因 dry 期间被标"已完成"而跳过
+                self._dry_done.add(src)
                 continue
             ok = await loop.run_in_executor(None, self._submit_copy, src)
             if ok:
@@ -324,8 +347,15 @@ class Cd2UploaderService:
                     "CD2 上传任务已提交：%s（%.2fGB）→ %s",
                     f.name, f.size / 1024**3, self.dst_dir,
                 )
+                # 进度条消息（发送成功则不再进本轮汇总明细，避免同事件两条通知）
+                if await self._send_progress_start(self._tasks[src]):
+                    report.progress_notified += 1
+                else:
+                    report.details.append(
+                        f"📤 新任务 {f.name}（{f.size / 1024**3:.2f}GB）"
+                    )
             else:
-                self._record_failure(src, f.name, "CopyFile 提交失败", report, now)
+                await self._record_failure(src, f.name, "CopyFile 提交失败", report, now)
 
         report.active = len(self._tasks)
         self._save_state()
@@ -366,21 +396,21 @@ class Cd2UploaderService:
                 if dst_files is not None and any(
                     x.name == info.name and not x.isDirectory for x in dst_files
                 ):
-                    self._finish(info, report, now)
+                    await self._finish(info, report, now)
                 else:
-                    self._record_failure(
+                    await self._record_failure(
                         src, info.name, "任务消失且目标无此文件", report, now
                     )
                 continue
             for t in matched:
                 status = t.status
                 if status == 3:  # Completed
-                    self._finish(info, report, now)
+                    await self._finish(info, report, now)
                 elif status == 4:  # Failed
                     err = "; ".join(
                         f"{e.path}: {e.error}" for e in list(t.errors)[:3]
                     ) or "未知错误"
-                    self._record_failure(
+                    await self._record_failure(
                         src, info.name, f"CD2 任务失败: {err}", report, now
                     )
                 else:
@@ -388,9 +418,10 @@ class Cd2UploaderService:
                     info.uploaded_bytes = t.uploadedBytes
                     info.last_progress = now
                     report.active += 1
+                    await self._edit_task_progress(info, now)
 
-    def _finish(self, info: _TaskInfo, report: Cd2UploadReport, now: float) -> None:
-        """任务完成：删源 + 状态清理 + 日志（同步：executor 内调用安全）。"""
+    async def _finish(self, info: _TaskInfo, report: Cd2UploadReport, now: float) -> None:
+        """任务完成：删源 + 状态清理 + 进度消息收尾 + 日志。"""
         loop = asyncio.get_running_loop()
         ok = loop.run_in_executor(None, self._delete_file, info.src_path)
         self._tasks.pop(info.src_path, None)
@@ -404,11 +435,23 @@ class Cd2UploaderService:
             "CD2 上传完成 %s（%.2fGB，%.1f 分钟，%.1f MB/s%s）",
             info.name, info.size / 1024**3, took / 60, speed, note,
         )
+        # 进度消息收尾：编辑为完成态（该事件已单独通知，不再进汇总明细）
+        if await self._end_progress(
+            f"✅ CD2 上传完成 · {info.name}\n"
+            f"[{render_progress_bar(100.0)}] 100%"
+            f" · {info.size / 1024**3:.2f}GB · {took / 60:.1f} 分钟 · {speed:.1f} MB/s{note}",
+            info.src_path,
+        ):
+            report.progress_notified += 1
+        else:
+            report.details.append(
+                f"✅ {info.name}（{info.size / 1024**3:.2f}GB · {took / 60:.1f} 分钟 · {speed:.1f} MB/s{note}）"
+            )
         if ok is None:
             logger.warning("CD2 上传完成但删源调度失败：%s", info.name)
 
-    def _record_failure(self, src: str, name: str, reason: str,
-                         report: Cd2UploadReport, now: float) -> None:
+    async def _record_failure(self, src: str, name: str, reason: str,
+                               report: Cd2UploadReport, now: float) -> None:
         self._tasks.pop(src, None)
         st = self._retry_state.get(src, {"failures": 0, "first_seen": now})
         st["failures"] += 1
@@ -426,6 +469,133 @@ class Cd2UploaderService:
             "CD2 上传失败 %s（%s）→ %.1fh 后重试（第 %d 次）",
             name, reason, backoff_h, st["failures"],
         )
+        # 进度消息收尾：编辑为失败态（该事件已单独通知，不再进汇总明细）
+        if await self._end_progress(
+            f"⚠️ CD2 上传失败 · {name}\n{reason} → {backoff_h:.1f}h 后重试"
+            f"（第 {st['failures']} 次）",
+            src,
+        ):
+            report.progress_notified += 1
+        else:
+            report.details.append(
+                f"⏳ 失败 {name}（第 {st['failures']} 次：{reason}，{backoff_h:.1f}h 后重试）"
+            )
+
+    # ------------------------------------------------------------------ #
+    # 进度条消息（任务提交 → 传输中随轮编辑 → 完成/失败收尾）
+    # ------------------------------------------------------------------ #
+    def _progress_bot(self):
+        """进度消息可用的 raw bot（CD2_REPORT_ADMIN 开 + TG 已 build + 有 admin）。"""
+        if not getattr(self.settings, "cd2_report_admin", True):
+            return None
+        tg = getattr(self.container, "telegram", None) if self.container else None
+        bot = getattr(tg, "bot", None) if tg is not None else None
+        if bot is None or not (getattr(self.settings, "tg_admin_ids", None) or []):
+            return None
+        return bot
+
+    async def _send_progress_start(self, info: _TaskInfo) -> bool:
+        """任务提交时给每个 admin 发进度条消息（至少送达一个才算成功）。"""
+        bot = self._progress_bot()
+        if bot is None:
+            return False
+        text = (
+            f"📤 CD2 上传开始 · {info.name}\n"
+            f"[{render_progress_bar(0.0)}] 0%"
+            f" · 0.00/{info.size / 1024**3:.2f}GB"
+        )
+        msgs: list[tuple[int, int]] = []
+        for uid in self.settings.tg_admin_ids:
+            try:
+                m = await bot.send_message(chat_id=uid, text=text)
+                msgs.append((uid, m.message_id))
+            except Exception as exc:  # noqa: BLE001 - 通知失败不影响主链路
+                logger.warning("CD2 进度消息发送 admin %s 失败：%s", uid, exc)
+        if not msgs:
+            return False
+        self._progress_msgs = msgs
+        self._progress_src = info.src_path
+        self._progress_last_text = text
+        return True
+
+    async def _edit_progress(self, text: str) -> None:
+        """编辑进度消息（同文跳过防 Message is not modified；编辑失败的剔除防循环报错）。"""
+        if not self._progress_msgs or text == self._progress_last_text:
+            return
+        bot = self._progress_bot()
+        if bot is None:
+            return
+        alive: list[tuple[int, int]] = []
+        for cid, mid in self._progress_msgs:
+            try:
+                await bot.edit_message_text(chat_id=cid, message_id=mid, text=text)
+                alive.append((cid, mid))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("CD2 进度消息编辑失败（%s）：%s", cid, exc)
+        self._progress_msgs = alive
+        self._progress_last_text = text
+
+    async def _end_progress(self, text: str, src: str) -> bool:
+        """任务终态收尾：把进度消息编辑为完成/失败态并清空进度状态。"""
+        if not self._progress_msgs or self._progress_src != src:
+            return False
+        await self._edit_progress(text)
+        self._progress_msgs = []
+        self._progress_src = None
+        self._progress_last_text = ""
+        return True
+
+    async def _edit_task_progress(self, info: _TaskInfo, now: float) -> None:
+        """传输中随轮更新进度条；CD2 单文件传输不报字节时降级显示已传时长。"""
+        if not self._progress_msgs or self._progress_src != info.src_path:
+            return
+        elapsed = max(0.0, now - info.submitted_at)
+        if info.uploaded_bytes > 0 and info.size > 0:
+            pct = min(100.0, info.uploaded_bytes / info.size * 100)
+            speed = info.uploaded_bytes / max(0.1, elapsed)
+            eta = (info.size - info.uploaded_bytes) / max(1.0, speed)
+            await self._edit_progress(
+                f"📤 CD2 上传中 · {info.name}\n"
+                f"[{render_progress_bar(pct)}] {pct:.0f}%"
+                f" · {info.uploaded_bytes / 1024**3:.2f}/{info.size / 1024**3:.2f}GB"
+                f" · {speed / 1024**2:.1f} MB/s · 剩余 {_fmt_dur(eta)}"
+            )
+        else:
+            await self._edit_progress(
+                f"📤 CD2 上传中 · {info.name}\n"
+                f"[{render_progress_bar(0.0)}] 传输中（CD2 单文件不报字节进度）"
+                f" · 已 {_fmt_dur(elapsed)}"
+            )
+
+    # ------------------------------------------------------------------ #
+    # admin 通知（本轮有动作才发，空轮不打扰）
+    # ------------------------------------------------------------------ #
+    async def _send_report(self, report: Cd2UploadReport) -> None:
+        """把本轮汇总 + 明细发给 TG_ADMIN_IDS；发送失败只记日志，不中断循环。
+
+        已通过进度条消息单独通知的事件（提交/完成/失败）不再重复发汇总；
+        stuck 告警始终发送。
+        """
+        if not getattr(self.settings, "cd2_report_admin", True):
+            return
+        action_count = (report.completed + report.submitted + report.dry_submitted
+                        + report.skipped + report.failed)
+        if action_count - report.progress_notified <= 0 and not report.stuck:
+            return
+        tg = getattr(self.container, "telegram", None) if self.container else None
+        if tg is None:
+            return
+        from app.telegram.notifier import format_round_report
+
+        text = format_round_report(
+            "📤", "CD2 上传汇总", report.summary(), report.details,
+            dry_run=self.settings.cd2_upload_dry_run,
+        )
+        for uid in list(getattr(self.settings, "tg_admin_ids", []) or []):
+            try:
+                await tg.send_message(chat_id=uid, text=text)
+            except Exception as exc:  # noqa: BLE001 - 通知失败不影响主链路
+                logger.warning("CD2 上传汇总发送 admin %s 失败：%s", uid, exc)
 
     # ------------------------------------------------------------------ #
     # /upload_status 查询
@@ -449,6 +619,8 @@ class Cd2UploaderService:
             oldest = min(v.get("first_seen", 0) for v in self._retry_state.values())
             if oldest:
                 lines.append(f"最老失败：{(time.time() - oldest) / 3600:.1f}h 前")
+        if self._last_report:
+            lines.append(f"最近一轮：{self._last_report}")
         return lines
 
     # ------------------------------------------------------------------ #
@@ -470,11 +642,13 @@ class Cd2UploaderService:
         while True:
             try:
                 report = await self.run_once()
+                self._last_report = report.summary()
                 if (
                     report.completed or report.submitted or report.dry_submitted
                     or report.skipped or report.failed or report.stuck
                 ):
                     logger.info("CD2 上传扫描：%s", report.summary())
+                    await self._send_report(report)
             except Exception as exc:
                 logger.error("CD2 上传扫描轮异常：%s", exc, exc_info=exc)
             await asyncio.sleep(self.interval)

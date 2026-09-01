@@ -159,3 +159,35 @@ def test_stats_counts(tmp_path):
         await cache.close()
 
     asyncio.run(run())
+
+
+# -------------------- /reset 一键清空 -------------------- #
+def test_clear_all_clears_data_keeps_share_dirs(tmp_path):
+    """clear_all：业务数据表清空，share_dirs（/dir add 用户配置）保留。"""
+    import asyncio
+
+    from app.db.cache import Cache
+
+    cache = Cache(str(tmp_path / "t.db"))
+
+    async def run():
+        await cache.set_tmdb(42, "tv", {"name": "剧"}, ttl_days=1)
+        await cache.mark_pushed("abc12345", provider="115")
+        await cache.add_share_dir("/媒体", 100)
+        dir_id = (await cache.list_share_dirs())[0]["id"]
+        await cache.record_share(dir_id, 11, "剧A", "swA1")
+
+        counts = await cache.clear_all()
+        assert counts["tmdb_cache"] == 1
+        assert counts["pushed_shares"] == 1
+        assert counts["shared_items"] == 1
+
+        # 数据表全空，监控目录配置仍在
+        st = await cache.stats()
+        assert st["pushed"] == 0 and st["tmdb_cache"] == 0
+        assert st["shared_items"] == 0
+        assert st["share_dirs"] == 1
+        assert await cache.get_shared_item(dir_id, 11) is None
+        await cache.close()
+
+    asyncio.run(run())

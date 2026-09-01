@@ -96,3 +96,59 @@ def test_notify_admins_text_passthrough(text):
     bot = _FakeBot()
     asyncio.run(notify_admins(bot, [1], text))
     assert bot.sent[0][1] == text
+
+
+# -------------------- 轮次汇总统一模板 -------------------- #
+def test_format_round_report_basic():
+    """icon 标题 + 时间戳 + 汇总行 + 明细行，顺序稳定。"""
+    from app.telegram.notifier import format_round_report
+
+    text = format_round_report("📤", "CD2 上传汇总", "扫描 3：完成 1", ["✅ a.mkv"])
+    lines = text.splitlines()
+    assert lines[0].startswith("📤 CD2 上传汇总 · ")  # 头行含时间戳
+    assert len(lines[0].split("· ")[-1]) == 11  # MM-DD HH:MM
+    assert lines[1] == "扫描 3：完成 1"
+    assert lines[2] == "✅ a.mkv"
+
+
+def test_format_round_report_dry_run_tag():
+    """dry-run 标注紧跟 icon，全大写可辨识。"""
+    from app.telegram.notifier import format_round_report
+
+    text = format_round_report("📤", "ed2k 推送汇总", "读取 1 条", dry_run=True)
+    assert text.splitlines()[0].startswith("📤 [DRY-RUN] ed2k 推送汇总 · ")
+    # 纯文本：不允许再走 HTML 粗体（统一渲染路径）
+    assert "<b>" not in text and "<i>" not in text
+
+
+def test_format_round_report_no_details():
+    """无明细：只有头行 + 汇总行，不产生多余空行。"""
+    from app.telegram.notifier import format_round_report
+
+    text = format_round_report("📂", "目录监控扫描", "无新内容")
+    assert len(text.splitlines()) == 2
+
+
+# -------------------- 进度条渲染 -------------------- #
+def test_render_progress_bar_basic():
+    """0/50/100 三档填充正确。"""
+    from app.telegram.notifier import render_progress_bar
+
+    assert render_progress_bar(0, 10) == "░" * 10
+    assert render_progress_bar(50, 10) == "█████░░░░░"
+    assert render_progress_bar(100, 10) == "█" * 10
+
+
+def test_render_progress_bar_clamps_out_of_range():
+    """负数/超 100 自动截断到边界。"""
+    from app.telegram.notifier import render_progress_bar
+
+    assert render_progress_bar(-20, 8) == "░" * 8
+    assert render_progress_bar(250, 8) == "█" * 8
+
+
+def test_render_progress_bar_rounding():
+    """四舍五入取整（46.5% 宽 20 → 9 格）。"""
+    from app.telegram.notifier import render_progress_bar
+
+    assert render_progress_bar(46.5, 20) == "█" * 9 + "░" * 11

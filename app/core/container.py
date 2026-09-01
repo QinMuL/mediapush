@@ -191,7 +191,7 @@ class Container:
         if self.settings.cd2_enabled:
             from app.media.cd2_uploader import Cd2UploaderService
 
-            self.cd2_uploader = Cd2UploaderService(self.settings)
+            self.cd2_uploader = Cd2UploaderService(self, self.settings)
             logger.info(
                 "CD2 上传已创建：%s → %s（%s）",
                 self.settings.cd2_upload_src,

@@ -140,6 +140,18 @@ class Cache:
             await self._db.close()
             self._db = None
 
+    async def clear_all(self) -> dict[str, int]:
+        """/reset 清空业务数据表（保留 share_dirs 用户配置），返回各表删除行数。
+
+        - tmdb_cache / pushed_shares / shared_items：纯派生数据，直接清
+        - share_dirs 是 /dir add 的用户配置，不清（重置不丢监控目录）
+        """
+        counts: dict[str, int] = {}
+        for table in ("tmdb_cache", "pushed_shares", "shared_items"):
+            cur = await self._execute(f"DELETE FROM {table}")
+            counts[table] = cur.rowcount or 0
+        return counts
+
     # ------------------------------------------------------------------ #
     # TMDB 缓存
     # ------------------------------------------------------------------ #

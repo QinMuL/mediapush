@@ -28,6 +28,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.db.state import StateStore, load_with_legacy
 from app.media.namer import NamingResult, analyze_file, sanitize_name
 
 logger = logging.getLogger(__name__)
@@ -128,7 +129,8 @@ class LocalMediaService:
         self.interval = max(1.0, settings.local_media_interval_seconds)
         self.input_dir = Path(settings.local_media_input_dir)
         self.output_dir = Path(settings.local_media_output_dir)
-        self.state_file = Path("./data/local_media_state.json")
+        # 统一状态存储（data/state.db，service=local_media；旧 JSON 自动迁移）
+        self._store = StateStore(getattr(settings, "state_db_path", "./data/state.db"))
         # 单轮最多处理成功数（兜底默认 5，防止一次性百来个文件把 IO/TMDB 打爆）
         self._batch_move_max: int = max(
             1, int(getattr(settings, "local_media_batch_move_max", 5))
@@ -140,6 +142,7 @@ class LocalMediaService:
         self._retry_state: dict[str, dict] = {}
         # DRY-RUN 已模拟处理的文件（内存级，重启清空；防同一文件无限循环）
         self._dry_done: set[str] = set()
+        self._last_report: str | None = None  # 最近一轮汇总（/status 展示用）
         self._load_state()
         self._task: asyncio.Task | None = None
 
@@ -147,25 +150,13 @@ class LocalMediaService:
     # 状态持久化
     # ------------------------------------------------------------------ #
     def _load_state(self) -> None:
-        try:
-            data = json.loads(self.state_file.read_text(encoding="utf-8"))
-            self._retry_state = {
-                k: v for k, v in data.items() if isinstance(v, dict)
-            }
-        except FileNotFoundError:
-            pass
-        except (OSError, ValueError) as exc:
-            logger.warning("本地媒体重试状态加载失败（按空启动）：%s", exc)
+        data = load_with_legacy(self._store, "local_media", "./data/local_media_state.json")
+        self._retry_state = {
+            k: v for k, v in data.items() if isinstance(v, dict)
+        }
 
     def _save_state(self) -> None:
-        try:
-            self.state_file.parent.mkdir(parents=True, exist_ok=True)
-            self.state_file.write_text(
-                json.dumps(self._retry_state, ensure_ascii=False, indent=1),
-                encoding="utf-8",
-            )
-        except OSError as exc:
-            logger.warning("本地媒体重试状态保存失败：%s", exc)
+        self._store.save("local_media", self._retry_state)
 
     # ------------------------------------------------------------------ #
     # 单轮扫描
@@ -334,6 +325,7 @@ class LocalMediaService:
         while True:
             try:
                 report = await self.run_once()
+                self._last_report = report.summary()
                 if report.moved or report.dry_moved or report.stable or report.low_conf or report.conflict or report.stuck:
                     logger.info("本地媒体扫描：%s", report.summary())
             except Exception as exc:

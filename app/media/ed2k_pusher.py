@@ -26,7 +26,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.core.link_parser import ParsedShare
+from app.db.state import StateStore, load_with_legacy
 from app.media.service import retry_backoff_seconds
+from app.telegram.notifier import render_progress_bar
 
 logger = logging.getLogger(__name__)
 
@@ -59,35 +61,35 @@ class Ed2kPusherService:
         self.settings = settings
         self.interval = max(1.0, settings.ed2k_push_interval_seconds)
         self.results_file = Path("./data/ed2k_results.jsonl")
-        self.state_file = Path("./data/ed2k_push_state.json")
+        # 统一状态存储（data/state.db，service=ed2k_push；旧 JSON 自动迁移）
+        self._store = StateStore(getattr(settings, "state_db_path", "./data/state.db"))
+        self._store_bound = ""
         # {"_offset": int, "<ed2k_url>": {failures, next_retry, first_seen}}
         self._state: dict = {"_offset": 0}
-        self._load_state()
+        # dry-run 状态隔离：dry 轮不落盘（offset 不前进），
+        # 切回实际模式时从磁盘回滚，重新消费 dry 期间"吃掉"的记录
+        self._dry_prev: bool = bool(getattr(settings, "ed2k_push_dry_run", True))
         self._task: asyncio.Task | None = None
+        # 轮内批量进度条消息：处理多条记录时发一条随编辑更新，收尾编辑为汇总
+        self._progress_msgs: list[tuple[int, int]] = []  # (chat_id, message_id)
+        self._progress_last_text: str = ""
+        self._progress_last_edit: float = 0.0             # 编辑节流（防刷 API）
 
     # ------------------------------------------------------------------ #
     def _load_state(self) -> None:
-        try:
-            data = json.loads(self.state_file.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                self._state = data
-            if "_offset" not in self._state:
-                self._state["_offset"] = 0
-        except FileNotFoundError:
-            self._state = {"_offset": 0}
-        except (OSError, ValueError) as exc:
-            logger.warning("ed2k 推送状态加载失败（按空启动）：%s", exc)
-            self._state = {"_offset": 0}
+        data = load_with_legacy(self._store, "ed2k_push", "./data/ed2k_push_state.json")
+        if isinstance(data, dict) and data:
+            self._state = data
+        else:
+            self._state = {}
+        self._state.setdefault("_offset", 0)
 
     def _save_state(self) -> None:
-        try:
-            self.state_file.parent.mkdir(parents=True, exist_ok=True)
-            self.state_file.write_text(
-                json.dumps(self._state, ensure_ascii=False, indent=1),
-                encoding="utf-8",
-            )
-        except OSError as exc:
-            logger.warning("ed2k 推送状态保存失败：%s", exc)
+        # dry-run 不落盘：模拟推送"消费"的记录不能真实推进 offset，
+        # 否则切回实际模式后这些记录被永久跳过
+        if getattr(self.settings, "ed2k_push_dry_run", False):
+            return
+        self._store.save("ed2k_push", self._state)
 
     # ------------------------------------------------------------------ #
     def _read_new_lines(self) -> list[dict]:
@@ -116,11 +118,18 @@ class Ed2kPusherService:
 
     # ------------------------------------------------------------------ #
     async def run_once(self) -> PushReport:
-        # state_file/results_file 可能在 __init__ 之后被赋值（测试/配置变更场景）
-        if not getattr(self, "_state_file_bound", None) or self._state_file_bound != str(self.state_file):
+        # store/results_file 可能在 __init__ 之后被替换（测试/配置变更场景）
+        if self._store_bound != self._store.db_path:
             self._state = {"_offset": 0}
             self._load_state()
-            self._state_file_bound = str(self.state_file)
+            self._store_bound = self._store.db_path
+        # dry-run → 实际模式切换（/reload）：磁盘状态未在 dry 期间推进，
+        # 回滚内存 offset 重新消费 dry 期间模拟"吃掉"的记录
+        dry_now = bool(getattr(self.settings, "ed2k_push_dry_run", False))
+        if self._dry_prev and not dry_now:
+            logger.info("ed2k 推送 dry-run→实际：回滚到磁盘状态重新消费")
+            self._load_state()
+        self._dry_prev = dry_now
         report = PushReport()
         processor = getattr(self.container, "processor", None)
         if processor is None:
@@ -155,6 +164,19 @@ class Ed2kPusherService:
             self._save_state()
             return report
 
+        # 批量进度条消息：一轮要处理 ≥2 条且实际推送模式才发（单条走汇总即可）
+        total = len(all_records)
+        use_progress = (
+            not self.settings.ed2k_push_dry_run
+            and getattr(self.settings, "ed2k_push_report_admin", False)
+            and total >= 2
+        )
+        self._progress_msgs = []  # 每轮独立，防跨轮串消息
+        self._progress_last_text = ""
+        done = 0
+        if use_progress:
+            await self._update_push_progress(done, total, "")
+
         for rec in all_records:
             url = rec.get("ed2k")
             name = rec.get("name") or url
@@ -188,19 +210,24 @@ class Ed2kPusherService:
                 res = await processor.process(parsed)
             except Exception as exc:  # noqa: BLE001
                 self._record_failure(st_key, name, f"未预期异常: {exc}", report, now)
+                done += 1
+                if use_progress:
+                    await self._update_push_progress(done, total, name)
                 continue
 
             if res.dup:
                 report.skipped_dup += 1
                 logger.info("ed2k 已推送过，跳过：%s", name)
                 self._state.pop(st_key, None)
-                continue
-            if res.ok:
+            elif res.ok:
                 report.pushed += 1
                 logger.info("ed2k 推送成功：%s", name)
                 self._state.pop(st_key, None)
-                continue
-            self._record_failure(st_key, name, res.message or "推送失败", report, now)
+            else:
+                self._record_failure(st_key, name, res.message or "推送失败", report, now)
+            done += 1
+            if use_progress:
+                await self._update_push_progress(done, total, name)
 
         self._save_state()
         return report
@@ -265,8 +292,70 @@ class Ed2kPusherService:
             lines.append(f"• 最近一轮：{last}")
         return chr(10).join(lines)
 
+    # ------------------------------------------------------------------ #
+    # 轮内批量进度条消息（≥2 条的实际推送轮才启用）
+    # ------------------------------------------------------------------ #
+    def _progress_bot(self):
+        """进度消息可用的 raw bot（REPORT_ADMIN 开 + TG 已 build + 有 admin）。"""
+        if not getattr(self.settings, "ed2k_push_report_admin", False):
+            return None
+        tg = getattr(self.container, "telegram", None)
+        bot = getattr(tg, "bot", None) if tg is not None else None
+        if bot is None or not (getattr(self.settings, "tg_admin_ids", None) or []):
+            return None
+        return bot
+
+    def _push_progress_text(self, done: int, total: int, last: str) -> str:
+        pct = done / total * 100 if total else 0.0
+        lines = [
+            f"📤 ed2k 推送进度 · {done}/{total}",
+            f"[{render_progress_bar(pct)}] {pct:.0f}%",
+        ]
+        if last:
+            lines.append(f"最近：{last}")
+        return "\n".join(lines)
+
+    async def _update_push_progress(self, done: int, total: int, last: str) -> None:
+        """发送/编辑本轮进度消息（首条 send，后续 edit；2s 节流防刷 API）。"""
+        bot = self._progress_bot()
+        if bot is None:
+            return
+        text = self._push_progress_text(done, total, last)
+        if text == self._progress_last_text:
+            return
+        mono = time.monotonic()
+        if self._progress_msgs and mono - self._progress_last_edit < 2.0:
+            return
+        if not self._progress_msgs:
+            if self._progress_last_text:  # 首条已尝试且全部失败 → 本轮不再重试
+                return
+            msgs: list[tuple[int, int]] = []
+            for uid in self.settings.tg_admin_ids:
+                try:
+                    m = await bot.send_message(chat_id=uid, text=text)
+                    msgs.append((uid, m.message_id))
+                except Exception as exc:  # noqa: BLE001 - 通知失败不影响主链路
+                    logger.warning("ed2k 进度消息发送 admin %s 失败：%s", uid, exc)
+            if msgs:
+                self._progress_msgs = msgs
+        else:
+            alive: list[tuple[int, int]] = []
+            for cid, mid in self._progress_msgs:
+                try:
+                    await bot.edit_message_text(chat_id=cid, message_id=mid, text=text)
+                    alive.append((cid, mid))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("ed2k 进度消息编辑失败（%s）：%s", cid, exc)
+            self._progress_msgs = alive
+        self._progress_last_text = text
+        self._progress_last_edit = mono
+
     async def _send_report(self, report: PushReport) -> None:
-        """把本轮汇总发 admin / 目标频道（按配置）。发送失败只记日志，不中断循环。"""
+        """把本轮汇总发 admin / 目标频道（按配置）。发送失败只记日志，不中断循环。
+
+        本轮有进度条消息时，admin 的汇总直接编辑该消息（进度条 100% 收尾），
+        不再另发新消息；频道同步不受影响。
+        """
         if not (self.settings.ed2k_push_report_admin or self.settings.ed2k_push_report_channel):
             return
         # 有任何有效动作（read/pushed/...）才发；空轮只在有 pending / 卡死时发
@@ -279,27 +368,39 @@ class Ed2kPusherService:
         tg = getattr(self.container, "telegram", None)
         if tg is None:
             return
-        header = (
-            "🔍 [DRY-RUN] ed2k 推送汇总"
-            if self.settings.ed2k_push_dry_run
-            else "📤 ed2k 推送汇总"
+        from app.telegram.notifier import format_round_report
+
+        text = format_round_report(
+            "📤", "ed2k 推送汇总", report.summary(),
+            dry_run=self.settings.ed2k_push_dry_run,
         )
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        text = f"<b>{header}</b>  <i>{ts}</i>" + chr(10) + report.summary()
-        targets: list[int | str] = []
+        # admin 目标：有进度消息 → 编辑为最终汇总；否则新发
         if self.settings.ed2k_push_report_admin:
-            targets = list(getattr(self.settings, "tg_admin_ids", []) or [])
+            bot = getattr(tg, "bot", None)
+            if self._progress_msgs and bot is not None:
+                for cid, mid in self._progress_msgs:
+                    try:
+                        await bot.edit_message_text(chat_id=cid, message_id=mid, text=text)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("ed2k 推送汇总编辑 %s 失败：%s", cid, exc)
+            else:
+                for uid in list(getattr(self.settings, "tg_admin_ids", []) or []):
+                    try:
+                        await tg.send_message(chat_id=uid, text=text)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("ed2k 推送汇总 %s 发送失败：%s", uid, exc)
+        # 频道同步（进度条只进 admin 私信，不刷频道）
         if self.settings.ed2k_push_report_channel:
             cid = getattr(self.settings, "tg_chat_id_ed2k", None) or getattr(
                 self.settings, "tg_chat_id", None
             )
             if cid:
-                targets.append(cid)
-        for cid in targets:
-            try:
-                await tg.send_message(chat_id=cid, text=text, parse_mode="HTML")
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("ed2k 推送汇总 %s 发送失败：%s", cid, exc)
+                try:
+                    await tg.send_message(chat_id=cid, text=text)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("ed2k 推送汇总 %s 发送失败：%s", cid, exc)
+        self._progress_msgs = []
+        self._progress_last_text = ""
 
 
     # ------------------------------------------------------------------ #

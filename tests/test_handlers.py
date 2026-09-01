@@ -1,6 +1,7 @@
 """Bot 命令菜单注册测试 + 编辑模式（/edit）流程测试。"""
 
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 from app.core.link_parser import ParsedShare
@@ -49,7 +50,7 @@ def test_bot_commands_structure():
     assert cmds == [
         "start", "help", "115", "edit", "cancel", "status", "refresh",
         "loglevel", "reload", "cookie", "mon", "inspect", "dir", "share",
-        "ed2k_status", "upload_status",
+        "ed2k_status", "upload_status", "reset",
     ]
     for c in _BOT_COMMANDS:
         assert c.description, f"{c.command} 描述为空"
@@ -645,6 +646,97 @@ def test_cmd_status_cookie_file_backfilled_not_direct():
     text = msg.reply_text.await_args.args[0]
     assert "115 Cookie：✅ 文件 ./data/115cookie.txt（UID 309130782）" in text
     assert "直配" not in text
+
+
+# ---------------------------------------------------------------------- #
+# /status：分区块 + 本地媒体流水线明细（队列深度 / 传输中 / 最近一轮）
+# ---------------------------------------------------------------------- #
+class _Cd2TaskInfo:
+    name = "x.mkv"
+    size = 2 * 1024**3
+    uploaded_bytes = 1024**3
+    submitted_at = time.time() - 600
+
+
+class _FakeCd2Uploader:
+    def __init__(self) -> None:
+        self._tasks = {"/media/media/C/x.mkv": _Cd2TaskInfo()}
+        self._completed = {f"/media/media/C/f{i}.mkv" for i in range(31)}
+        self._retry_state = {}
+        self._last_report = "扫描 5 个文件：✅ 上传完成 1"
+
+
+class _FakeLocalMedia:
+    _retry_state: dict = {}
+    _last_report = "扫描 3 个视频：稳定 3 → ✅ 移动 3"
+
+
+def test_cmd_status_sections_and_cd2_inflight_detail():
+    """/status 按 运行概览/健康/频道/常驻任务/流水线 分区块；
+    CD2 启用时显示传输中进度、已完成数与最近一轮。"""
+    pan = _StatusPan115("UID=1;")
+    container = _StatusContainer(pan)
+    s = container.settings
+    s.cd2_enabled = True
+    s.cd2_upload_dry_run = False
+    s.cd2_upload_interval_seconds = 60.0
+    s.cd2_upload_src = "/media/media/C"
+    s.cd2_upload_dst = "/115open/临时目录"
+    s.cd2_report_admin = True
+    container.cd2_uploader = _FakeCd2Uploader()
+
+    ctx = _make_context(container)
+    msg = _make_message("/status")
+    update = _make_update(message=msg)
+    asyncio.run(cmd_status(update, ctx))
+
+    text = msg.reply_text.await_args.args[0]
+    # 分区块结构
+    assert "🤖 运行概览" in text
+    assert "🩺 健康与配置" in text
+    assert "📡 频道" in text
+    assert "⚙️ 常驻任务" in text
+    assert "🎬 本地媒体流水线" in text
+    # 未启用的阶段单独标注
+    assert "① A→B 重命名：⬜ 未启用" in text
+    assert "② B→C 哈希：⬜ 未启用" in text
+    assert "③ C→频道推送：⬜ 未启用" in text
+    # CD2 阶段：状态 + 路径 + 传输中 + 已完成 + 最近一轮
+    assert "④ C→115 上传（CD2）：✅ 每 60s · 实际上传 · Admin 汇总开" in text
+    assert "/media/media/C → /115open/临时目录" in text
+    assert "传输中：x.mkv 50%" in text
+    assert "已完成 31 · 退避中 0" in text
+    assert "最近一轮：扫描 5 个文件：✅ 上传完成 1" in text
+
+
+def test_cmd_status_local_media_queue_and_last_round():
+    """A→B 启用：队列深度（目录不可访问显示 ?）+ 最近一轮汇总。"""
+    pan = _StatusPan115("UID=1;")
+    container = _StatusContainer(pan)
+    s = container.settings
+    s.local_media_enabled = True
+    s.local_media_dry_run = False
+    s.local_media_interval_seconds = 10.0
+    s.local_media_input_dir = "/nonexistent/A"
+    s.local_media_output_dir = "/media/B"
+    container.local_media = _FakeLocalMedia()
+
+    ctx = _make_context(container)
+    msg = _make_message("/status")
+    update = _make_update(message=msg)
+    asyncio.run(cmd_status(update, ctx))
+
+    text = msg.reply_text.await_args.args[0]
+    assert "① A→B 重命名：✅ 每 10s · 实际移动 · A 待处理 ? · 低置信退避 0" in text
+    assert "A=/nonexistent/A → B=/media/B" in text
+    assert "最近一轮：扫描 3 个视频" in text
+
+
+def test_cmd_status_all_disabled_shows_hint():
+    """四个流水线开关全关：显示统一未启用提示。"""
+    text = _run_status()
+    assert "🎬 本地媒体流水线" in text
+    assert "未启用" in text
 
 
 def test_cmd_cookie_file_backfilled_allows_update(tmp_path):

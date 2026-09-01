@@ -22,6 +22,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.db.state import StateStore, load_with_legacy
 from app.media.ed2k import ed2k_hash_file, ed2k_uri
 from app.media.service import (
     _TEMP_EXTS,
@@ -87,13 +88,15 @@ class Ed2kService:
         self.input_dir = Path(settings.ed2k_input_dir)
         self.output_dir = Path(settings.ed2k_output_dir)
         self.results_file = Path("./data/ed2k_results.jsonl")
-        self.state_file = Path("./data/ed2k_state.json")
+        # 统一状态存储（data/state.db，service=ed2k；旧 JSON 自动迁移）
+        self._store = StateStore(getattr(settings, "state_db_path", "./data/state.db"))
         self._seen: dict[str, tuple[int, float]] = {}
         self._stable: dict[str, int] = {}
         self._retry_state: dict[str, dict] = {}
         self._busy: set[str] = set()  # 哈希进行中：防重复触发
         # DRY-RUN 已模拟处理的文件（内存级，重启清空）
         self._dry_done: set[str] = set()
+        self._last_report: str | None = None  # 最近一轮汇总（/status 展示用）
         self._load_state()
         self._task: asyncio.Task | None = None
 
@@ -101,25 +104,13 @@ class Ed2kService:
     # 状态
     # ------------------------------------------------------------------ #
     def _load_state(self) -> None:
-        try:
-            data = json.loads(self.state_file.read_text(encoding="utf-8"))
-            self._retry_state = {
-                k: v for k, v in data.items() if isinstance(v, dict)
-            }
-        except FileNotFoundError:
-            pass
-        except (OSError, ValueError) as exc:
-            logger.warning("ed2k 状态加载失败（按空启动）：%s", exc)
+        data = load_with_legacy(self._store, "ed2k", "./data/ed2k_state.json")
+        self._retry_state = {
+            k: v for k, v in data.items() if isinstance(v, dict)
+        }
 
     def _save_state(self) -> None:
-        try:
-            self.state_file.parent.mkdir(parents=True, exist_ok=True)
-            self.state_file.write_text(
-                json.dumps(self._retry_state, ensure_ascii=False, indent=1),
-                encoding="utf-8",
-            )
-        except OSError as exc:
-            logger.warning("ed2k 状态保存失败：%s", exc)
+        self._store.save("ed2k", self._retry_state)
 
     def _append_result(self, record: dict) -> None:
         try:
@@ -302,6 +293,7 @@ class Ed2kService:
         while True:
             try:
                 report = await self.run_once()
+                self._last_report = report.summary()
                 if report.hashed or report.moved or report.dry_moved or report.conflict or report.stuck:
                     logger.info("ed2k 扫描：%s", report.summary())
             except Exception as exc:
