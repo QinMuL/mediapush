@@ -269,3 +269,101 @@ def test_report_summary():
     r = LocalMediaReport(scanned=5, stable=2, moved=3, low_conf=1, conflict=1)
     s = r.summary()
     assert "移动 3" in s and "低置信保留 1" in s and "同名跳过 1" in s
+
+
+# ---------------------------------------------------------------------- #
+# 建议 1：批量移动上限 LOCAL_MEDIA_BATCH_MOVE_MAX（默认 5）防 IO/TMDB 打爆
+# ---------------------------------------------------------------------- #
+class _FakeSettingsWithBatch(_FakeSettings):
+    """补一个 batch_move_max 字段。"""
+    local_media_batch_move_max = 3  # 上限 3 用于测试
+
+
+def _mk_service_batch(a: Path, b: Path) -> LocalMediaService:
+    st = _FakeSettingsWithBatch()
+    st.local_media_input_dir = str(a)
+    st.local_media_output_dir = str(b)
+    st.local_media_stable_rounds = 1   # 一轮即稳，便于构造大批量 stable 场景
+    st.local_media_dry_run = False
+    svc = LocalMediaService(_FakeContainer(), st)
+    svc.state_file = a.parent / "_state_test_batch.json"
+    return svc
+
+
+def test_batch_move_cap_is_enforced(dirs, monkeypatch):
+    """A 里放 6 个视频都稳定：1 轮最多移 batch_move_max=3 个，下轮再移 3 个。"""
+    import asyncio as _as
+    a, b = dirs
+    episodes = list(range(1, 7))  # E01–E06
+    for ep in episodes:
+        (a / f"Furious.S01E{ep:02d}.2026.2160p.mkv").write_bytes(b"0" * 64)
+
+    st = _FakeSettingsWithBatch()
+    st.local_media_input_dir = str(a)
+    st.local_media_output_dir = str(b)
+    st.local_media_stable_rounds = 2   # 2 轮快照一致才算稳定
+    st.local_media_dry_run = False
+    svc = LocalMediaService(_FakeContainer(), st)
+    svc.state_file = a.parent / "_state_test_batch.json"
+
+    def _mk_result(ep: int):
+        return NamingResult(
+            parsed=MediaData(
+                title="Furious", year=2026, media_type="tv",
+                season=1, episode=ep, raw=f"Furious.S01E{ep:02d}.2026.2160p.mkv",
+            ),
+            details={"title": "狂怒追缉", "year": 2026},
+            proposed=f"狂怒追缉.2026.S01E{ep:02d}.第{ep:02d}集.2160p.WEB-DL.H.265.mkv",
+        )
+
+    async def fake_analyze(path, tmdb):
+        name = Path(path).name
+        for ep in episodes:
+            if f"S01E{ep:02d}" in name:
+                return _mk_result(ep)
+        raise AssertionError(f"unexpected path {path}")
+
+    monkeypatch.setattr("app.media.service.analyze_file", fake_analyze)
+
+    # 第 1 轮：仅首拍快照（stable < 2），不移动任何
+    r1 = _as.run(svc.run_once())
+    assert r1.scanned == 6 and r1.stable == 0
+
+    # 第 2 轮：快照一致，全部达到阈值；但 batch 上限=3 → 只移 3
+    r2 = _as.run(svc.run_once())
+    assert r2.scanned == 6
+    assert r2.stable == 3, f"批量上限应只处理 3 个，实际 stable={r2.stable}"
+    assert len(list(b.rglob("*.mkv"))) == 3
+    assert len(list(a.rglob("*.mkv"))) == 3  # A 里剩下 3 个未处理
+
+    # 第 3 轮：剩余 3 个仍在 A、仍稳定 → 再移 3
+    r3 = _as.run(svc.run_once())
+    assert r3.stable == 3
+    assert len(list(b.rglob("*.mkv"))) == 6
+    assert len(list(a.rglob("*.mkv"))) == 0
+
+
+def test_batch_move_defaults_to_five_when_unset(dirs, monkeypatch):
+    """老 settings 没有 batch_move_max 属性：Service 兜底到默认 5，不报错。"""
+    import asyncio as _as
+    a, b = dirs
+    for ep in range(1, 11):
+        (a / f"S{ep:02d}.mkv").write_bytes(b"x")
+    svc = _mk_service(a, b, monkeypatch)
+    svc.settings.local_media_stable_rounds = 2
+    svc.settings.local_media_dry_run = False
+
+    async def fake_analyze(path, tmdb):
+        name = Path(path).stem
+        return NamingResult(
+            parsed=MediaData(title=name, year=2026, media_type="tv",
+                             season=1, episode=1, raw=f"{name}.mkv"),
+            details={"title": name, "year": 2026},
+            proposed=f"{name}.done.mkv",
+        )
+
+    monkeypatch.setattr("app.media.service.analyze_file", fake_analyze)
+    _as.run(svc.run_once())               # R1: 首拍快照，stable=1 < 2
+    r = _as.run(svc.run_once())            # R2: 10 个稳定，但兜底上限 5 → 移 5
+    assert r.stable == 5, f"兜底 5 应移 5 个，实际 stable={r.stable}"
+    assert len(list(b.rglob("*.mkv"))) == 5

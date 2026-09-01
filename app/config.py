@@ -105,6 +105,7 @@ class Settings:
     local_media_interval_seconds: float = 10.0  # 扫描周期
     local_media_stable_rounds: int = 3          # 稳定判定轮数（×周期）
     local_media_stuck_days: float = 7.0          # 低置信卡死告警阈值（天）
+    local_media_batch_move_max: int = 5          # 单轮最多移动的文件数（防一次性几十上百个打爆 IO/TMDB）
     # ed2k 流水线（目录B监控 → ed2k 哈希 → 目录C，见 app/media/ed2k_service.py）
     ed2k_enabled: bool = False
     ed2k_input_dir: str = ""                    # 目录B（= local_media_output_dir 通常一致）
@@ -211,6 +212,9 @@ class Settings:
             ),
             local_media_stuck_days=max(
                 1.0, _env_float("LOCAL_MEDIA_STUCK_DAYS", 7.0)
+            ),
+            local_media_batch_move_max=max(
+                1, _env_int("LOCAL_MEDIA_BATCH_MOVE_MAX", 5)
             ),
             ed2k_enabled=_env_bool("ED2K_ENABLED", False),
             ed2k_input_dir=os.getenv("ED2K_INPUT_DIR", "").strip(),

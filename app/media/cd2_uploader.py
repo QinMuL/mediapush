@@ -99,6 +99,9 @@ class Cd2UploaderService:
         self._completed: set[str] = set()         # 已完成/跳过的 src（去重）
         self._stable_seen: dict[str, str] = {}   # 稳定检测快照
         self._task: asyncio.Task | None = None
+        # 列目录失败 warning 冷却（同路径 5min 内 1 条，防刷屏）
+        self._list_dir_warn_cooldown: float = 300.0
+        self._last_list_dir_warn_at: dict[str, float] = {}
 
     # ------------------------------------------------------------------ #
     # gRPC 连接层（同步，统一走 executor）
@@ -257,6 +260,14 @@ class Cd2UploaderService:
         # 2) 列目录C
         files = await loop.run_in_executor(None, self._list_dir, self.src_dir)
         if files is None:
+            now = time.time()
+            last = self._last_list_dir_warn_at.get(self.src_dir, 0.0)
+            if now - last >= self._list_dir_warn_cooldown:
+                self._last_list_dir_warn_at[self.src_dir] = now
+                logger.warning(
+                    "CD2 源目录列取失败（返回 None）：%s 路径在 CD2 命名空间下可能不存在或 gRPC 中断——请检查 CD2_UPLOAD_SRC 配置与 CD2 服务状态（%.0f 秒内不再重复告警）",
+                    self.src_dir, self._list_dir_warn_cooldown,
+                )
             return report
         videos = [f for f in files if not f.isDirectory and f.size > 0]
         report.scanned = len(videos)

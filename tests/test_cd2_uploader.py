@@ -231,3 +231,73 @@ def test_status_lines(tmp_path):
     lines = u.status_lines()
     assert any("CD2 上传" in x for x in lines)
     assert any("DRY_RUN" in x for x in lines)
+
+
+# ---------------------------------------------------------------------- #
+# 建议 2：列目录返回 None 时冷却 warning（5min 内同路径只 1 warning）
+# ---------------------------------------------------------------------- #
+class FakeUploaderListDirNone(FakeUploader):
+    """_list_dir 永远返回 None（模拟 CD2 命名空间路径错 / gRPC 断）。"""
+
+    def _list_dir(self, path):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_list_dir_none_emits_warning_with_cooldown(tmp_path, caplog):
+    """首 2 轮连续 None：只 1 条 warning（冷却 5min）；冷却外再 1 轮再打 1 条。"""
+    import logging as _lg
+    from unittest.mock import patch as _patch
+
+    u = FakeUploaderListDirNone(make_settings(), [], [])
+    u.state_file = tmp_path / "cd2_state.json"
+    caplog.set_level(_lg.WARNING, logger="app.media.cd2_uploader")
+
+    # 冷却 300s = 5min；用「时钟固定再手动推进」模式，确保 cd2_uploader 内任何多次
+    # time.time() 调用在「同一轮」内看到同一时间戳（避免 next(iter) 消耗）。
+    clock = {"t": 1_700_000_000.0}
+
+    def _tick(delta: float = 0.0) -> None:
+        clock["t"] += delta
+
+    with _patch("app.media.cd2_uploader.time.time", lambda: clock["t"]):
+        # 轮 1：首次 None → 应 warning
+        await u.run_once()
+        warns = [r for r in caplog.records if r.levelno >= _lg.WARNING
+                 and "CD2 源目录" in r.getMessage()]
+        assert len(warns) == 1, f"首轮: expect=1, actual={[r.getMessage() for r in warns]}"
+        caplog.clear()
+
+        # 轮 2：推进 36s（仍在 300s 冷却窗内）→ 不 warning
+        _tick(36.0)
+        await u.run_once()
+        warns = [r for r in caplog.records if r.levelno >= _lg.WARNING
+                 and "CD2 源目录" in r.getMessage()]
+        assert len(warns) == 0, f"冷却内(36s): expect=0, actual={[r.getMessage() for r in warns]}"
+        caplog.clear()
+
+        # 轮 3：推进到 300s 正点（刚好 300s，>= 冷却）→ 仍按 >= 判断，会打
+        _tick(264.0)  # 36+264 = 300s
+        await u.run_once()
+        warns = [r for r in caplog.records if r.levelno >= _lg.WARNING
+                 and "CD2 源目录" in r.getMessage()]
+        assert len(warns) == 1, f"冷却到期: expect=1, actual={[r.getMessage() for r in warns]}"
+        caplog.clear()
+
+        # 轮 4：再推 10s → 310s 但还没到 300+300=600s → 不打
+        _tick(10.0)
+        await u.run_once()
+        warns = [r for r in caplog.records if r.levelno >= _lg.WARNING
+                 and "CD2 源目录" in r.getMessage()]
+        assert len(warns) == 0, f"第2冷却窗内(10s): expect=0, actual={[r.getMessage() for r in warns]}"
+
+
+@pytest.mark.asyncio
+async def test_list_dir_none_returns_empty_report(tmp_path):
+    """列目录返回 None 时 report 全 0 不抛错（保持现有静默+空 report 行为）。"""
+    u = FakeUploaderListDirNone(make_settings(), [], [])
+    u.state_file = tmp_path / "cd2_state.json"
+    r = await u.run_once()
+    assert r.scanned == 0
+    assert r.submitted == 0
+    assert r.completed == 0

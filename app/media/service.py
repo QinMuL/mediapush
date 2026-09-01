@@ -129,6 +129,10 @@ class LocalMediaService:
         self.input_dir = Path(settings.local_media_input_dir)
         self.output_dir = Path(settings.local_media_output_dir)
         self.state_file = Path("./data/local_media_state.json")
+        # 单轮最多处理成功数（兜底默认 5，防止一次性百来个文件把 IO/TMDB 打爆）
+        self._batch_move_max: int = max(
+            1, int(getattr(settings, "local_media_batch_move_max", 5))
+        )
         # 稳定性追踪：(size, mtime) 快照 + 连续稳定轮数
         self._seen: dict[str, tuple[int, float]] = {}
         self._stable: dict[str, int] = {}
@@ -198,7 +202,10 @@ class LocalMediaService:
 
         now = time.time()
         moved_sources: list[Path] = []
+        processed_success: int = 0
         for f in files:
+            if processed_success >= self._batch_move_max:
+                break
             key = str(f)
             if key in self._dry_done:
                 continue
@@ -215,6 +222,7 @@ class LocalMediaService:
             self._seen.pop(key, None)
             self._stable.pop(key, None)
             if ok:
+                processed_success += 1
                 report.stable += 1
                 moved_sources.append(f)
 
