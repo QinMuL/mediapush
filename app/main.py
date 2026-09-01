@@ -1,4 +1,4 @@
-"""程序入口：加载配置 → 构建容器 → 启动 Telegram Bot（run_polling）。"""
+﻿"""程序入口：加载配置 → 构建容器 → 启动 Telegram Bot（run_polling）。"""
 
 from __future__ import annotations
 
@@ -9,29 +9,37 @@ from app.config import Settings
 from app.core.container import Container
 from app.logging_config import setup_logging
 
-# 启动时清除进程级代理环境变量（借 P115-Share）：docker-compose 注入的
-# HTTP_PROXY 等会被 httpx/aiohttp 自动读取，导致 115（须直连防风控）与
-# TMDB 意外走代理。代理一律显式配置（PROXY_URL → PTB/TMDB；115 默认直连）。
-_PROXY_ENV_KEYS = (
-    "HTTP_PROXY", "http_proxy",
-    "HTTPS_PROXY", "https_proxy",
-    "ALL_PROXY", "all_proxy",
-)
+# 115 域名列表：p115client 内部 requests/urllib3 会读 NO_PROXY/no_proxy env，
+# 命中这些域名的请求不走代理（115 走代理易触发风控）。
+_115_DOMAINS = "115.com,.115.com"
 
 
-def _clear_proxy_env() -> None:
-    cleared = [k for k in _PROXY_ENV_KEYS if os.environ.pop(k, None) is not None]
-    if cleared:
-        logging.getLogger("app").warning(
-            "已清除进程级代理环境变量（%s）：代理请用 PROXY_URL 显式配置；"
-            "115 走直连防风控",
-            ", ".join(cleared),
-        )
+def setup_proxy_env() -> None:
+    """设置 NO_PROXY 让 115 走直连，同时保留系统代理供 TMDB 自动检测。
+
+    - 不再清除 HTTP_PROXY/HTTPS_PROXY 环境变量（旧方案 _clear_proxy_env 会
+      导致 TMDB httpx trust_env=True 拿不到系统代理）
+    - 改为设置 NO_PROXY=115.com,.115.com：p115client 内部 requests 看到后
+      对 115 域名走直连，其它域名（如 api.themoviedb.org）仍可用系统代理
+    - TG Bot 走 PTB 显式 .proxy(PROXY_URL)，不受 env 影响
+    - PROXY_URL 仍为 TMDB 的首选代理（显式 > 系统代理 env）
+    """
+    existing = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+    parts = [p.strip() for p in existing.split(",") if p.strip()]
+    for d in _115_DOMAINS.split(","):
+        if d and d not in parts:
+            parts.append(d)
+    no_proxy = ",".join(parts)
+    os.environ["NO_PROXY"] = no_proxy
+    os.environ["no_proxy"] = no_proxy
+    logging.getLogger("app").info(
+        "已设置 NO_PROXY=%s（115 走直连防风控；TMDB 可用系统代理或 PROXY_URL）",
+        no_proxy,
+    )
 
 
 def main() -> None:
     settings = Settings.load()
-    # 集中式日志配置：彩色控制台 + 缩短模块名 + 噪声库降级 + 本地文件轮转（见 app/logging_config.py）
     setup_logging(
         settings.log_level,
         use_color=settings.log_color,
@@ -40,7 +48,7 @@ def main() -> None:
 
     logger = logging.getLogger("app")
     logger.info("配置加载完成，DB=%s", settings.db_path)
-    _clear_proxy_env()
+    setup_proxy_env()
 
     warns = settings.validate()
     for w in warns:
@@ -53,9 +61,6 @@ def main() -> None:
         logger.error("TG_BOT_TOKEN 未配置，无法启动 Bot。请填写 .env 后重试。")
         return
 
-    # SIGTERM 由 PTB run_polling 内置处理 → 触发 post_stop/post_shutdown
-    # 优雅清理 TMDB/缓存资源（见 bot.py _post_shutdown）。勿覆盖 signal.signal，
-    # 否则 PTB 收不到 SIGTERM，container.close() 不执行。
     logger.info("启动 Telegram Bot ...")
     container.telegram.run()
 

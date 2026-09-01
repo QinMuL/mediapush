@@ -11,6 +11,38 @@
 
 ---
 
+## 核心能力一览
+
+项目有**两条并行链路**，通过 DI 容器编排，各链路可独立开关：
+
+### 链路 A：网盘分享自动化
+
+```
+用户/Bot → 115分享链接/ed2k → 解析 → TMDB匹配 → 卡片推送 → 去重缓存 → 巡检撤卡
+网盘目录监控 → 自动建永久分享 → 推卡片 → 归档
+频道监控 → 捕获ed2k → 推卡片
+```
+
+### 链路 B：本地媒体处理全流水线
+
+```
+目录A → 稳定检测 → TMDB高置信匹配 + ffprobe探测 → 统一命名模板重命名 → 移入B
+目录B → 稳定检测 → MD4分块哈希 → ed2k链接 → 写JSONL → 移入C
+目录C → 读JSONL → 转分享卡片 → 推TG频道
+目录C → CloudDrive2 gRPC跨云复制 → 115网盘 → 删源
+```
+
+| 功能 | 总开关 | 默认 | 说明 |
+|---|---|---|---|
+| 本地媒体重命名 | `LOCAL_MEDIA_ENABLED` | false | A→B：监控目录A，TMDB 高置信匹配 + ffprobe 实时探测质量标签，统一命名模板 |
+| ed2k 链接生成 | `ED2K_ENABLED` | false | B→C：MD4 分块哈希（9.72MB 块），2.4GB 文件 ~5 秒 |
+| ed2k 频道推送 | `ED2K_PUSH_ENABLED` | false | C→频道：JSONL 增量读取，卡片+TMDB 元数据 |
+| CD2 上传 115 | `CD2_ENABLED` | false | C→115：CloudDrive2 gRPC 跨云复制，串行+退避+完成删源 |
+
+每个功能还有独立的 `xxx_DRY_RUN` 开关（默认 true），模拟模式只出日志不实际操作。
+
+---
+
 ## 一、前置准备
 
 需要准备 5 样东西，全部填入 `.env`。
@@ -36,7 +68,7 @@
 ### 6. 代理（国内必需）
 - TG Bot API 与 TMDB API 在国内需走代理；填 `PROXY_URL`（如 `http://127.0.0.1:7890` 或 `socks5://127.0.0.1:1080`）。
 - **115 默认不走代理**（走代理易触发风控），如确实需要可设 `PAN115_USE_PROXY=true`（当前版本 115 代理尚未完全接线，默认直连）。
-- 进程启动时会**自动清除** docker-compose 注入的 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` 等环境变量（防止 115 意外走代理触发风控）；代理只认 `PROXY_URL` 显式配置。
+- 进程启动时设置 `NO_PROXY=115.com,.115.com`：115 请求走直连防风控，TMDB/TG 不受影响。TMDB 会自动检测系统代理环境变量（`HTTP_PROXY`/`HTTPS_PROXY`），也支持 `PROXY_URL` 显式配置（优先级更高）。
 
 ### 7. 频道监控账号（可选）
 - 功能：用你自己的 Telegram 账号实时监控指定公开频道，自动捕获其中的 ed2k 链接并推送到推送频道。
@@ -92,6 +124,36 @@ cp .env.example .env
 | `MONITOR_SESSION` | Telethon session 路径，默认 `./data/monitor.session` |
 | `MONITOR_DB_PATH` | 监控配置存储，默认 `./data/monitor.db` |
 | `MONITOR_BATCH_SECONDS` | 默认聚合窗口秒数（0=实时逐条），可被 `/mon batch` 覆盖 |
+
+### 本地媒体流水线配置（链路 B）
+
+| 变量 | 说明 |
+|---|---|
+| `LOCAL_MEDIA_ENABLED` | 总开关（默认 false），启用 A→B 重命名流水线 |
+| `LOCAL_MEDIA_INPUT_DIR` | 目录 A：待处理资源路径（容器内路径，需在 docker-compose.yml 映射） |
+| `LOCAL_MEDIA_OUTPUT_DIR` | 目录 B：规范化输出路径（须在 A 之外） |
+| `LOCAL_MEDIA_DRY_RUN` | 模拟模式（默认 true），只出日志不实际移动 |
+| `LOCAL_MEDIA_INTERVAL_SECONDS` | 扫描周期秒（默认 10） |
+| `LOCAL_MEDIA_STABLE_ROUNDS` | 稳定判定轮数（默认 3，× 周期 = 文件稳定窗口） |
+| `LOCAL_MEDIA_STUCK_DAYS` | 低置信匹配卡死告警阈值天（默认 7） |
+| `ED2K_ENABLED` | 总开关（默认 false），启用 B→C ed2k 哈希流水线 |
+| `ED2K_INPUT_DIR` | 目录 B（通常 = `LOCAL_MEDIA_OUTPUT_DIR`） |
+| `ED2K_OUTPUT_DIR` | 目录 C：ed2k 产出后归档路径 |
+| `ED2K_DRY_RUN` | 模拟模式（默认 true），只哈希 + 记 JSONL 不移动 |
+| `ED2K_INTERVAL_SECONDS` | 扫描周期秒（默认 30，哈希重 30s 起步） |
+| `ED2K_PUSH_ENABLED` | 总开关（默认 false），启用 C→频道推送 |
+| `ED2K_PUSH_DRY_RUN` | 模拟模式（默认 true），只出日志不实际调 processor |
+| `ED2K_PUSH_INTERVAL_SECONDS` | 推送扫描周期秒（默认 60） |
+| `ED2K_PUSH_REPORT_ADMIN` | 每轮结束汇总发 TG_ADMIN_IDS（默认 true） |
+| `CD2_ENABLED` | 总开关（默认 false），启用 C→115 上传 |
+| `CD2_ADDRESS` | CloudDrive2 gRPC 地址（默认端口 19798） |
+| `CD2_TOKEN` | CD2 API 令牌（推荐，UI 创建） |
+| `CD2_USERNAME` / `CD2_PASSWORD` | 或账号密码（token 优先） |
+| `CD2_UPLOAD_SRC` | 目录 C 在 CD2 里的路径（本地挂载后） |
+| `CD2_UPLOAD_DST` | 115 在 CD2 里的目标目录 |
+| `CD2_UPLOAD_DRY_RUN` | 模拟模式（默认 true），只查重 + 日志不提交任务 |
+| `CD2_UPLOAD_INTERVAL_SECONDS` | 扫描周期秒（默认 60） |
+| `CD2_STUCK_DAYS` | 上传失败卡死告警阈值天（默认 7） |
 
 ---
 
@@ -205,7 +267,9 @@ docker inspect mediapush --format '{{.State.Health.Status}}'
 | `/loglevel <级别>` | 运行时调整控制台日志级别（DEBUG/INFO/WARNING/ERROR），无需重启；文件恒为 DEBUG |
 | `/reload` | 重读 `.env` 热加载配置（间隔/通知开关/限速/cookie 文件），连接层变更会提示需重启 |
 | `/cookie` | 查看状态；`/cookie <串>` 直接在 bot 里更新 115 cookie（写文件 + 热加载 + 实时探活；需已配置 `PAN115_COOKIE_FILE`） |
-| `/status` | 运行状态（时长/推送统计）、配置与健康、后台服务一览 |
+| `/status` | 运行状态（时长/推送统计）、配置与健康、后台服务一览（含链路 B 各服务） |
+| `/ed2k_status` | ed2k 生成 + 推送详情（扫描/哈希/推送/失败退避） |
+| `/upload_status` | CD2 上传详情（扫描/传输中/完成/失败退避/卡死告警） |
 | `/mon` | 频道监控管理（详见下节） |
 | `/help` | 帮助 |
 
@@ -271,40 +335,91 @@ docker inspect mediapush --format '{{.State.Health.Status}}'
 
 ---
 
+### 本地媒体处理流水线（A→B→C→频道→115）
+
+本地视频文件全自动处理：文件名规范化 → ed2k 链接生成 → 频道推送 → 上传 115。
+
+**命名规范**（高置信度硬门槛）：
+- 必须同时匹配 TMDB 片名 + 年份（剧集额外 SxxExx）才放行重命名
+- 质量标签（分辨率/编码/帧率/比特率/HDR/DV）从 **ffprobe 实时探测**，不从文件名提取
+- 流媒体平台简称自动补全（NF→Netflix 等）
+- 跨语种兜底：zh-CN 搜索返回中文标题时，拉 TMDB 详情 translations（en/zh/ko）+ AKA 别名再匹配
+- 文件名末尾附 `{tmdb-<id>}` 标签，保证 Emby/飞牛 100% 刮削
+- 低置信不重命名，进入指数退避（1h→2h→…→24h），TMDB 补全后自动命中
+
+**ed2k 生成**：
+- MD4 分块哈希（9.72MB 块），pycryptodome C 实现，2.4GB 文件 ~5 秒
+- 结果写 JSONL 增量存储，重启不丢
+- 生成的 ed2k 链接可直接在 115 网盘离线成功
+
+**CD2 上传**：
+- 通过 CloudDrive2 gRPC 跨云复制（服务端 CopyFile，非流式上传，大文件稳定）
+- 串行提交（同时只 1 个 copy 任务，防挤占上行）
+- 按源路径精确追踪（不影响 CD2 界面手动创建的其它任务）
+- 完成自动删源 + 失败指数退避 + 卡死告警
+
+**Docker 卷映射**：`.env` 填容器内路径，`docker-compose.yml` 做宿主机→容器映射。例如：
+```yaml
+volumes:
+  - ./data:/app/data
+  - /nas-openlist/1000/media/A:/media/A    # 目录A
+  - /nas-openlist/1000/media/B:/media/B    # 目录B
+  - /nas-openlist/1000/media/C:/media/C    # 目录C
+```
+.env 对应填 `LOCAL_MEDIA_INPUT_DIR=/media/A` 等。NAS 部署时只改宿主机路径，容器路径不变。
+
+---
+
 ## 五、目录结构
 
 ```
 app/
 ├── main.py              # 入口：加载配置 → 清代理环境变量 → 构建容器 → run_polling
-├── config.py            # .env / 环境变量加载与校验（含 cookie 文件读取）
+├── config.py            # .env / 环境变量加载与校验（含 cookie 文件读取 + 热加载字段）
+├── logging_config.py    # 双通道分级日志（彩色控制台 + 文件轮转 + 第三方库降噪）
 ├── core/
-│   ├── container.py     # DI 容器（懒加载各服务）
+│   ├── container.py     # DI 容器（懒加载各服务，条件启用）
 │   ├── processor.py     # 编排：读取→解析→TMDB→推送→去重
-│   └── share_watcher.py # 目录监控→建永久分享→推卡片（/dir 管理）
-│   └── link_parser.py   # 115 链接/裸码/ed2k 解析 + 正文访问码提取
+│   ├── share_watcher.py # 目录监控→建永久分享→推卡片（违规 blocked + 失败退避）
+│   ├── link_parser.py   # 115 链接/裸码/ed2k 解析 + 正文访问码提取
+│   └── rate_limiter.py  # AdaptiveLimiter 自适应令牌桶（115 margin 信号反馈）
 ├── providers/
-│   ├── base.py          # BaseShareProvider + ShareFile
+│   ├── base.py          # BaseShareProvider + ShareFile（网盘抽象接口）
 │   ├── ed2k.py          # ed2k Provider（纯字符串解析，无网络请求）
 │   ├── exceptions.py    # Pan115Error（独立，p115client 装坏也可导入）
 │   └── pan115.py        # 115 封装（share_snap 预检 + margin/快照渐进重试）
 ├── parser/
-│   └── media_parser.py  # guessit + 噪音清洗 + 分享聚合
+│   └── media_parser.py  # guessit + 噪音清洗 + 分享聚合 + {tmdb-XXX} 标签提取
 ├── tmdb/
-│   └── client.py        # TMDB API（搜索带年回退/年份-标题-类型优先匹配/详情/缓存）
+│   └── client.py        # TMDB API（搜索带年回退/跨语种别名兜底/详情 translations+AKA/缓存/trust_env）
+├── media/               # 本地媒体处理流水线（链路 B）
+│   ├── service.py       # A→B：目录A监控 + 稳定检测 + namer 高置信匹配 + 移入B
+│   ├── namer.py         # 命名引擎：TMDB 高置信匹配 + 统一命名模板 + 标点折叠
+│   ├── probe.py         # ffprobe 探测：分辨率/编码/帧率/比特率/HDR/DV
+│   ├── ed2k.py          # MD4 分块哈希（pycryptodome C 实现，兼容 OpenSSL 3）
+│   ├── ed2k_service.py  # B→C：目录B监控 + 稳定检测 + ed2k 哈希 + JSONL + 移入C
+│   ├── ed2k_pusher.py   # C→频道：JSONL 增量读取 + 卡片推送 + 状态持久化
+│   └── cd2_uploader.py  # C→115：CD2 gRPC 跨云复制 + 任务追踪 + 完成删源 + 退避
+├── cd2/                 # CloudDrive2 gRPC 生成代码
+│   ├── __init__.py      # WKT 预加载（protobuf 兼容性修复）
+│   ├── clouddrive.proto # proto 定义
+│   ├── clouddrive_pb2.py
+│   └── clouddrive_pb2_grpc.py
 ├── telegram/
-│   ├── bot.py           # PTB Application（concurrent_updates + 代理 + 心跳 + 巡检挂载）
-│   ├── handlers.py      # 命令 + 裸链接处理 + 批处理聚合 + 处理中去重 + /mon 管理
+│   ├── bot.py           # PTB Application（concurrent_updates + 代理 + 心跳 + 服务启停编排）
+│   ├── handlers.py      # 命令 + 裸链接处理 + 批处理 + 编辑模式 + /mon 管理
 │   ├── edit_session.py  # /edit 编辑会话状态（推荐语/精品标记）
 │   ├── inspector.py     # 分享失效巡检（撤卡/告警 + cookie 热加载）
-│   └── pusher.py        # 卡片渲染 + 推送（返回消息引用供撤卡）
+│   ├── pusher.py        # 卡片渲染 + 推送（返回消息引用供撤卡）
+│   └── notifier.py      # admin 私信通知
 ├── monitor/             # 频道监控（Telethon 用户账号）
 │   ├── store.py         # 监控配置持久化（频道/规则/去重，monitor.db）
 │   ├── watcher.py       # ed2k 提取/验证/过滤/渲染（纯函数）
 │   ├── service.py       # Telethon 封装 + 实时事件 + 补扫 + 推送
 │   └── login.py         # 登录 CLI（备选；推荐 Bot 内 /mon login）
 └── db/
-    └── cache.py         # aiosqlite：tmdb_cache + pushed_shares（巡检字段 + 自动迁移）
-tests/                   # 单测（parser/link_parser/pan115/tmdb/pusher/cache/processor/monitor/inspector/handlers）
+    └── cache.py         # aiosqlite：tmdb_cache + pushed_shares + shared_items（自动迁移）
+tests/                   # 23 个测试文件（namer/cd2_uploader/share_watcher/handlers/ed2k/probe/...）
 ```
 
 ---
@@ -329,10 +444,14 @@ ruff check .
 - **115 响应语义**（实测）：margin 风控返回 `{"margin": N}`（无 state/data，check_response 放行后 `resp["data"]` 抛 KeyError）→ 等 N 秒渐进重试（cap 30s，3 次）；「正在生成文件快照」→ 3s/6s/9s 退避重查；errno 4100009/4100010/`share_state=7` = 失效；errno 4100012/4100008 = 分享存在仅访问码缺失/错误，**不是死链**。
 - **Telegram**：`concurrent_updates(True)`（否则长 handler 阻塞队列）；handler 经 `bot_data` 注入 container，不访问私有属性；TG 走代理。
 - **TMDB**：4xx 不重试 / 429·5xx·超时指数退避重试；带年搜无果回退无年；`search_best` 打分：年份吻合 > 标题精确（zh > original_title 别名 > 包含）> 评分，显式 media_type 过滤异型候选；元数据缓存统一 24h（upsert 刷新时间戳）。
-- **代理分发**：TG + TMDB 走代理，115 默认不走；启动时清除进程级代理环境变量（`main.py`）。
+- **代理分发**：TG + TMDB 走代理，115 默认不走；启动时设置 `NO_PROXY=115.com,.115.com` 让 115 走直连，TMDB 可用系统代理或 `PROXY_URL` 显式配置（`main.py`）。
 - **推送链路**：`push_share` 返回 `(ok, msg, message_id, chat_id)` 消息引用，`mark_pushed` upsert 存档（provider/password/chat_id/message_id/title）；巡检撤卡靠该引用。批处理串行（全局锁 + 2s 限速）；同一链接处理中 60s 去重防双推。
 - **健康检查**：Bot `post_init` 启动心跳任务（每 30s 写 `/tmp/.heartbeat`），Docker HEALTHCHECK 检查文件新鲜度（120s 阈值），卡死时自动重启。详见部署章节。
 - 扩展新网盘：继承 `BaseShareProvider` 实现 `list_share`/`check_health`，在 `link_parser` 注册解析，在 `container` 注册实例，上层零改动。
+- **本地媒体流水线**：三个总开关默认 false（`LOCAL_MEDIA_ENABLED` / `ED2K_ENABLED` / `ED2K_PUSH_ENABLED` / `CD2_ENABLED`），升级/重启不改变原有行为；每个有独立 `xxx_DRY_RUN`（默认 true）。`.env` 用容器内路径，`docker-compose.yml` 做卷映射。
+- **ed2k 哈希**：MD4 分块（9728000 字节），pycryptodome C 实现（兼容 OpenSSL 3 / Python 3.14）；结果 JSONL 增量存储，重启不丢。
+- **CD2 上传**：gRPC 同步 IO 统一丢 executor 线程，不阻塞事件循环；按源路径精确追踪（不影响 CD2 界面手动任务）；`ConflictPolicy=Skip` 查重。
+- **TMDB 跨语种**：zh-CN 搜索返回中文标题时，near-miss 候选拉详情 translations（en/zh/ko）+ alternative_titles 再匹配；标点折叠（全/半角逗号/句号/括号统一归一化）。
 
 ---
 
@@ -346,6 +465,10 @@ ruff check .
 - **频道收不到**：确认 Bot 已是频道管理员且有发送权限；确认 `TG_CHAT_ID` 正确（分流时检查 `TG_CHAT_ID_115` / `TG_CHAT_ID_ED2K`）。
 - **cookie 失效告警**：仅影响 `/status` 健康检查，匿名读取分享不受影响。更新 cookie：改 `PAN115_COOKIE_FILE` 文件内容（自动热加载）或 `PAN115_COOKIE` 环境变量后重启。
 - **目录监控没反应**：需已配置 115 cookie（创建分享要登录态）；`/dir list` 确认目录已登记；`/share` 手动触发看报错；cookie 失效时 `/dir add` 会被拦下。
+- **本地媒体流水线不工作**：确认 `LOCAL_MEDIA_ENABLED=true` 且 `LOCAL_MEDIA_DRY_RUN=false`（默认 true 只出日志）；确认 A/B/C 三个目录在 `.env` 和 `docker-compose.yml` 都配了且不重叠；`/status` 看各服务状态。
+- **TMDB 匹配不到（英文名资源）**：新剧可能 TMDB 还没收录，程序会指数退避自动重试；若是跨语种问题，检查 `PROXY_URL` 是否可达（`main.py` 会清除系统代理 env，TMDB 只认 `PROXY_URL` 显式配置）。
+- **CD2 上传卡住**：`/upload_status` 看退避详情；CD2 里手动取消 + 移出 C 目录即可停止（程序会记一次失败后不再重试）。
+- **违规资源一直刷屏**：`/dir del` + `/dir add` 重新添加监控目录可清除 blocked 记录。
 
 ---
 
