@@ -21,7 +21,6 @@ dry-run（LOCAL_MEDIA_DRY_RUN 默认 true）：只输出"将移动到"日志，�
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import time

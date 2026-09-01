@@ -713,7 +713,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     container = _container(context)
     try:
         summary = await _reset_all_data(container)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.exception("/reset 执行失败")
         await update.message.reply_text(f"❌ 重置失败：{exc}\n建议重启容器后重试")
         return

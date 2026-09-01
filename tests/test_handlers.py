@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock
 
 from app.core.link_parser import ParsedShare
@@ -667,7 +668,7 @@ class _FakeCd2Uploader:
 
 
 class _FakeLocalMedia:
-    _retry_state: dict = {}
+    _retry_state: ClassVar[dict] = {}
     _last_report = "扫描 3 个视频：稳定 3 → ✅ 移动 3"
 
 

@@ -20,11 +20,9 @@ dry-run（CD2_UPLOAD_DRY_RUN 默认 true）：只查重 + 出"将上传"日志�
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from app.db.state import StateStore, load_with_legacy
 from app.media.service import retry_backoff_seconds

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -17,7 +18,7 @@ class _FakeSettings:
     ed2k_push_dry_run = True
     ed2k_push_report_admin = False
     ed2k_push_report_channel = False
-    tg_admin_ids: list = []
+    tg_admin_ids: ClassVar[list] = []
 
 
 class _FakeTg:
