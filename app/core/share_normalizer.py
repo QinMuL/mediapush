@@ -455,37 +455,32 @@ class ShareNormalizer:
         """在 parent_cid 下创建子目录，返回 cid。
 
         幂等：已存在则返回现有 cid。
+        p115client fs_mkdir：POST /files/add，payload={cname, pid}。
         """
-        # 先检查是否已存在
+        # 先检查是否已存在（幂等）
         items = await pan115.list_dir(parent_cid, nf=1)
         for it in items:
             if it["name"].lower() == name.lower():
                 return it["fid"]
-        # 创建
+        # 创建（payload 严格 {cname, pid}，多传键会被 115 拒）
         from p115client.client import check_response
+
         client = pan115._login_client()
         resp = await pan115._call_with_margin(
-            lambda: client.fs_mkdirs(
-                {"pid": parent_cid, "names": [name], "ignore_warn": 1},
+            lambda: client.fs_mkdir(
+                {"cname": name, "pid": parent_cid},
                 async_=True,
             ),
-            label="fs_mkdirs",
+            label="fs_mkdir",
         )
         try:
             check_response(resp)
         except Exception as exc:
             from app.providers.exceptions import Pan115Error
             raise Pan115Error(f"建目录失败（{name}）：{exc}") from exc
-        # 解析返回的 cid
-        data = resp.get("data") or resp
-        cid = data.get("file_id") or data.get("cid") or data.get("id")
-        if cid is None and isinstance(data, list) and data:
-            cid = data[0].get("file_id") or data[0].get("cid")
-        if cid is None:
-            # 重新列目录获取
-            items = await pan115.list_dir(parent_cid, nf=1)
-            for it in items:
-                if it["name"].lower() == name.lower():
-                    return it["fid"]
-            raise RuntimeError(f"建目录后无法获取 cid：{name}")
-        return int(cid)
+        # 建后重列目录拿 cid（fs_mkdir 响应格式不稳，重列最可靠）
+        items = await pan115.list_dir(parent_cid, nf=1)
+        for it in items:
+            if it["name"].lower() == name.lower():
+                return it["fid"]
+        raise RuntimeError(f"建目录后无法获取 cid：{name}")

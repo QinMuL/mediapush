@@ -572,16 +572,18 @@ class Pan115Provider(BaseShareProvider):
                 ) from exc
 
     async def fs_rename(self, file_id: int, new_name: str) -> None:
-        """重命名文件/目录（fs_rename API）。需登录 cookie。
+        """重命名文件/目录（fs_rename → open ufile/update）。需登录 cookie。
 
-        幂等：若原名与新名相同仍调用（115 内部幂等，不产生副作用）。
+        p115client fs_rename 只接受 {file_id, file_name} payload
+        （多传键会被 115 拒：errno 990002 参数错误）。
+        注意：改名必须带扩展名（文件），否则 115 会截断最后一个句点后内容。
         """
         from p115client.client import check_response
 
         client = self._login_client()
         resp = await self._call_with_margin(
             lambda: client.fs_rename(
-                {"file_id": file_id, "file_name": new_name, "ignore_warn": 1},
+                {"file_id": file_id, "file_name": new_name},
                 async_=True,
             ),
             label="fs_rename",
