@@ -28,6 +28,7 @@ import time
 from dataclasses import dataclass, field
 
 from app.core.link_parser import ParsedShare
+from app.core.share_normalizer import ShareNormalizer
 from app.logging_config import make_trace_id, trace_id
 from app.media.service import retry_backoff_seconds
 from app.providers.exceptions import Pan115Error
@@ -93,6 +94,7 @@ class ShareWatcher:
         self.interval = max(1.0, settings.share_watch_interval_minutes)
         self._task: asyncio.Task | None = None
         self._archive_cid: int | None = None  # 归档目录 CID（进程内缓存）
+        self._normalizer = ShareNormalizer(container, settings)
 
     # ------------------------------------------------------------------ #
     async def run_once(self) -> WatchReport:
@@ -119,7 +121,7 @@ class ShareWatcher:
         for d in dirs:
             dir_id, path, cid = int(d["id"]), d["path"], int(d["cid"])
             try:
-                subdirs = await pan115.list_dir(cid)
+                subdirs = await pan115.list_dir(cid, nf=0)
             except Exception as exc:  # noqa: BLE001 - 网络异常下轮再看（warning 摘要）
                 report.failed += 1
                 logger.warning("目录监控列目录失败（%s）：%s", path, exc)
@@ -127,6 +129,7 @@ class ShareWatcher:
 
             for item in subdirs:
                 fid, name = item["fid"], item["name"]
+                is_dir = item.get("is_dir", True)
                 record = await cache.get_shared_item(dir_id, fid)
                 if record is not None and record["status"] == "ok":
                     report.skipped += 1
@@ -146,6 +149,18 @@ class ShareWatcher:
 
                 if record is None:
                     report.new_items += 1
+                    # 分享前目录结构标准化（幂等，失败不阻断）
+                    if self._normalizer.enabled:
+                        nr = await self._normalizer.normalize(
+                            pan115, fid, name, is_dir, cid
+                        )
+                        if nr.changed:
+                            logger.info(
+                                "目录标准化：%s → %s\n  %s",
+                                name, nr.name, "\n  ".join(nr.actions),
+                            )
+                        fid = nr.fid
+                        name = nr.name
                 # pending：复用已建的 share_code 重推（新分享常处审核/快照中，
                 # 读取失败 → 登记 pending → 下轮复用同码重试，绝不重复建分享）
                 try:

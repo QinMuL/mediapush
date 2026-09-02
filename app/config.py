@@ -99,6 +99,9 @@ class Settings:
     share_watch_notify: bool = True
     # 推送成功后移入的归档目录（须在监控目录之外；空=不移动仅标记）
     share_archive_dir: str = "/已分享"
+    # 分享前目录结构标准化（季目录重命名 + 资源目录补全）
+    share_normalize_enabled: bool = False
+    share_normalize_dry_run: bool = True
     # 频道监控（Telethon）断连/重连/补扫等运行事件私信 admin
     monitor_notify: bool = True
     # 本地媒体流水线（目录A监控 → namer 重命名 → 目录B，见 app/media/service.py）
@@ -215,6 +218,8 @@ class Settings:
             ),
             share_watch_notify=_env_bool("SHARE_WATCH_NOTIFY", True),
             share_archive_dir=os.getenv("SHARE_ARCHIVE_DIR", "/已分享").strip(),
+            share_normalize_enabled=_env_bool("SHARE_NORMALIZE_ENABLED", False),
+            share_normalize_dry_run=_env_bool("SHARE_NORMALIZE_DRY_RUN", True),
             monitor_notify=_env_bool("MONITOR_NOTIFY", True),
             local_media_enabled=_env_bool("LOCAL_MEDIA_ENABLED", False),
             local_media_input_dir=os.getenv("LOCAL_MEDIA_INPUT_DIR", "").strip(),
@@ -347,6 +352,8 @@ HOT_RELOAD_FIELDS: frozenset[str] = frozenset({
     "share_watch_interval_minutes",
     "share_watch_notify",
     "share_archive_dir",
+    "share_normalize_enabled",
+    "share_normalize_dry_run",
     "monitor_notify",
     "monitor_batch_seconds",
     "local_media_dry_run",

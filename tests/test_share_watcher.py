@@ -60,7 +60,7 @@ class _FakePan115:
         self.makedirs_calls: list[str] = []
         self.moved: list[tuple[int, int]] = []
 
-    async def list_dir(self, cid):
+    async def list_dir(self, cid, *, nf=1):
         return self.dirs_map.get(cid, [])
 
     async def create_share(self, fid):
@@ -105,6 +105,7 @@ class _FakeSettings:
     share_watch_interval_minutes = 10.0
     share_archive_dir = ""  # 默认不启用归档（现有用例语义不变）
     share_watch_notify = True
+    share_normalize_enabled = False
     tg_admin_ids: tuple = ()
 
 
@@ -356,7 +357,7 @@ def test_run_once_list_dir_error_counts_failed(monkeypatch):
     cache = _FakeCache([_dir(1, "/媒体", 100)])
 
     class _Boom(_FakePan115):
-        async def list_dir(self, cid):
+        async def list_dir(self, cid, *, nf=1):
             raise RuntimeError("connect timeout")
 
     pan115 = _Boom({})

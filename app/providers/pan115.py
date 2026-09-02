@@ -396,10 +396,11 @@ class Pan115Provider(BaseShareProvider):
             return resp
         raise Pan115Error(f"115 {label} 限速，多次重试后仍失败")
 
-    async def list_dir(self, cid: int = 0) -> list[dict]:
-        """列自己网盘目录的**子目录**（fs_files + nf=1 仅目录，自动翻页）。
+    async def list_dir(self, cid: int = 0, *, nf: int = 1) -> list[dict]:
+        """列自己网盘目录的子项（fs_files，自动翻页）。
 
-        返回 [{fid, name, size}]（均为目录），需登录 cookie。
+        nf=1（默认）仅目录，nf=0 文件+目录。
+        返回 [{fid, name, is_dir, size}]，需登录 cookie。
         响应两种格式（实测 webapi）：
         - 老格式：data 为列表，count 在顶层
         - 新格式：data 为 {"list": [...], "count": N}
@@ -415,7 +416,7 @@ class Pan115Provider(BaseShareProvider):
             resp = await self._call_with_margin(
                 lambda off=offset: client.fs_files(
                     {"cid": cid, "limit": limit, "offset": off,
-                     "nf": 1, "asc": 1, "o": "file_name"},
+                     "nf": nf, "asc": 1, "o": "file_name"},
                     async_=True,
                 ),
                 label="fs_files",
@@ -569,6 +570,28 @@ class Pan115Provider(BaseShareProvider):
                 raise Pan115Error(
                     f"移动失败（fid={file_id}→cid={to_cid}）：{exc}"
                 ) from exc
+
+    async def fs_rename(self, file_id: int, new_name: str) -> None:
+        """重命名文件/目录（fs_rename API）。需登录 cookie。
+
+        幂等：若原名与新名相同仍调用（115 内部幂等，不产生副作用）。
+        """
+        from p115client.client import check_response
+
+        client = self._login_client()
+        resp = await self._call_with_margin(
+            lambda: client.fs_rename(
+                {"file_id": file_id, "file_name": new_name, "ignore_warn": 1},
+                async_=True,
+            ),
+            label="fs_rename",
+        )
+        try:
+            check_response(resp)
+        except Exception as exc:
+            raise Pan115Error(
+                f"重命名失败（fid={file_id}→{new_name}）：{exc}"
+            ) from exc
 
     # ------------------------------------------------------------------ #
     async def check_health(self) -> bool | None:
