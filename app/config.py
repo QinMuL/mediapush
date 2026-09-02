@@ -113,6 +113,7 @@ class Settings:
     local_media_stable_rounds: int = 3          # 稳定判定轮数（×周期）
     local_media_stuck_days: float = 7.0          # 低置信卡死告警阈值（天）
     local_media_batch_move_max: int = 5          # 单轮最多移动的文件数（防一次性几十上百个打爆 IO/TMDB）
+    local_media_min_size_mb: float = 10.0        # 最小体积守门（MB）：低于此值视为下载残缺，不进流水线（防 0 字节占位文件）
     # ed2k 流水线（目录B监控 → ed2k 哈希 → 目录C，见 app/media/ed2k_service.py）
     ed2k_enabled: bool = False
     ed2k_input_dir: str = ""                    # 目录B（= local_media_output_dir 通常一致）
@@ -237,6 +238,9 @@ class Settings:
             local_media_batch_move_max=max(
                 1, _env_int("LOCAL_MEDIA_BATCH_MOVE_MAX", 5)
             ),
+            local_media_min_size_mb=max(
+                0.0, _env_float("LOCAL_MEDIA_MIN_SIZE_MB", 10.0)
+            ),
             ed2k_enabled=_env_bool("ED2K_ENABLED", False),
             ed2k_input_dir=os.getenv("ED2K_INPUT_DIR", "").strip(),
             ed2k_output_dir=os.getenv("ED2K_OUTPUT_DIR", "").strip(),
@@ -360,6 +364,7 @@ HOT_RELOAD_FIELDS: frozenset[str] = frozenset({
     "local_media_interval_seconds",
     "local_media_stable_rounds",
     "local_media_stuck_days",
+    "local_media_min_size_mb",
     "ed2k_dry_run",
     "ed2k_interval_seconds",
     "ed2k_stable_rounds",

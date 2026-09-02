@@ -9,6 +9,8 @@
      电影平铺：B/片名 (年份) - 质量.mkv
      剧集分夹：B/片名 (年份)/Sxx/片名.年份.SxxEyy.第zz集...mkv
    - 低置信：原地保留，指数退避后重试（1h→2h→…→24h 封顶）
+   - 体积守门：低于 LOCAL_MEDIA_MIN_SIZE_MB 的文件视为下载残缺直接拦截
+     （下载失败留下的 0 字节占位文件天然"稳定"，稳定性检测拦不住）
 4. 字幕伴行：同 stem 的 .srt/.ass/.ssa/.sub 跟随视频改名移动（Emby 配对）
 5. 同名冲突：目标已存在则跳过+告警，绝不覆盖
 6. A 子目录清空后删除空目录（保持源目录整洁）
@@ -103,6 +105,7 @@ class LocalMediaReport:
     low_conf: int = 0        # 低置信保留（退避重试）
     conflict: int = 0        # 目标同名跳过
     stuck: int = 0           # 卡死告警（超 STUCK_DAYS 仍低置信）
+    too_small: int = 0       # 体积守门拦截（下载残缺文件，每文件只告警一次）
 
     def summary(self) -> str:
         s = f"扫描 {self.scanned} 个视频：稳定 {self.stable}"
@@ -114,6 +117,8 @@ class LocalMediaReport:
             s += f" · ⏳ 低置信保留 {self.low_conf}（退避重试）"
         if self.conflict:
             s += f" · ⚠️ 同名跳过 {self.conflict}"
+        if self.too_small:
+            s += f" · 🚫 疑似残缺拦截 {self.too_small}"
         if self.stuck:
             s += f" · 🚨 卡死 {self.stuck}（人工检查）"
         return s
@@ -141,6 +146,8 @@ class LocalMediaService:
         self._retry_state: dict[str, dict] = {}
         # DRY-RUN 已模拟处理的文件（内存级，重启清空；防同一文件无限循环）
         self._dry_done: set[str] = set()
+        # 体积守门已告警文件（告警一次后静默拦截；文件消失/重新增长后清除）
+        self._small_warned: set[str] = set()
         self._last_report: str | None = None  # 最近一轮汇总（/status 展示用）
         self._load_state()
         self._task: asyncio.Task | None = None
@@ -189,6 +196,7 @@ class LocalMediaService:
             if key not in alive:
                 self._seen.pop(key, None)
                 self._stable.pop(key, None)
+                self._small_warned.discard(key)
 
         now = time.time()
         moved_sources: list[Path] = []
@@ -200,6 +208,23 @@ class LocalMediaService:
             if key in self._dry_done:
                 continue
             if self._stable.get(key, 0) < self.settings.local_media_stable_rounds:
+                continue
+            # 体积守门：下载失败留下的 0 字节/残缺占位文件（空文件天然"稳定"，
+            # 稳定性检测拦不住）——低于阈值不进流水线，告警一次后静默拦截；
+            # 若下载恢复文件重新增长，size 变化会重置稳定计数，自然放行
+            min_bytes = getattr(self.settings, "local_media_min_size_mb", 10.0) * 1024 * 1024
+            try:
+                if f.stat().st_size < min_bytes:
+                    if key not in self._small_warned:
+                        self._small_warned.add(key)
+                        report.too_small += 1
+                        logger.warning(
+                            "本地媒体拦截疑似残缺文件 %s（%.1f MB < %.0f MB 阈值，"
+                            "疑似下载失败占位；若确认下载完整请手动处理）",
+                            f.name, f.stat().st_size / 1048576, min_bytes / 1048576,
+                        )
+                    continue
+            except OSError:
                 continue
             if not self._retry_due(key, now):
                 continue

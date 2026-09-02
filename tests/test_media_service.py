@@ -124,6 +124,7 @@ class _FakeSettings:
     local_media_dry_run = True
     local_media_input_dir = ""
     local_media_output_dir = ""
+    local_media_min_size_mb = 0.0  # 关闭体积守门（老测试用 64 字节小文件）
 
 
 class _FakeContainer:
@@ -367,3 +368,106 @@ def test_batch_move_defaults_to_five_when_unset(dirs, monkeypatch):
     r = _as.run(svc.run_once())            # R2: 10 个稳定，但兜底上限 5 → 移 5
     assert r.stable == 5, f"兜底 5 应移 5 个，实际 stable={r.stable}"
     assert len(list(b.rglob("*.mkv"))) == 5
+
+
+# ---------------------------------------------------------------------- #
+# 体积守门 LOCAL_MEDIA_MIN_SIZE_MB：下载失败留下的 0 字节占位文件拦截
+# ---------------------------------------------------------------------- #
+def _mk_service_min_size(a: Path, b: Path, min_mb: float) -> LocalMediaService:
+    st = _FakeSettings()
+    st.local_media_input_dir = str(a)
+    st.local_media_output_dir = str(b)
+    st.local_media_stable_rounds = 2
+    st.local_media_min_size_mb = min_mb
+    svc = LocalMediaService(_FakeContainer(), st)
+    svc.state_file = a.parent / "_state_test_minsize.json"
+    return svc
+
+
+def test_min_size_guard_blocks_zero_byte_file(dirs, monkeypatch):
+    """0 字节空文件（下载失败占位）：稳定后仍被拦截，不进流水线。"""
+    a, b = dirs
+    video = a / "Show.S01E01.2026.2160p.WEB-DL.mkv"
+    video.write_bytes(b"")  # 0 字节
+    svc = _mk_service_min_size(a, b, min_mb=10.0)
+
+    calls = {"n": 0}
+
+    async def fake_analyze(path, tmdb):
+        calls["n"] += 1
+        raise AssertionError("残缺文件不应进入 analyze")
+
+    monkeypatch.setattr("app.media.service.analyze_file", fake_analyze)
+
+    asyncio.run(svc.run_once())       # 第 1 轮：记录快照
+    r2 = asyncio.run(svc.run_once())  # 第 2 轮：达到稳定 → 触发守门
+    assert r2.too_small == 1
+    assert calls["n"] == 0           # 从未进入分析
+    assert video.exists()           # 原地保留
+    assert not list(b.rglob("*"))    # B 无产出
+
+
+def test_min_size_guard_warns_once_then_silent(dirs, monkeypatch):
+    """同一文件多轮只告警/计数一次，后续静默拦截（防日志刷屏）。"""
+    a, b = dirs
+    video = a / "Show.S01E02.2026.2160p.WEB-DL.mkv"
+    video.write_bytes(b"x" * 1024)  # 1KB < 10MB
+    svc = _mk_service_min_size(a, b, min_mb=10.0)
+
+    monkeypatch.setattr(
+        "app.media.service.analyze_file",
+        lambda path, tmdb: (_ for _ in ()).throw(AssertionError("不应进入分析")),
+    )
+
+    asyncio.run(svc.run_once())
+    asyncio.run(svc.run_once())   # 达到稳定：首次告警
+    r3 = asyncio.run(svc.run_once())
+    r4 = asyncio.run(svc.run_once())
+    assert r3.too_small == 0 and r4.too_small == 0  # 后续轮不再计数
+
+
+def test_min_size_guard_recovers_when_file_grows(dirs, monkeypatch):
+    """拦截后下载恢复、文件重新增长：size 变化重置稳定计数，最终放行。"""
+    a, b = dirs
+    video = a / "Show.S01E03.2026.2160p.WEB-DL.mkv"
+    video.write_bytes(b"x" * 1024)
+    svc = _mk_service_min_size(a, b, min_mb=10.0)
+    result = NamingResult(
+        parsed=MediaData(title="Show", year=2026, media_type="tv",
+                        season=1, episode=3, raw=video.name),
+        details={"title": "测试剧", "year": 2026},
+        proposed="测试剧.2026.S01E03.第03集.2160p.WEB-DL.H.265.mkv",
+    )
+    monkeypatch.setattr(
+        "app.media.service.analyze_file",
+        lambda path, tmdb: asyncio.sleep(0, result=result),
+    )
+
+    asyncio.run(svc.run_once())
+    asyncio.run(svc.run_once())   # 稳定 → 拦截（too_small）
+    # 下载恢复：文件重新写入完整内容（守门按字节比较，写 11MB 过阈值）
+    video.write_bytes(b"y" * (11 * 1024 * 1024))
+    asyncio.run(svc.run_once())   # size 变化：稳定计数重置为 1
+    r = asyncio.run(svc.run_once())   # 重新达到稳定 → 放行
+    assert r.stable == 1 and r.dry_moved == 1
+
+
+def test_min_size_guard_zero_disables(dirs, monkeypatch):
+    """min_mb=0 关闭守门：小文件正常走流水线（老测试语义）。"""
+    a, b = dirs
+    video = a / "Show.S01E04.2026.2160p.WEB-DL.mkv"
+    video.write_bytes(b"x" * 64)
+    svc = _mk_service_min_size(a, b, min_mb=0.0)
+    result = NamingResult(
+        parsed=MediaData(title="Show", year=2026, media_type="tv",
+                        season=1, episode=4, raw=video.name),
+        details={"title": "测试剧", "year": 2026},
+        proposed="测试剧.2026.S01E04.第04集.2160p.WEB-DL.H.265.mkv",
+    )
+    monkeypatch.setattr(
+        "app.media.service.analyze_file",
+        lambda path, tmdb: asyncio.sleep(0, result=result),
+    )
+    asyncio.run(svc.run_once())
+    r = asyncio.run(svc.run_once())
+    assert r.too_small == 0 and r.dry_moved == 1
