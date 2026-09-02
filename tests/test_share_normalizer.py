@@ -10,8 +10,7 @@
 
 from __future__ import annotations
 
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -23,7 +22,6 @@ from app.core.share_normalizer import (
     format_season_dir,
     parse_season_dir,
 )
-
 
 # ---------------------------------------------------------------------- #
 # 纯函数测试

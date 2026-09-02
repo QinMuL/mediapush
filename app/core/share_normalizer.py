@@ -25,7 +25,7 @@ import logging
 import re
 from dataclasses import dataclass
 
-from app.parser.media_parser import extract_season_episode, parse_filename
+from app.parser.media_parser import parse_filename
 
 logger = logging.getLogger(__name__)
 
@@ -108,8 +108,7 @@ def build_resource_name(title: str, year: int | None, tmdb_id: int | None,
     if year:
         parts.append(f"({year})")
     if tmdb_id:
-        prefix = "tmdb" if media_type != "tv" else "tmdb"
-        parts.append(f"{{{prefix}-{tmdb_id}}}")
+        parts.append(f"{{tmdb-{tmdb_id}}}")
     return " ".join(parts)
 
 
