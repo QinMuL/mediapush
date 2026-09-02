@@ -729,8 +729,15 @@ class Cd2UploaderService:
             self.interval,
         )
         # 重启恢复：CD2 侧仍在跑的任务重新纳入追踪（防重复提交 + 进度续显）
+        # 须先建立 gRPC 连接（_recover_tasks 不自行建连）
         try:
-            await self._recover_tasks()
+            loop = asyncio.get_running_loop()
+            if await loop.run_in_executor(
+                None, lambda: self._ensure_conn() and self._login()
+            ):
+                await self._recover_tasks()
+            else:
+                logger.warning("CD2 重启任务恢复跳过：gRPC 连接/登录失败")
         except Exception as exc:  # noqa: BLE001 - 恢复失败不阻断启动
             logger.warning("CD2 重启任务恢复失败（下轮扫描将按查重收尾）：%s", exc)
         self._task = asyncio.create_task(self._run_loop())
