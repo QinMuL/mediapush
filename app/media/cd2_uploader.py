@@ -12,6 +12,8 @@
 6. 串行：同时只跑 1 个 copy 任务（避免挤占上行带宽）
 
 重试状态持久化 data/cd2_state.json（重启不丢退避计数）。
+重启恢复：_tasks（进行中任务）为内存态，启动时从 CD2 GetCopyTasks 重建追踪
+（防重复提交 + 进度续显；匹配不到文件时建占位任务堵串行闸门）。
 dry-run（CD2_UPLOAD_DRY_RUN 默认 true）：只查重 + 出"将上传"日志，不提交任务。
 
 注意：gRPC 调用是同步 IO，统一丢 executor 线程执行，不阻塞事件循环。
@@ -252,6 +254,87 @@ class Cd2UploaderService:
             return False
 
     # ------------------------------------------------------------------ #
+    # 重启恢复：从 CD2 GetCopyTasks 重建进行中任务追踪
+    # ------------------------------------------------------------------ #
+    async def _recover_tasks(self) -> None:
+        """重启恢复：_tasks 是内存态（重启即丢），但 CD2 侧任务仍在跑。
+
+        不恢复的后果：扫描循环把源文件视为新文件 → 重复提交 CopyFile。
+        恢复后 _tasks 非空 → 串行闸门阻止新提交，_track_tasks 接管追踪。
+        匹配策略（单文件 copy 的 CD2 sourcePath 可能是父目录）：
+        1. sourcePath 恰为目录C内文件 → 精确重建
+        2. sourcePath 为父目录 → 按 totalBytes 匹配 C 中同 size 文件
+        3. 仍匹配不到（Scanning 期 totalBytes=0）→ 占位任务堵闸门，
+           完成时仅弃追踪不删源，下轮扫描靠查重收尾
+        """
+        loop = asyncio.get_running_loop()
+        tasks = await loop.run_in_executor(None, self._query_tasks)
+        if not tasks:
+            return
+        files = await loop.run_in_executor(None, self._list_dir, self.src_dir)
+        by_src: dict = {}
+        if files:
+            by_src = {
+                f.fullPathName: f for f in files
+                if not f.isDirectory and f.size > 0
+            }
+        now = time.time()
+        recovered = 0
+        for t in tasks:
+            if t.destPath != self.dst_dir:
+                continue
+            if t.status in (3, 4):  # Completed/Failed：由下轮扫描查重收尾/重新提交
+                continue
+            st_time = getattr(t, "startTime", None)
+            submitted_at = (
+                st_time.seconds if getattr(st_time, "seconds", 0) else now
+            )
+            if t.sourcePath in by_src:
+                f = by_src[t.sourcePath]
+                src = t.sourcePath
+            elif t.sourcePath == self.src_dir and t.totalBytes:
+                # 目录级任务：按 totalBytes 匹配文件
+                f = next(
+                    (x for x in by_src.values() if x.size == t.totalBytes), None
+                )
+                if f is None:
+                    continue
+                src = f.fullPathName
+            elif t.sourcePath == self.src_dir:
+                # 匹配不到（Scanning 期）：占位任务（key=src_dir）堵住串行闸门。
+                # _track_tasks 的 fallback 分支可按 src_dir 匹配 CD2 任务；
+                # _finish 对 src_dir 有保护（不删源）
+                self._tasks[self.src_dir] = _TaskInfo(
+                    name="（重启恢复·待扫描）", src_path=self.src_dir,
+                    dst_path=self.dst_dir, size=t.totalBytes,
+                    submitted_at=submitted_at,
+                    uploaded_bytes=t.uploadedBytes,
+                )
+                recovered += 1
+                logger.warning(
+                    "CD2 重启恢复：目录级任务无法定位文件（totalBytes=%d），"
+                    "已建占位追踪防重复提交", t.totalBytes,
+                )
+                continue
+            else:
+                continue  # 非本服务任务
+            self._tasks[src] = _TaskInfo(
+                name=f.name, src_path=src, dst_path=self.dst_dir,
+                size=f.size, submitted_at=submitted_at,
+                uploaded_bytes=t.uploadedBytes,
+            )
+            recovered += 1
+            logger.info(
+                "CD2 重启恢复任务：%s（%.2fGB，CD2 报告 %.2fGB 已传）",
+                f.name, f.size / 1024**3, t.uploadedBytes / 1024**3,
+            )
+        if recovered:
+            # 恢复首个任务的进度消息（重启丢了原消息引用）
+            first = next(iter(self._tasks.values()), None)
+            if first is not None:
+                await self._send_progress_start(first)
+
+    # ------------------------------------------------------------------ #
     # 单轮扫描
     # ------------------------------------------------------------------ #
     async def run_once(self) -> Cd2UploadReport:
@@ -420,6 +503,17 @@ class Cd2UploaderService:
 
     async def _finish(self, info: _TaskInfo, report: Cd2UploadReport, now: float) -> None:
         """任务完成：删源 + 状态清理 + 进度消息收尾 + 日志。"""
+        if info.src_path == self.src_dir:
+            # 重启恢复的占位任务：src_path 是目录C本身，绝不能删；
+            # 仅弃追踪，让下轮扫描对残留源文件走查重收尾（目标已有同名 → 记完成）
+            self._tasks.pop(info.src_path, None)
+            report.completed += 1
+            logger.info(
+                "CD2 占位任务追踪的 CD2 任务已完成（%.2fGB）；目录C残留文件"
+                "将由下轮扫描查重收尾",
+                info.size / 1024**3,
+            )
+            return
         loop = asyncio.get_running_loop()
         ok = loop.run_in_executor(None, self._delete_file, info.src_path)
         self._tasks.pop(info.src_path, None)
@@ -634,6 +728,11 @@ class Cd2UploaderService:
             "DRY-RUN 模拟" if self.settings.cd2_upload_dry_run else "实际上传",
             self.interval,
         )
+        # 重启恢复：CD2 侧仍在跑的任务重新纳入追踪（防重复提交 + 进度续显）
+        try:
+            await self._recover_tasks()
+        except Exception as exc:  # noqa: BLE001 - 恢复失败不阻断启动
+            logger.warning("CD2 重启任务恢复失败（下轮扫描将按查重收尾）：%s", exc)
         self._task = asyncio.create_task(self._run_loop())
 
     async def _run_loop(self) -> None:

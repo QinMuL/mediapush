@@ -1,4 +1,4 @@
-﻿"""Cd2UploaderService 单元测试（不连真实 CD2，gRPC 层 mock）。"""
+"""Cd2UploaderService 单元测试（不连真实 CD2，gRPC 层 mock）。"""
 
 from __future__ import annotations
 
@@ -88,13 +88,15 @@ def make_fake(tmp_path, src_files, dst_files, **overrides) -> FakeUploader:
     return u
 
 
-def _task(src="/media/media/C/a.mkv", status=3, uploaded=1024, total=1024):
+def _task(src="/media/media/C/a.mkv", status=3, uploaded=1024, total=1024,
+          start_seconds=0):
     return SimpleNamespace(
         sourcePath=src,
         destPath="/115open/tmp",
         status=status,
         uploadedBytes=uploaded,
         totalBytes=total,
+        startTime=SimpleNamespace(seconds=start_seconds),
         errors=[SimpleNamespace(path="/x", error="boom")],
     )
 
@@ -530,3 +532,107 @@ async def test_progress_suppressed_when_report_admin_off(tmp_path):
     assert r.progress_notified == 0
     assert tg.sent == []
     assert any("新任务 a.mkv" in d for d in r.details)  # 回退到汇总明细
+
+
+# ---------------------------------------------------------------------- #
+# 重启恢复：_tasks 从 CD2 GetCopyTasks 重建（防重复提交 + 进度续显）
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_recover_exact_src_path(tmp_path):
+    """sourcePath 精确命中目录C文件 → 重建追踪，run_once 不重复提交。"""
+    u = make_fake(
+        tmp_path,
+        src_files=[FakeFile("a.mkv", "/media/media/C/a.mkv", 1024)],
+        dst_files=[],
+        cd2_upload_dry_run=False,
+    )
+    u.tasks_result = [_task(status=2, uploaded=512, total=1024)]
+    await u._recover_tasks()
+    assert "/media/media/C/a.mkv" in u._tasks
+    info = u._tasks["/media/media/C/a.mkv"]
+    assert info.uploaded_bytes == 512 and info.size == 1024
+    # 恢复后 run_once：串行闸门生效，不重复提交
+    r = await u.run_once()
+    assert r.submitted == 0 and u.submitted == []
+
+
+@pytest.mark.asyncio
+async def test_recover_directory_task_by_size(tmp_path):
+    """sourcePath 为父目录（单文件 copy 的 CD2 行为）：按 totalBytes 匹配文件。"""
+    u = make_fake(
+        tmp_path,
+        src_files=[
+            FakeFile("a.mkv", "/media/media/C/a.mkv", 2048),
+            FakeFile("b.mkv", "/media/media/C/b.mkv", 4096),
+        ],
+        dst_files=[],
+        cd2_upload_dry_run=False,
+    )
+    u.tasks_result = [
+        _task(src="/media/media/C", status=2, uploaded=1024, total=4096)
+    ]
+    await u._recover_tasks()
+    # 按 size=4096 匹配到 b.mkv 而非 a.mkv
+    assert "/media/media/C/b.mkv" in u._tasks
+    assert "/media/media/C/a.mkv" not in u._tasks
+    r = await u.run_once()
+    assert r.submitted == 0
+
+
+@pytest.mark.asyncio
+async def test_recover_placeholder_when_size_mismatch(tmp_path):
+    """匹配不到文件（Scanning 期 totalBytes=0）：占位任务堵闸门，不删源目录。"""
+    u = make_fake(
+        tmp_path,
+        src_files=[FakeFile("a.mkv", "/media/media/C/a.mkv", 1024)],
+        dst_files=[],
+        cd2_upload_dry_run=False,
+    )
+    u.tasks_result = [
+        _task(src="/media/media/C", status=1, uploaded=0, total=0)
+    ]
+    await u._recover_tasks()
+    assert u.src_dir in u._tasks  # 占位任务（key=src_dir）
+    r = await u.run_once()
+    assert r.submitted == 0  # 闸门生效
+
+    # CD2 任务完成：占位收尾不删源目录
+    u.tasks_result = [_task(src="/media/media/C", status=3)]
+    r = await u.run_once()
+    assert r.completed == 1
+    assert u.deleted == []       # 绝不删目录C本身
+    assert u.src_dir not in u._tasks
+
+
+@pytest.mark.asyncio
+async def test_recover_skips_completed_failed_and_foreign(tmp_path):
+    """Completed/Failed/非本服务任务（destPath 不符）不恢复。"""
+    u = make_fake(
+        tmp_path,
+        src_files=[FakeFile("a.mkv", "/media/media/C/a.mkv", 1024)],
+        dst_files=[],
+        cd2_upload_dry_run=False,
+    )
+    foreign = _task(status=2)
+    foreign.destPath = "/other/dest"  # 非本服务任务
+    u.tasks_result = [
+        _task(status=3),   # Completed
+        _task(status=4),   # Failed
+        foreign,
+    ]
+    await u._recover_tasks()
+    assert u._tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_recover_none_when_cd2_empty(tmp_path):
+    """CD2 无任务（或查询失败）：恢复为空操作。"""
+    u = make_fake(
+        tmp_path,
+        src_files=[FakeFile("a.mkv", "/media/media/C/a.mkv", 1024)],
+        dst_files=[],
+        cd2_upload_dry_run=False,
+    )
+    u.tasks_result = []
+    await u._recover_tasks()
+    assert u._tasks == {}
