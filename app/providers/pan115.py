@@ -572,18 +572,19 @@ class Pan115Provider(BaseShareProvider):
                 ) from exc
 
     async def fs_rename(self, file_id: int, new_name: str) -> None:
-        """重命名文件/目录（fs_rename → open ufile/update）。需登录 cookie。
+        """重命名文件/目录（fs_rename_app → /files/batch_rename）。需登录 cookie。
 
-        p115client fs_rename 只接受 {file_id, file_name} payload
-        （多传键会被 115 拒：errno 990002 参数错误）。
-        注意：改名必须带扩展名（文件），否则 115 会截断最后一个句点后内容。
+        p115client fs_rename 走 open API（/open/ufile/update），web cookie 调
+        会被拒 errno 990002；改用 fs_rename_app（/{app}/files/batch_rename），
+        与项目 web cookie 兼容。
+        payload 格式：{files_new_name[{fid}]: new_name}
         """
         from p115client.client import check_response
 
         client = self._login_client()
         resp = await self._call_with_margin(
-            lambda: client.fs_rename(
-                {"file_id": file_id, "file_name": new_name},
+            lambda: client.fs_rename_app(
+                {f"files_new_name[{file_id}]": new_name},
                 async_=True,
             ),
             label="fs_rename",
