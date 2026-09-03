@@ -1,4 +1,4 @@
-"""监控账号登录 CLI（备选方式）：
+﻿"""监控账号登录 CLI（备选方式）：
 
     python -m app.monitor.login
 
@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 
 from app.config import Settings
-from app.monitor.service import parse_proxy
+from app.monitor.channel_monitor import parse_proxy
 
 
 async def main() -> None:

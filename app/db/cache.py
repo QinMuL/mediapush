@@ -255,7 +255,7 @@ class Cache:
             "share_code", "password", "chat_id", "message_id",
             "title", "last_checked_at", "pushed_at",
         )
-        return [dict(zip(keys, r)) for r in rows]
+        return [dict(zip(keys, r, strict=True)) for r in rows]
 
     async def touch_checked(self, share_code: str) -> None:
         """记录检查时间（活着/暂不可判均记录，减少重复巡检）。"""
@@ -302,7 +302,7 @@ class Cache:
             "FROM share_dirs d ORDER BY d.id"
         )
         keys = ("id", "path", "cid", "shared")
-        return [dict(zip(keys, r)) for r in rows]
+        return [dict(zip(keys, r, strict=True)) for r in rows]
 
     async def get_shared_item(self, dir_id: int, file_id: int) -> dict | None:
         """查子目录的分享记录（含 pending/failed）：有记录即不再新建分享。"""
@@ -316,7 +316,7 @@ class Cache:
             return None
         keys = ("file_id", "dir_id", "name", "share_code", "password", "status",
                 "fail_count", "next_retry_at", "fail_reason")
-        return dict(zip(keys, row))
+        return dict(zip(keys, row, strict=True))
 
     async def record_share(
         self, dir_id: int, file_id: int, name: str, share_code: str,

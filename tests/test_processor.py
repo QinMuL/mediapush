@@ -3,6 +3,7 @@ import asyncio
 from app.core.link_parser import ParsedShare
 from app.core.processor import ShareProcessor
 from app.providers.base import ShareFile
+from app.providers.ed2k import Ed2kProvider
 
 
 class FakePan115:
@@ -61,11 +62,12 @@ class FakePusher:
 
 
 class FakeContainer:
+    """pusher 懒取 stub：实例本身可调用（processor.pusher_provider()）。"""
+
     def __init__(self, pusher):
         self._pusher = pusher
 
-    @property
-    def pusher(self):
+    def __call__(self):
         return self._pusher
 
 
@@ -172,8 +174,6 @@ def test_tmdb_not_configured():
 
 
 # -------------------- ed2k 路由 -------------------- #
-from app.providers.ed2k import Ed2kProvider
-
 _ED2K_URL = (
     "ed2k://|file|宾虚 (1959) - 2160p.BluRay REMUX.DoVi P7.H.265.10-bit.23.976fps.TrueHD 7.1-WF.mkv"
     "|135915637476|3E874DEBD5E4A7AF8B1EEE7F41E7DD51|/"

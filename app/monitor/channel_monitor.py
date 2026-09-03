@@ -643,7 +643,7 @@ class MonitorService:
         target = await self.target_chat_id()
         done: list[str] = []
         failed: list[str] = []
-        for item, h in zip(pend.items, pend.hashes):
+        for item, h in zip(pend.items, pend.hashes, strict=False):
             if await self._push_card(processor, item, pend.title, pend.latest_ts, target):
                 done.append(h)
             else:

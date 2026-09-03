@@ -16,10 +16,10 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass, field
 
+from app.core.service_base import PollingService
 from app.telegram.notifier import AdminNotifier, notify_admins
 
 logger = logging.getLogger(__name__)
@@ -52,19 +52,31 @@ class InspectReport:
             s += f" · ⚠️ 异常 {self.errors}"
         return s
 
+    def has_events(self) -> bool:
+        """本轮是否有值得记日志的事件（恒 True：巡检每轮都记完成日志）。"""
+        return True
 
-class ShareInspector:
-    """巡检器：run_once 单轮；start/stop 后台循环（bot post_init 挂载）。"""
+
+class ShareInspector(PollingService):
+    """巡检器：run_once 单轮；循环骨架见 PollingService（bot post_init 挂载）。"""
+
+    name = "inspect"
+    log_prefix = "分享巡检"
+    interval_scale = 3600.0    # interval 单位为小时
+    startup_delay = 120.0      # 启动先歇 2 分钟（避开启动高峰，等首批数据落库）
 
     def __init__(self, container, settings) -> None:
         self.container = container
         self.settings = settings
         self.interval = max(0.5, settings.inspect_interval_hours)
-        self._task: asyncio.Task | None = None
         # 巡检异常轮计数（连续 N 轮异常 → 告警，恢复正常清零）
         self._error_rounds = 0
         # 延迟初始化（bot 启动后才有实例）：首次使用时从 container 取
         self._notifier: AdminNotifier | None = None
+
+    async def before_round(self) -> None:
+        self._refresh_cookie_file()
+        await self._check_cookie_health()
 
     def _get_notifier(self) -> AdminNotifier | None:
         """告警通知器（cookie 告警 24h 节流 + 巡检异常告警）。"""
@@ -237,56 +249,37 @@ class ShareInspector:
         await notify_admins(telegram.bot, self.settings.tg_admin_ids, text)
 
     # ------------------------------------------------------------------ #
-    async def start(self) -> None:
-        """后台循环（bot post_init 挂载，与 monitor 同模式）。"""
-        if self._task is not None and not self._task.done():
-            return
-        self._task = asyncio.create_task(self._loop())
-        logger.info(
+    # 生命周期钩子（循环骨架见 PollingService）
+    # ------------------------------------------------------------------ #
+    async def after_round(self, report) -> None:
+        if report.dead and self.settings.inspect_notify:
+            await self.notify_admin(report)
+        if report.code_items:
+            await self._notify_code_items(report)
+        # 巡检异常轮告警：连续 N 轮全异常（疑似 IP 被限/网络故障）才打扰
+        threshold = max(1, self.settings.inspect_error_alert_rounds)
+        if report.errors and report.total and report.errors == report.total:
+            self._error_rounds += 1
+            if self._error_rounds >= threshold:
+                notifier = self._get_notifier()
+                if notifier is not None:
+                    await notifier.alert(
+                        "inspect_errors",
+                        f"⚠️ 分享巡检已连续 {self._error_rounds} 轮全部失败"
+                        f"（每轮 {report.errors} 条查询异常）。\n"
+                        f"疑似 115 限流本机 IP 或网络故障；将按间隔继续重试。",
+                    )
+        elif self._error_rounds:
+            rounds = self._error_rounds
+            self._error_rounds = 0
+            notifier = self._get_notifier()
+            if notifier is not None:
+                await notifier.resolve(
+                    "inspect_errors",
+                    f"✅ 分享巡检已恢复正常（此前连续 {rounds} 轮失败）",
+                )
+
+    def _on_start(self) -> None:
+        self.log.info(
             "分享失效巡检已启动（间隔 %.1f 小时）", self.interval
         )
-
-    async def stop(self) -> None:
-        if self._task is not None and not self._task.done():
-            self._task.cancel()
-        self._task = None
-
-    async def _loop(self) -> None:
-        # 启动先歇 2 分钟（避开启动高峰，等首批推送/巡检数据落库）
-        await asyncio.sleep(120)
-        while True:
-            try:
-                self._refresh_cookie_file()
-                await self._check_cookie_health()
-                report = await self.run_once()
-                if report.dead and self.settings.inspect_notify:
-                    await self.notify_admin(report)
-                if report.code_items:
-                    await self._notify_code_items(report)
-                # 巡检异常轮告警：连续 N 轮全异常（疑似 IP 被限/网络故障）才打扰
-                threshold = max(1, self.settings.inspect_error_alert_rounds)
-                if report.errors and report.total and report.errors == report.total:
-                    self._error_rounds += 1
-                    if self._error_rounds >= threshold:
-                        notifier = self._get_notifier()
-                        if notifier is not None:
-                            await notifier.alert(
-                                "inspect_errors",
-                                f"⚠️ 分享巡检已连续 {self._error_rounds} 轮全部失败"
-                                f"（每轮 {report.errors} 条查询异常）。\n"
-                                f"疑似 115 限流本机 IP 或网络故障；将按间隔继续重试。",
-                            )
-                elif self._error_rounds:
-                    rounds = self._error_rounds
-                    self._error_rounds = 0
-                    notifier = self._get_notifier()
-                    if notifier is not None:
-                        await notifier.resolve(
-                            "inspect_errors",
-                            f"✅ 分享巡检已恢复正常（此前连续 {rounds} 轮失败）",
-                        )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("巡检轮失败（下轮重试）")
-            await asyncio.sleep(self.interval * 3600)

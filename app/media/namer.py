@@ -26,6 +26,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from app.matching import title_match as _title_match
 from app.media.probe import ProbeTags, probe_file
 from app.parser.media_parser import (
     MediaData,
@@ -89,30 +90,8 @@ def parse_for_naming(name: str) -> MediaData:
 
 
 # ---------------------------------------------------------------------- #
-# TMDB 硬门槛匹配
+# TMDB 硬门槛匹配：归一化/比较实现收敛于 app/matching.py（全项目唯一）
 # ---------------------------------------------------------------------- #
-# 标点折叠：全/半角逗号、冒号、句号、引号、括号、空格、连字符全部去掉后再
-# 小写比较——避免 "Four Hands, Two Sonatas" vs "Four Hands Two Sonatas"
-# 或 "四手联弹，两首奏鸣曲" vs "四手联弹两首奏鸣曲" 被判成不同。
-_TITLE_STRIP_RE = re.compile(r"[\s,，:：;；!！.。·\-_''\"()（）\[\]【】<>《》]")
-
-
-def _norm_title(s: str) -> str:
-    return _TITLE_STRIP_RE.sub("", (s or "").lower())
-
-
-def _title_match(query: str, candidate_titles: list[str]) -> bool:
-    """标题匹配：归一化后相等或包含（≥4 字符防短词误匹配）。"""
-    q = _norm_title(query)
-    if not q:
-        return False
-    for t in candidate_titles:
-        c = _norm_title(t)
-        if not c:
-            continue
-        if q == c or (len(q) >= 4 and q in c) or (len(c) >= 4 and c in q):
-            return True
-    return False
 
 
 def _cand_year(c: dict) -> int | None:

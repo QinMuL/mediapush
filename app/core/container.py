@@ -1,4 +1,4 @@
-"""DI 容器：懒加载所有服务单例。
+﻿"""DI 容器：懒加载所有服务单例。
 
 - 空配置（缺 token/cookie/key）时不阻塞启动，对应服务为 None
 - pusher 懒取：bot 启动（build）后才就绪
@@ -27,10 +27,7 @@ class Container:
         self.monitor = None
         self.inspector = None
         self.share_watcher = None
-        self.local_media = None
-        self.ed2k_service = None   # B→C 哈希流水线（app.media.ed2k_service.Ed2kService）
-        self.ed2k_pusher = None    # JSONL → 频道推送（app.media.ed2k_pusher.Ed2kPusherService）
-        self.cd2_uploader = None   # C → CD2 CopyFile → 115（app.media.cd2_uploader.Cd2UploaderService）
+        self.pipeline = None     # 统一媒体流水线（app.pipeline.service.PipelineService）
         self.pan115_limiter = None
         self._built = False
 
@@ -48,6 +45,9 @@ class Container:
             from pathlib import Path
 
             new_cookie = Path(cookie_file).read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            # 文件不存在（首启未设置/被删）：等价未配置，匿名模式可用，静默
+            return False
         except OSError as exc:
             logger.warning("cookie 文件读取失败：%s", exc)
             return False
@@ -106,7 +106,9 @@ class Container:
         # 编排器（pusher 懒取，故可先建）
         from app.core.processor import ShareProcessor
 
-        self.processor = ShareProcessor(self.pan115, self.ed2k, self.tmdb, self.cache, self)
+        self.processor = ShareProcessor(
+            self.pan115, self.ed2k, self.tmdb, self.cache, lambda: self.pusher
+        )
 
         # Telegram Bot
         if self.settings.tg_bot_token:
@@ -118,7 +120,7 @@ class Container:
 
         # 频道监控（Telethon 用户账号）——store 恒可建，登录态在 service.start 校验
         if self.settings.monitor_enabled:
-            from app.monitor.service import MonitorService
+            from app.monitor.channel_monitor import MonitorService
             from app.monitor.store import MonitorStore
 
             self.monitor_store = MonitorStore(self.settings.monitor_db_path)
@@ -147,59 +149,21 @@ class Container:
         else:
             logger.info("SHARE_WATCH_ENABLED=false，目录监控未启用")
 
-        # 本地媒体流水线（目录A → 重命名 → 目录B，start 在 bot post_init）
-        if self.settings.local_media_enabled:
-            from app.media.service import LocalMediaService
+        # 统一媒体流水线（A → 重命名 → B 资源库 → 哈希/推卡片 → CD2 上传，start 在 bot post_init）
+        if self.settings.pipeline_enabled:
+            from app.pipeline.service import PipelineService
 
-            self.local_media = LocalMediaService(self, self.settings)
+            self.pipeline = PipelineService(self, self.settings)
             logger.info(
-                "本地媒体流水线已创建：A=%s → B=%s（%s）",
-                self.settings.local_media_input_dir,
-                self.settings.local_media_output_dir,
-                "DRY-RUN 模拟" if self.settings.local_media_dry_run else "实际移动",
+                "统一媒体流水线已创建：A=%s → B=%s（重命名%s · 推送%s · 上传%s）",
+                self.settings.pipeline_input_dir,
+                self.settings.pipeline_library_dir,
+                "模拟" if self.settings.pipeline_rename_dry_run else "实际",
+                "模拟" if self.settings.pipeline_push_dry_run else "实际",
+                "模拟" if self.settings.pipeline_upload_dry_run else "实际",
             )
         else:
-            logger.info("LOCAL_MEDIA_ENABLED=false，本地媒体流水线未启用")
-
-        # ed2k 流水线（目录B → 哈希 → 目录C，start 在 bot post_init）
-        if self.settings.ed2k_enabled:
-            from app.media.ed2k_service import Ed2kService
-
-            self.ed2k_service = Ed2kService(self.settings)
-            logger.info(
-                "ed2k 流水线已创建：B=%s → C=%s（%s）",
-                self.settings.ed2k_input_dir,
-                self.settings.ed2k_output_dir,
-                "DRY-RUN 模拟" if self.settings.ed2k_dry_run else "实际移动",
-            )
-        else:
-            logger.info("ED2K_ENABLED=false，ed2k 流水线未启用")
-
-        # ed2k 推送（JSONL → ShareProcessor → 频道卡片，start 在 bot post_init）
-        if self.settings.ed2k_push_enabled:
-            from app.media.ed2k_pusher import Ed2kPusherService
-
-            self.ed2k_pusher = Ed2kPusherService(self, self.settings)
-            logger.info(
-                "ed2k 推送已创建：追读 data/ed2k_results.jsonl（%s）",
-                "DRY-RUN 模拟" if self.settings.ed2k_push_dry_run else "实际推送",
-            )
-        else:
-            logger.info("ED2K_PUSH_ENABLED=false，ed2k 推送未启用")
-
-        # CD2 上传（目录C → CloudDrive2 CopyFile → 115，start 在 bot post_init）
-        if self.settings.cd2_enabled:
-            from app.media.cd2_uploader import Cd2UploaderService
-
-            self.cd2_uploader = Cd2UploaderService(self, self.settings)
-            logger.info(
-                "CD2 上传已创建：%s → %s（%s）",
-                self.settings.cd2_upload_src,
-                self.settings.cd2_upload_dst,
-                "DRY-RUN 模拟" if self.settings.cd2_upload_dry_run else "实际上传",
-            )
-        else:
-            logger.info("CD2_ENABLED=false，CD2 上传未启用")
+            logger.info("PIPELINE_ENABLED=false，统一媒体流水线未启用")
 
         self._built = True
 
@@ -234,14 +198,8 @@ class Container:
             self.inspector.interval = max(0.5, old.inspect_interval_hours)
         if "share_watch_interval_minutes" in hot and self.share_watcher is not None:
             self.share_watcher.interval = max(1.0, old.share_watch_interval_minutes)
-        if "local_media_interval_seconds" in hot and self.local_media is not None:
-            self.local_media.interval = max(1.0, old.local_media_interval_seconds)
-        if "ed2k_interval_seconds" in hot and self.ed2k_service is not None:
-            self.ed2k_service.interval = max(1.0, old.ed2k_interval_seconds)
-        if "ed2k_push_interval_seconds" in hot and self.ed2k_pusher is not None:
-            self.ed2k_pusher.interval = max(1.0, old.ed2k_push_interval_seconds)
-        if "cd2_upload_interval_seconds" in hot and self.cd2_uploader is not None:
-            self.cd2_uploader.interval = max(5.0, old.cd2_upload_interval_seconds)
+        if "pipeline_interval_seconds" in hot and self.pipeline is not None:
+            self.pipeline.interval = max(1.0, old.pipeline_interval_seconds)
         if "pan115_request_interval" in hot and self.pan115_limiter is not None:
             self.pan115_limiter.set_base_interval(old.pan115_request_interval)
         if "log_level" in hot:
@@ -278,15 +236,26 @@ class Container:
     def tg_ready(self) -> bool:
         return self.telegram is not None
 
+    @property
+    def polling_services(self) -> list:
+        """全部轮询服务实例（统一入口：批量启停 / 状态聚合）。
+
+        monitor 不在内（Telethon 事件驱动，非轮询模型）。
+        """
+        from app.core.service_base import PollingService
+
+        return [
+            svc for svc in (
+                self.inspector,
+                self.share_watcher,
+                self.pipeline,
+            )
+            if isinstance(svc, PollingService)
+        ]
+
     async def close(self) -> None:
-        if self.cd2_uploader is not None:
-            await self.cd2_uploader.stop()
-        if self.ed2k_pusher is not None:
-            await self.ed2k_pusher.stop()
-        if self.ed2k_service is not None:
-            await self.ed2k_service.stop()
-        if self.local_media is not None:
-            await self.local_media.stop()
+        if self.pipeline is not None:
+            await self.pipeline.stop()
         if self.share_watcher is not None:
             await self.share_watcher.stop()
         if self.inspector is not None:

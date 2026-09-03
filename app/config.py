@@ -17,6 +17,18 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _env_bool_alias(name: str, legacy: str, default: bool) -> bool:
+    """布尔配置别名：新键优先，旧键兜底（键位治理迁移期兼容，旧键不删）。
+
+    现存别名：PIPELINE_REPORT_ADMIN ← CD2_REPORT_ADMIN（统一流水线
+    合并原 ed2k_push/cd2 两处报告开关后的兼容入口）。
+    """
+    raw = os.getenv(name)
+    if raw is not None:
+        return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return _env_bool(legacy, default)
+
+
 def _env_int(name: str, default: int = 0) -> int:
     raw = os.getenv(name, "")
     try:
@@ -104,43 +116,27 @@ class Settings:
     share_normalize_dry_run: bool = True
     # 频道监控（Telethon）断连/重连/补扫等运行事件私信 admin
     monitor_notify: bool = True
-    # 本地媒体流水线（目录A监控 → namer 重命名 → 目录B，见 app/media/service.py）
-    local_media_enabled: bool = False
-    local_media_input_dir: str = ""    # 目录A：待处理资源（递归监控）
-    local_media_output_dir: str = ""   # 目录B：规范化输出（须在A之外）
-    local_media_dry_run: bool = True   # 模拟模式：只出日志不实际移动
-    local_media_interval_seconds: float = 10.0  # 扫描周期
-    local_media_stable_rounds: int = 3          # 稳定判定轮数（×周期）
-    local_media_stuck_days: float = 7.0          # 低置信卡死告警阈值（天）
-    local_media_batch_move_max: int = 5          # 单轮最多移动的文件数（防一次性几十上百个打爆 IO/TMDB）
-    local_media_min_size_mb: float = 10.0        # 最小体积守门（MB）：低于此值视为下载残缺，不进流水线（防 0 字节占位文件）
-    # ed2k 流水线（目录B监控 → ed2k 哈希 → 目录C，见 app/media/ed2k_service.py）
-    ed2k_enabled: bool = False
-    ed2k_input_dir: str = ""                    # 目录B（= local_media_output_dir 通常一致）
-    ed2k_output_dir: str = ""                   # 目录C：ed2k 产出后归档（须在B之外）
-    ed2k_dry_run: bool = True                    # 模拟模式：只哈希+记 jsonl，不实际移动
-    ed2k_interval_seconds: float = 30.0          # 扫描周期（哈希重，30s 起步）
-    ed2k_stable_rounds: int = 3                  # 稳定判定轮数（×周期）
-    ed2k_stuck_days: float = 7.0                  # 哈希失败卡死告警（天）
-    # ed2k 推送（JSONL → ShareProcessor → TG_CHAT_ID_ED2K 频道）
-    ed2k_push_enabled: bool = False
-    ed2k_push_dry_run: bool = True                 # 模拟：只出日志不实际调用 processor
-    ed2k_push_interval_seconds: float = 60.0       # 推送扫描周期秒（60s 起步，卡片+TMDB 较慢）
-    ed2k_push_stuck_days: float = 7.0              # 推送失败卡死告警（天）
-    ed2k_push_report_admin: bool = True            # 每轮结束把汇总发给 TG_ADMIN_IDS
-    ed2k_push_report_channel: bool = False         # 每轮结束把汇总同步发到 TG_CHAT_ID_ED2K（慎用，会刷频道）
-    # CD2 上传（目录C → CloudDrive2 CopyFile → 115，见 app/media/cd2_uploader.py）
-    cd2_enabled: bool = False
+    # 统一媒体流水线（方案二整合：A → 重命名 → B 资源库 → 哈希/推卡片 → CD2 上传 115，
+    # 见 app/pipeline/service.py；替代原 local_media/ed2k/ed2k_push/cd2 四段服务）
+    pipeline_enabled: bool = False
+    pipeline_input_dir: str = ""       # 目录A：下载落地（递归监控，稳定判定在此）
+    pipeline_library_dir: str = ""     # 目录B：资源库（重命名+哈希+待上传，CD2 挂载源）
+    pipeline_rename_dry_run: bool = True   # ① 模拟：只出"拟移动"日志（仍真调 TMDB）
+    pipeline_push_dry_run: bool = True     # ② 模拟：只出"将推送"日志（哈希/JSONL 仍真实）
+    pipeline_upload_dry_run: bool = True   # ③ 模拟：只出"将上传"日志（仍真查重 115 目标）
+    pipeline_interval_seconds: float = 10.0  # 轮询周期（哈希/上传追踪同轮进行）
+    pipeline_stable_rounds: int = 3          # A 侧稳定判定轮数（×周期，唯一一处）
+    pipeline_batch_max: int = 5              # 单轮最多重命名的文件数（防打爆 IO/TMDB）
+    pipeline_min_size_mb: float = 10.0       # 体积守门（MB）：低于视为下载残缺拦截
+    pipeline_stuck_days: float = 7.0         # 各阶段失败卡死告警阈值（天）
+    pipeline_report_admin: bool = True       # 有动作的轮次把汇总+明细发给 TG_ADMIN_IDS
+    # CD2 连接与路径（上传阶段用；src = 目录B 在 CD2 里的路径）
     cd2_address: str = "192.168.1.202:19798"       # CD2 gRPC 地址
     cd2_token: str = ""                           # API 令牌（推荐，UI 创建）
     cd2_username: str = ""                         # 或账号密码（token 优先）
     cd2_password: str = ""
-    cd2_upload_src: str = ""                       # 目录C 在 CD2 里的路径（本地挂载）
+    cd2_upload_src: str = ""                       # 目录B 在 CD2 里的路径（本地挂载）
     cd2_upload_dst: str = ""                       # 115 在 CD2 里的目标目录
-    cd2_upload_dry_run: bool = True                # 模拟：只查重+日志，不提交任务
-    cd2_upload_interval_seconds: float = 60.0      # 扫描周期
-    cd2_stuck_days: float = 7.0                     # 上传失败卡死告警（天）
-    cd2_report_admin: bool = True                   # 有动作的轮次把汇总+明细发给 TG_ADMIN_IDS
 
     @classmethod
     def load(cls, *, dotenv_override: bool = False) -> Settings:
@@ -165,6 +161,10 @@ class Settings:
         if not cookie and cookie_file:
             try:
                 cookie = Path(cookie_file).read_text(encoding="utf-8").strip()
+            except FileNotFoundError:
+                # 首次部署文件尚不存在（_ensure_dirs 随后创建空占位）：
+                # 等价于未配置 cookie，匿名模式可用，静默即可
+                pass
             except OSError as exc:
                 logger.warning("PAN115_COOKIE_FILE 读取失败：%s", exc)
 
@@ -222,43 +222,22 @@ class Settings:
             share_normalize_enabled=_env_bool("SHARE_NORMALIZE_ENABLED", False),
             share_normalize_dry_run=_env_bool("SHARE_NORMALIZE_DRY_RUN", True),
             monitor_notify=_env_bool("MONITOR_NOTIFY", True),
-            local_media_enabled=_env_bool("LOCAL_MEDIA_ENABLED", False),
-            local_media_input_dir=os.getenv("LOCAL_MEDIA_INPUT_DIR", "").strip(),
-            local_media_output_dir=os.getenv("LOCAL_MEDIA_OUTPUT_DIR", "").strip(),
-            local_media_dry_run=_env_bool("LOCAL_MEDIA_DRY_RUN", True),
-            local_media_interval_seconds=max(
-                1.0, _env_float("LOCAL_MEDIA_INTERVAL_SECONDS", 10.0)
+            pipeline_enabled=_env_bool("PIPELINE_ENABLED", False),
+            pipeline_input_dir=os.getenv("PIPELINE_INPUT_DIR", "").strip(),
+            pipeline_library_dir=os.getenv("PIPELINE_LIBRARY_DIR", "").strip(),
+            pipeline_rename_dry_run=_env_bool("PIPELINE_RENAME_DRY_RUN", True),
+            pipeline_push_dry_run=_env_bool("PIPELINE_PUSH_DRY_RUN", True),
+            pipeline_upload_dry_run=_env_bool("PIPELINE_UPLOAD_DRY_RUN", True),
+            pipeline_interval_seconds=max(
+                1.0, _env_float("PIPELINE_INTERVAL_SECONDS", 10.0)
             ),
-            local_media_stable_rounds=max(
-                1, _env_int("LOCAL_MEDIA_STABLE_ROUNDS", 3)
+            pipeline_stable_rounds=max(1, _env_int("PIPELINE_STABLE_ROUNDS", 3)),
+            pipeline_batch_max=max(1, _env_int("PIPELINE_BATCH_MAX", 5)),
+            pipeline_min_size_mb=max(0.0, _env_float("PIPELINE_MIN_SIZE_MB", 10.0)),
+            pipeline_stuck_days=max(1.0, _env_float("PIPELINE_STUCK_DAYS", 7.0)),
+            pipeline_report_admin=_env_bool_alias(
+                "PIPELINE_REPORT_ADMIN", "CD2_REPORT_ADMIN", True
             ),
-            local_media_stuck_days=max(
-                1.0, _env_float("LOCAL_MEDIA_STUCK_DAYS", 7.0)
-            ),
-            local_media_batch_move_max=max(
-                1, _env_int("LOCAL_MEDIA_BATCH_MOVE_MAX", 5)
-            ),
-            local_media_min_size_mb=max(
-                0.0, _env_float("LOCAL_MEDIA_MIN_SIZE_MB", 10.0)
-            ),
-            ed2k_enabled=_env_bool("ED2K_ENABLED", False),
-            ed2k_input_dir=os.getenv("ED2K_INPUT_DIR", "").strip(),
-            ed2k_output_dir=os.getenv("ED2K_OUTPUT_DIR", "").strip(),
-            ed2k_dry_run=_env_bool("ED2K_DRY_RUN", True),
-            ed2k_interval_seconds=max(
-                1.0, _env_float("ED2K_INTERVAL_SECONDS", 30.0)
-            ),
-            ed2k_stable_rounds=max(1, _env_int("ED2K_STABLE_ROUNDS", 3)),
-            ed2k_stuck_days=max(1.0, _env_float("ED2K_STUCK_DAYS", 7.0)),
-            ed2k_push_enabled=_env_bool("ED2K_PUSH_ENABLED", False),
-            ed2k_push_dry_run=_env_bool("ED2K_PUSH_DRY_RUN", True),
-            ed2k_push_interval_seconds=max(
-                1.0, _env_float("ED2K_PUSH_INTERVAL_SECONDS", 60.0)
-            ),
-            ed2k_push_stuck_days=max(1.0, _env_float("ED2K_PUSH_STUCK_DAYS", 7.0)),
-            ed2k_push_report_admin=_env_bool("ED2K_PUSH_REPORT_ADMIN", True),
-            ed2k_push_report_channel=_env_bool("ED2K_PUSH_REPORT_CHANNEL", False),
-            cd2_enabled=_env_bool("CD2_ENABLED", False),
             cd2_address=os.getenv("CD2_ADDRESS", "192.168.1.202:19798").strip()
             or "192.168.1.202:19798",
             cd2_token=os.getenv("CD2_TOKEN", "").strip(),
@@ -266,12 +245,6 @@ class Settings:
             cd2_password=os.getenv("CD2_PASSWORD", "").strip(),
             cd2_upload_src=os.getenv("CD2_UPLOAD_SRC", "").strip(),
             cd2_upload_dst=os.getenv("CD2_UPLOAD_DST", "").strip(),
-            cd2_upload_dry_run=_env_bool("CD2_UPLOAD_DRY_RUN", True),
-            cd2_upload_interval_seconds=max(
-                5.0, _env_float("CD2_UPLOAD_INTERVAL_SECONDS", 60.0)
-            ),
-            cd2_stuck_days=max(1.0, _env_float("CD2_STUCK_DAYS", 7.0)),
-            cd2_report_admin=_env_bool("CD2_REPORT_ADMIN", True),
         )
         settings._ensure_dirs()
         return settings
@@ -280,6 +253,17 @@ class Settings:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         if self.log_file:
             Path(self.log_file).parent.mkdir(parents=True, exist_ok=True)
+        # cookie 文件首启自动创建空占位：用户可直接在宿主机编辑该文件写入
+        # （也作为 /cookie 命令的落点）；空内容 = 未配置（匿名模式），各读取点
+        # 对空串静默跳过，不会产生告警噪音
+        if self.pan115_cookie_file and not Path(self.pan115_cookie_file).exists():
+            try:
+                Path(self.pan115_cookie_file).parent.mkdir(parents=True, exist_ok=True)
+                Path(self.pan115_cookie_file).touch()
+                logger.info("已创建 cookie 空文件：%s（/cookie 命令或直接编辑写入）",
+                            self.pan115_cookie_file)
+            except OSError as exc:
+                logger.warning("cookie 空文件创建失败（不影响运行）：%s", exc)
 
     def validate(self) -> list[str]:
         """返回告警列表（不抛错，缺失项由 Container 决定是否阻塞启动）。"""
@@ -297,43 +281,43 @@ class Settings:
             warns.append("PROXY_URL 未配置，TG/TMDB 在国内网络可能无法访问。")
         if self.monitor_enabled and not (self.tg_api_id and self.tg_api_hash):
             warns.append("TG_API_ID/TG_API_HASH 未配置，频道监控不启动。")
-        if self.local_media_enabled:
-            if not self.local_media_input_dir or not self.local_media_output_dir:
+        # 统一流水线校验
+        if self.pipeline_enabled:
+            if not self.pipeline_input_dir or not self.pipeline_library_dir:
                 warns.append(
-                    "LOCAL_MEDIA_ENABLED 已开但 INPUT/OUTPUT 目录未配置，本地媒体流水线不启动。"
+                    "PIPELINE_ENABLED 已开但 PIPELINE_INPUT_DIR/PIPELINE_LIBRARY_DIR 未配置，流水线不启动。"
                 )
             else:
-                inp, out = Path(self.local_media_input_dir), Path(self.local_media_output_dir)
-                if inp != out and out in inp.parents:
-                    warns.append("LOCAL_MEDIA_OUTPUT_DIR 不得位于 INPUT 目录内（会被反复扫描）。")
-        if self.ed2k_enabled:
-            if not self.ed2k_input_dir or not self.ed2k_output_dir:
-                warns.append("ED2K_ENABLED 已开但 INPUT/OUTPUT 目录未配置，ed2k 流水线不启动。")
-            else:
-                b, c = Path(self.ed2k_input_dir), Path(self.ed2k_output_dir)
-                if b != c and c in b.parents:
-                    warns.append("ED2K_OUTPUT_DIR 不得位于 INPUT 目录内（会被反复哈希）。")
-                bo = Path(self.local_media_output_dir) if self.local_media_enabled else None
-                if bo and b != bo and bo.exists() and b.exists() and b.resolve() != bo.resolve():
+                a = Path(self.pipeline_input_dir)
+                b = Path(self.pipeline_library_dir)
+                if a != b and (b in a.parents or a in b.parents):
                     warns.append(
-                        f"ED2K_INPUT_DIR={self.ed2k_input_dir} 与 LOCAL_MEDIA_OUTPUT_DIR="
-                        f"{self.local_media_output_dir} 不一致——A→B→C 链路需要衔接，确认你的配置。"
+                        "PIPELINE_LIBRARY_DIR 与 PIPELINE_INPUT_DIR 不得互相嵌套（会被反复扫描）。"
                     )
-        if self.ed2k_push_enabled and not self.tg_chat_id_ed2k and not self.tg_chat_id:
-                warns.append(
-                    "ED2K_PUSH_ENABLED 已开但 TG_CHAT_ID_ED2K/TG_CHAT_ID 均未配置——推送无目标频道。"
-                )
-        if self.cd2_enabled:
             if not self.cd2_upload_src or not self.cd2_upload_dst:
-                warns.append("CD2_ENABLED 已开但 CD2_UPLOAD_SRC/DST 未配置，CD2 上传不启动。")
+                warns.append(
+                    "流水线上传需配置 CD2_UPLOAD_SRC（B 的 CD2 路径）与 CD2_UPLOAD_DST。"
+                )
             elif self.cd2_upload_src == self.cd2_upload_dst:
                 warns.append("CD2_UPLOAD_SRC 与 DST 不得相同（源=目标会死循环）。")
             if not self.cd2_token and not (self.cd2_username and self.cd2_password):
                 warns.append(
-                    "CD2_ENABLED 已开但 CD2_TOKEN / CD2_USERNAME+PASSWORD 均未配置——无法认证。"
+                    "CD2_TOKEN / CD2_USERNAME+PASSWORD 均未配置——上传阶段无法认证。"
                 )
-            if self.cd2_upload_src and self.cd2_upload_dst and not self.cd2_token:
+            elif not self.cd2_token:
                 warns.append("CD2 建议使用 API 令牌（CD2_TOKEN）而非账号密码。")
+        # 旧四段开关迁移提醒（读原始 env，不进 Settings 字段）
+        _on = {"1", "true", "yes", "y", "on"}
+        legacy_on = [
+            k for k in ("LOCAL_MEDIA_ENABLED", "ED2K_ENABLED",
+                        "ED2K_PUSH_ENABLED", "CD2_ENABLED")
+            if (os.getenv(k) or "").strip().lower() in _on
+        ]
+        if legacy_on and not self.pipeline_enabled:
+            warns.append(
+                f"检测到旧版四段开关仍为 true（{', '.join(legacy_on)}）——"
+                "已由统一流水线 PIPELINE_* 取代，请按 README「流水线迁移」更新 .env。"
+            )
         return warns
 
     def is_admin(self, user_id: int | None) -> bool:
@@ -360,20 +344,13 @@ HOT_RELOAD_FIELDS: frozenset[str] = frozenset({
     "share_normalize_dry_run",
     "monitor_notify",
     "monitor_batch_seconds",
-    "local_media_dry_run",
-    "local_media_interval_seconds",
-    "local_media_stable_rounds",
-    "local_media_stuck_days",
-    "local_media_min_size_mb",
-    "ed2k_dry_run",
-    "ed2k_interval_seconds",
-    "ed2k_stable_rounds",
-    "ed2k_stuck_days",
-    "ed2k_push_dry_run",
-    "ed2k_push_interval_seconds",
-    "ed2k_push_stuck_days",
-    "cd2_upload_dry_run",
-    "cd2_upload_interval_seconds",
-    "cd2_stuck_days",
-    "cd2_report_admin",
+    "pipeline_rename_dry_run",
+    "pipeline_push_dry_run",
+    "pipeline_upload_dry_run",
+    "pipeline_interval_seconds",
+    "pipeline_stable_rounds",
+    "pipeline_stuck_days",
+    "pipeline_min_size_mb",
+    "pipeline_batch_max",
+    "pipeline_report_admin",
 })

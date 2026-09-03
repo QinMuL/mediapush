@@ -7,10 +7,15 @@
 - 旧 JSON 状态文件首次加载时自动迁移入库并改名 .migrated（load_with_legacy）
 
 已接入服务（service 键）：
-- local_media  ← data/local_media_state.json（低置信退避状态）
-- ed2k         ← data/ed2k_state.json（哈希失败退避状态）
-- ed2k_push    ← data/ed2k_push_state.json（JSONL offset + 推送退避状态）
-- cd2          ← data/cd2_state.json（completed + 上传退避状态）
+- pipeline    ← 统一媒体流水线（failures 阶段退避 + completed + pushed）
+- share_watch 等其他常驻服务按需接入
+
+历史键（旧四段链路，随方案二整合停用；旧 JSON 由 load_with_legacy
+统一迁移入库，payload 结构兼容读取）：
+- local_media ← data/local_media_state.json（低置信退避）
+- ed2k        ← data/ed2k_state.json（哈希失败退避）
+- ed2k_push   ← data/ed2k_push_state.json（JSONL offset + 推送退避）
+- cd2         ← data/cd2_state.json（completed + 上传退避）
 """
 
 from __future__ import annotations

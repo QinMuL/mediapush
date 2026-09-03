@@ -132,8 +132,8 @@ def test_dual_file_split_media_vs_core(tmp_path):
         "INFO", use_color=False,
         log_file=str(core), log_media_file=str(media),
     )
-    logging.getLogger("app.media.service").info("media-pipeline-msg")
-    logging.getLogger("app.media.ed2k_service").info("media-ed2k-msg")
+    logging.getLogger("app.pipeline.service").info("media-pipeline-msg")
+    logging.getLogger("app.media.namer").info("media-namer-msg")
     logging.getLogger("app.core.processor").info("core-msg")
     for h in logging.getLogger().handlers:
         h.flush()
@@ -143,10 +143,10 @@ def test_dual_file_split_media_vs_core(tmp_path):
     # 核心日志：系统内容在，媒体流水线不在
     assert "core-msg" in core_text
     assert "media-pipeline-msg" not in core_text
-    assert "media-ed2k-msg" not in core_text
-    # 媒体日志：只有 app.media.*
+    assert "media-namer-msg" not in core_text
+    # 媒体日志：只有流水线模块
     assert "media-pipeline-msg" in media_text
-    assert "media-ed2k-msg" in media_text
+    assert "media-namer-msg" in media_text
     assert "core-msg" not in media_text
     # 恢复
     setup_logging("INFO", use_color=False)

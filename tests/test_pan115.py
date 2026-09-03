@@ -25,7 +25,7 @@ class _FakeAIter:
         try:
             return next(self._it)
         except StopIteration:
-            raise StopAsyncIteration
+            raise StopAsyncIteration from None
 
 
 def _patch_precheck_ok(monkeypatch):

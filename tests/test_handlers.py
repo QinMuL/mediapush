@@ -1,8 +1,6 @@
 """Bot 命令菜单注册测试 + 编辑模式（/edit）流程测试。"""
 
 import asyncio
-import time
-from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock
 
 from app.core.link_parser import ParsedShare
@@ -17,6 +15,7 @@ from app.telegram.handlers import (
     cmd_cookie,
     cmd_edit,
     cmd_status,
+    coordinator,
     on_edit_callback,
     on_text,
     setup_commands,
@@ -592,11 +591,8 @@ class _StatusContainer:
         self.settings.inspect_interval_hours = 6
         self.settings.share_watch_enabled = False
         self.settings.share_watch_interval_minutes = 10
-        # 本地媒体 / ed2k 流水线 / ed2k 推送 / CD2 上传：默认未启用（避免走进 :g 格式化分支）
-        self.settings.local_media_enabled = False
-        self.settings.ed2k_enabled = False
-        self.settings.ed2k_push_enabled = False
-        self.settings.cd2_enabled = False
+        # 统一媒体流水线：默认未启用
+        self.settings.pipeline_enabled = False
 
 
 def _run_status(env_cookie="", cookie_file="", provider_cookie=""):
@@ -650,41 +646,29 @@ def test_cmd_status_cookie_file_backfilled_not_direct():
 
 
 # ---------------------------------------------------------------------- #
-# /status：分区块 + 本地媒体流水线明细（队列深度 / 传输中 / 最近一轮）
+# /status：分区块 + 媒体流水线明细（阶段状态 / 传输中 / 最近一轮）
 # ---------------------------------------------------------------------- #
-class _Cd2TaskInfo:
-    name = "x.mkv"
-    size = 2 * 1024**3
-    uploaded_bytes = 1024**3
-    submitted_at = time.time() - 600
+class _FakePipeline:
+    def overview_lines(self) -> list[str]:
+        return [
+            "① A→B 重命名：实际 · A 待处理 2 · 低置信退避 0",
+            "② B→卡片：实际 · 待推 0 · 账本 3 条",
+            "③ B→115：实际 · 已完成 31 · 退避 0",
+            "   A=/media/A → B=/media/B",
+            "   CD2：/media/media/B → /115open/临时目录",
+            "   🔄 传输中：x.mkv 50%（10 分钟）",
+            "   最近一轮：A 扫描 5：重命名 1 · 上传完成 1",
+        ]
 
 
-class _FakeCd2Uploader:
-    def __init__(self) -> None:
-        self._tasks = {"/media/media/C/x.mkv": _Cd2TaskInfo()}
-        self._completed = {f"/media/media/C/f{i}.mkv" for i in range(31)}
-        self._retry_state = {}
-        self._last_report = "扫描 5 个文件：✅ 上传完成 1"
-
-
-class _FakeLocalMedia:
-    _retry_state: ClassVar[dict] = {}
-    _last_report = "扫描 3 个视频：稳定 3 → ✅ 移动 3"
-
-
-def test_cmd_status_sections_and_cd2_inflight_detail():
+def test_cmd_status_sections_and_pipeline_detail():
     """/status 按 运行概览/健康/频道/常驻任务/流水线 分区块；
-    CD2 启用时显示传输中进度、已完成数与最近一轮。"""
+    流水线启用时显示三阶段状态、路径与最近一轮。"""
     pan = _StatusPan115("UID=1;")
     container = _StatusContainer(pan)
     s = container.settings
-    s.cd2_enabled = True
-    s.cd2_upload_dry_run = False
-    s.cd2_upload_interval_seconds = 60.0
-    s.cd2_upload_src = "/media/media/C"
-    s.cd2_upload_dst = "/115open/临时目录"
-    s.cd2_report_admin = True
-    container.cd2_uploader = _FakeCd2Uploader()
+    s.pipeline_enabled = True
+    container.pipeline = _FakePipeline()
 
     ctx = _make_context(container)
     msg = _make_message("/status")
@@ -697,46 +681,20 @@ def test_cmd_status_sections_and_cd2_inflight_detail():
     assert "🩺 健康与配置" in text
     assert "📡 频道" in text
     assert "⚙️ 常驻任务" in text
-    assert "🎬 本地媒体流水线" in text
-    # 未启用的阶段单独标注
-    assert "① A→B 重命名：⬜ 未启用" in text
-    assert "② B→C 哈希：⬜ 未启用" in text
-    assert "③ C→频道推送：⬜ 未启用" in text
-    # CD2 阶段：状态 + 路径 + 传输中 + 已完成 + 最近一轮
-    assert "④ C→115 上传（CD2）：✅ 每 60s · 实际上传 · Admin 汇总开" in text
-    assert "/media/media/C → /115open/临时目录" in text
+    assert "🎬 媒体流水线" in text
+    # 三阶段 + 路径 + 传输中 + 最近一轮
+    assert "① A→B 重命名：实际" in text
+    assert "② B→卡片：实际" in text
+    assert "③ B→115：实际 · 已完成 31" in text
+    assert "A=/media/A → B=/media/B" in text
     assert "传输中：x.mkv 50%" in text
-    assert "已完成 31 · 退避中 0" in text
-    assert "最近一轮：扫描 5 个文件：✅ 上传完成 1" in text
-
-
-def test_cmd_status_local_media_queue_and_last_round():
-    """A→B 启用：队列深度（目录不可访问显示 ?）+ 最近一轮汇总。"""
-    pan = _StatusPan115("UID=1;")
-    container = _StatusContainer(pan)
-    s = container.settings
-    s.local_media_enabled = True
-    s.local_media_dry_run = False
-    s.local_media_interval_seconds = 10.0
-    s.local_media_input_dir = "/nonexistent/A"
-    s.local_media_output_dir = "/media/B"
-    container.local_media = _FakeLocalMedia()
-
-    ctx = _make_context(container)
-    msg = _make_message("/status")
-    update = _make_update(message=msg)
-    asyncio.run(cmd_status(update, ctx))
-
-    text = msg.reply_text.await_args.args[0]
-    assert "① A→B 重命名：✅ 每 10s · 实际移动 · A 待处理 ? · 低置信退避 0" in text
-    assert "A=/nonexistent/A → B=/media/B" in text
-    assert "最近一轮：扫描 3 个视频" in text
+    assert "最近一轮：A 扫描 5" in text
 
 
 def test_cmd_status_all_disabled_shows_hint():
-    """四个流水线开关全关：显示统一未启用提示。"""
+    """流水线开关关闭：显示统一未启用提示。"""
     text = _run_status()
-    assert "🎬 本地媒体流水线" in text
+    assert "🎬 媒体流水线" in text
     assert "未启用" in text
 
 
@@ -769,36 +727,28 @@ def test_processing_dedup_blocks_duplicate_concurrent():
     msg = _make_message("https://115.com/s/abc12345")
     update = _make_update(message=msg)
 
-    from app.telegram.handlers import _mark_processing, _processing
-
     # 第一次正常处理（结束后标记已被 finally 清除）
     asyncio.run(on_text(update, ctx))
     assert len(proc.process_calls) == 1
 
     # 模拟"处理中"（另一并发任务尚未完成）→ 跳过并提示
-    _mark_processing(ParsedShare("115", "abc12345"))
+    coordinator.mark_processing(ParsedShare("115", "abc12345"))
     try:
         asyncio.run(on_text(update, ctx))
         assert len(proc.process_calls) == 1  # 未重复处理
         texts = [c.args[0] for c in msg.reply_text.call_args_list]
         assert any("正在处理中" in t for t in texts)
     finally:
-        _processing.clear()
+        coordinator._processing.clear()
 
 
 def test_processing_ttl_expires():
     """超过 60s 的陈旧标记视为不在处理中（顺手清理）。"""
     import time as _t
 
-    from app.telegram.handlers import (
-        _PROCESSING_TTL,
-        _is_processing,
-        _processing,
-    )
-
-    _processing["115:xyz"] = _t.monotonic() - _PROCESSING_TTL - 1  # 已过期
     try:
-        assert _is_processing(ParsedShare("115", "xyz")) is False
-        assert "115:xyz" not in _processing  # 已被清理
+        coordinator._processing["115:xyz"] = _t.monotonic() - coordinator._PROCESSING_TTL - 1  # 已过期
+        assert coordinator.is_processing(ParsedShare("115", "xyz")) is False
+        assert "115:xyz" not in coordinator._processing  # 已被清理
     finally:
-        _processing.clear()
+        coordinator._processing.clear()

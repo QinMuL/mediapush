@@ -23,19 +23,94 @@ _HEARTBEAT_INTERVAL = 30  # 秒
 # 进程退出后 Docker restart 策略自动重启，无需人工干预。
 _PROBE_EVERY = 3  # 每 3 个心跳周期（90s）探活一次
 _PROBE_MAX_FAIL = 3  # 连续 3 次失败（~4.5min）→ os._exit(1)
+# 探活请求硬超时（秒）：请求挂起（连接池/代理半死）等价于失败，也要计数
+_PROBE_TIMEOUT = 30
+# 入站看门狗：网络正常但 Telegram 侧更新持续未被取走（pending_update_count>0，
+# 长轮询卡死在半死连接上的典型症状——"能发不能收"）→ 连续 N 轮 → 重启 Updater
+_WATCHDOG_STRIKES = 3  # 连续 3 轮可疑（90s/轮 ≈ 4.5 分钟）→ 触发恢复
+_RECOVER_TIMEOUT = 60  # 恢复流程硬超时（秒）：超时 → 退出交 Docker 重启
+
+
+async def _inbound_watchdog_tick(app, strikes: int) -> int:
+    """入站看门狗单轮检查：返回新的连续可疑计数（模块级，便于单测）。
+
+    原理：长轮询健康时 Telegram 侧 pending_update_count 恒为 0（更新毫秒级
+    被取走）；若 get_me 已通过（出站网络正常）而 pending 持续 > 0，说明
+    get_updates 长轮询卡死——半死代理连接上"能发不能收"的典型症状，
+    此时旧探活全部失效（polling 任务未死、get_me 正常），唯有本探针可见。
+
+    恢复动作：重启 Updater 长轮询会话（应用与其余服务不动，频道监控/
+    流水线/巡检不受影响）；恢复失败/超时 → os._exit 交 Docker 整体重启。
+    """
+    updater = getattr(app, "updater", None)
+    if updater is None:
+        return 0
+    pending: int | None = None
+    if updater.running:
+        try:
+            info = await asyncio.wait_for(
+                app.bot.get_webhook_info(), timeout=_PROBE_TIMEOUT
+            )
+            pending = info.pending_update_count
+        except Exception as exc:  # noqa: BLE001 - 探针失败：网络抖动，保持现状下轮再看
+            logger.debug("入站探针失败（下轮再看）：%s", exc)
+            return strikes
+        if pending <= 0:
+            if strikes:
+                logger.info("入站看门狗：更新堆积已清零（此前连续 %d 轮可疑）", strikes)
+            return 0
+    # 可疑：updater 未运行，或网络正常但更新未被取走
+    strikes += 1
+    logger.warning(
+        "入站看门狗（第 %d/%d 轮）：updater.running=%s · Telegram 侧堆积 %s 条"
+        "未取更新——网络正常但收件停滞（正常时 pending 恒为 0）",
+        strikes, _WATCHDOG_STRIKES, updater.running, pending,
+    )
+    if strikes >= _WATCHDOG_STRIKES:
+        logger.error("连续 %d 轮入站停滞，触发恢复（重启 Updater 长轮询）", strikes)
+        try:
+            await asyncio.wait_for(_recover_updater(app), timeout=_RECOVER_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001 - 恢复失败是终态：退出交 Docker
+            logger.error("入站恢复失败：%s —— 强制退出交 Docker 重启", exc)
+            os._exit(1)
+        return 0
+    return strikes
+
+
+async def _recover_updater(app) -> None:
+    """恢复入站：重启 Updater 长轮询会话（应用与其余服务不动）。
+
+    start_polling 失败向上抛（由调用方决定退出）；同实例重启保留
+    _last_update_id，未取走的更新会重新投递，不会丢消息。
+    """
+    task = getattr(app.updater, "_Updater__polling_task", None)
+    if task is not None and not task.done():
+        logger.error("polling 任务状态：仍在等待中（卡在单次 get_updates 上）")
+    try:
+        await app.updater.stop()
+    except Exception as exc:  # noqa: BLE001 - stop 失败也要尝试重启
+        logger.error("Updater.stop() 失败（继续尝试重启）：%s", exc)
+    await app.updater.start_polling(timeout=10)
+    logger.warning(
+        "Updater 长轮询已重启，入站恢复（updater.running=%s）", app.updater.running
+    )
 
 
 async def _heartbeat_loop(app) -> None:
-    """心跳 + 自愈探活（模块级，便于单测）。
+    """心跳 + 自愈探活 + 入站看门狗（模块级，便于单测）。
 
     每 30s 写心跳文件（Docker HEALTHCHECK 用）；
-    每 90s 双重探活，异常时 os._exit 触发 Docker 自动重启：
+    每 90s 三重自愈，异常时 os._exit 触发 Docker 自动重启：
     1) polling 任务活性：PTB 的 network_retry_loop 因意外异常退出时
        updater.running 标志仍为 True（进程"健康"但永远收不到消息），
        检查内部 polling task 是否 done 能捕获此场景；
-    2) 网络连通：get_me 探测 bot client（代理/httpx 连接池卡死）。
+    2) 网络连通：get_me 探测 bot client（代理/httpx 连接池卡死）；
+       请求硬超时 _PROBE_TIMEOUT——挂起等价于失败；
+    3) 入站看门狗：网络正常但 Telegram 侧更新持续堆积（长轮询卡死，
+       "能发不能收"）→ 重启 Updater；恢复失败 → 退出交 Docker 重启。
     """
     fail_count = 0
+    inbound_strikes = 0
     tick = 0
     while True:
         # 心跳文件
@@ -57,16 +132,25 @@ async def _heartbeat_loop(app) -> None:
                     exc = "cancelled"
                 logger.error("polling 任务已静默死亡（%s），强制退出以触发 Docker 重启", exc)
                 os._exit(1)
-            # 2) 网络连通性
+            # 2) 网络连通性（硬超时：挂起 = 失败）
             try:
-                await app.bot.get_me()
+                await asyncio.wait_for(app.bot.get_me(), timeout=_PROBE_TIMEOUT)
                 fail_count = 0
+            except TimeoutError:
+                fail_count += 1
+                logger.warning(
+                    "自愈探活超时（请求挂起，疑似连接池/代理卡死）（第 %d/%d 次）",
+                    fail_count, _PROBE_MAX_FAIL,
+                )
             except Exception as exc:  # noqa: BLE001
                 fail_count += 1
                 logger.warning("自愈探活失败（第 %d/%d 次）：%s", fail_count, _PROBE_MAX_FAIL, exc)
-                if fail_count >= _PROBE_MAX_FAIL:
-                    logger.error("连续 %d 次探活失败，强制退出以触发 Docker 重启", fail_count)
-                    os._exit(1)
+            if fail_count >= _PROBE_MAX_FAIL:
+                logger.error("连续 %d 次探活失败，强制退出以触发 Docker 重启", fail_count)
+                os._exit(1)
+            # 3) 入站看门狗（仅网络正常时检查——探活失败轮跳过，避免误判）
+            if fail_count == 0:
+                inbound_strikes = await _inbound_watchdog_tick(app, inbound_strikes)
         await asyncio.sleep(_HEARTBEAT_INTERVAL)
 
 
@@ -113,18 +197,9 @@ class TelegramService:
                 await self.container.inspector.stop()
             if self.container.share_watcher is not None:
                 await self.container.share_watcher.stop()
-            # 本地媒体流水线：停止后台循环
-            if self.container.local_media is not None:
-                await self.container.local_media.stop()
-            # ed2k B→C 哈希流水线：停止后台循环
-            if self.container.ed2k_service is not None:
-                await self.container.ed2k_service.stop()
-            # ed2k 推送（JSONL→频道）：停止后台循环
-            if self.container.ed2k_pusher is not None:
-                await self.container.ed2k_pusher.stop()
-            # CD2 上传（目录C→115）：停止后台循环
-            if self.container.cd2_uploader is not None:
-                await self.container.cd2_uploader.stop()
+            # 统一媒体流水线：停止后台循环（含 gRPC 通道清理）
+            if self.container.pipeline is not None:
+                await self.container.pipeline.stop()
             if self.container.monitor is not None:
                 await self.container.monitor.stop()
             if self.container.monitor_store is not None:
@@ -163,25 +238,10 @@ class TelegramService:
                 app.bot_data["_share_watcher_task"] = asyncio.create_task(
                     self.container.share_watcher.start()
                 )
-            # 本地媒体流水线（目录A → 重命名 → 目录B）：后台循环（独立任务）
-            if self.container.local_media is not None:
-                app.bot_data["_local_media_task"] = asyncio.create_task(
-                    self.container.local_media.start()
-                )
-            # ed2k 流水线（目录B → 哈希 → 目录C）：后台循环（独立任务）
-            if self.container.ed2k_service is not None:
-                app.bot_data["_ed2k_hash_task"] = asyncio.create_task(
-                    self.container.ed2k_service.start()
-                )
-            # ed2k 推送（JSONL → 频道卡片）：后台循环（独立任务）
-            if self.container.ed2k_pusher is not None:
-                app.bot_data["_ed2k_push_task"] = asyncio.create_task(
-                    self.container.ed2k_pusher.start()
-                )
-            # CD2 上传（目录C → 115）：后台循环（独立任务）
-            if self.container.cd2_uploader is not None:
-                app.bot_data["_cd2_upload_task"] = asyncio.create_task(
-                    self.container.cd2_uploader.start()
+            # 统一媒体流水线（A → B → 哈希/推卡片 → 115）：后台循环（独立任务）
+            if self.container.pipeline is not None:
+                app.bot_data["_pipeline_task"] = asyncio.create_task(
+                    self.container.pipeline.start()
                 )
 
         builder = (

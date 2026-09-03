@@ -1,0 +1,41 @@
+# 工程化配置：仅 tool 配置段（依赖以 requirements.txt 为唯一权威源）
+# - ruff: lint 规则与生成码豁免
+# - pytest: 测试发现与 asyncio 模式（与现状一致：显式 @pytest.mark.asyncio）
+# - mypy: 渐进引入占位（暂不进 CI 门禁，先供本地 `mypy app/core app/db` 使用）
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+extend-exclude = [
+    "app/cd2/clouddrive_pb2.py",       # protobuf 生成码（139KB）
+    "app/cd2/clouddrive_pb2_grpc.py",  # gRPC 生成码（400KB）
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort（import 排序）
+    "B",   # bugbear（常见 bug 模式）
+    "UP",  # pyupgrade（现代语法）
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"  # 现状即显式标记，显式声明防默认值漂移
+
+[tool.mypy]
+python_version = "3.12"
+# 渐进策略：先覆盖核心稳定层，后续逐步收紧
+files = ["app/core", "app/db"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+check_untyped_defs = true
+
+# 生成码不检查
+[[tool.mypy.overrides]]
+module = "app.cd2.*"
+ignore_errors = true

@@ -1,4 +1,4 @@
-"""频道监控模块测试：store 持久化 / watcher 纯函数 / service 配置选择。"""
+﻿"""频道监控模块测试：store 持久化 / watcher 纯函数 / service 配置选择。"""
 
 import asyncio
 import time
@@ -246,7 +246,7 @@ class _Settings:
 
 
 def test_parse_proxy_variants():
-    from app.monitor.service import parse_proxy
+    from app.monitor.channel_monitor import parse_proxy
 
     assert parse_proxy("") is None
     assert parse_proxy("socks5://127.0.0.1:7890") == {
@@ -267,7 +267,7 @@ def test_parse_proxy_variants():
 
 
 def test_target_and_batch_selection(tmp_path):
-    from app.monitor.service import MonitorService
+    from app.monitor.channel_monitor import MonitorService
 
     class _Container:
         pusher = None
@@ -306,7 +306,7 @@ def test_target_and_batch_selection(tmp_path):
 
 
 def test_normalize_ref_variants():
-    from app.monitor.service import MonitorService
+    from app.monitor.channel_monitor import MonitorService
 
     n = MonitorService._normalize_ref
     assert n("@movie_ch") == "movie_ch"
@@ -376,7 +376,7 @@ class _FakeLoginClient:
 
 def _login_svc(tmp_path, monkeypatch, client_kwargs=None, settings=None):
     """构造登录测试用 MonitorService：_make_client 每次产生新 FakeClient（真实语义）。"""
-    from app.monitor.service import MonitorService
+    from app.monitor.channel_monitor import MonitorService
 
     store = MonitorStore(str(tmp_path / "m.db"))
 
@@ -398,7 +398,7 @@ def _login_svc(tmp_path, monkeypatch, client_kwargs=None, settings=None):
 
 def test_login_flow_with_password(tmp_path, monkeypatch):
     """完整登录流：/mon login → 手机号（自动补 +86）→ 验证码 → 两步密码 → 监控启动。"""
-    from app.monitor.service import STATE_RUNNING
+    from app.monitor.channel_monitor import STATE_RUNNING
 
     svc, store, fakes = _login_svc(tmp_path, monkeypatch, {"need_password": True})
 
@@ -439,7 +439,7 @@ def test_login_flow_with_password(tmp_path, monkeypatch):
 
 def test_login_flow_direct_code_ok(tmp_path, monkeypatch):
     """/mon login 带手机号直接发码；验证码即完成（无两步验证）。"""
-    from app.monitor.service import STATE_RUNNING
+    from app.monitor.channel_monitor import STATE_RUNNING
 
     svc, store, _ = _login_svc(tmp_path, monkeypatch)
 
@@ -525,7 +525,7 @@ def test_login_cancel_and_single_instance(tmp_path, monkeypatch):
 
 def test_login_rejected_when_running_or_no_api(tmp_path, monkeypatch):
     """监控运行中拒绝重复登录；缺 API 配置直接拒绝。"""
-    from app.monitor.service import STATE_NO_API
+    from app.monitor.channel_monitor import STATE_NO_API
 
     class _NoApiSettings(_Settings):
         def __init__(self):
@@ -639,7 +639,7 @@ class _FakeEvent:
 
 def _make_svc(tmp_path, fail: bool = False):
     """构造真实 store + stub container 的 MonitorService（不触网）。"""
-    from app.monitor.service import MonitorService
+    from app.monitor.channel_monitor import MonitorService
 
     store = MonitorStore(str(tmp_path / "m.db"))
     container = _FakeContainer(fail)
@@ -692,7 +692,7 @@ def test_on_new_message_excludes_filtered_links(tmp_path):
 
 def test_batch_window_merges_links(tmp_path, monkeypatch):
     """batch>0：窗口内同频道多条消息的链接合并为一条推送。"""
-    import app.monitor.service as svc_mod
+    import app.monitor.channel_monitor as svc_mod
 
     monkeypatch.setattr(svc_mod, "_PUSH_INTERVAL", 0)  # 免去推送限速等待
     svc, store, container = _make_svc(tmp_path)
@@ -721,7 +721,7 @@ def test_batch_window_merges_links(tmp_path, monkeypatch):
 
 def test_flush_failure_rolls_back_seen(tmp_path, monkeypatch):
     """推送失败：不落去重 + 回滚进程内占位（下次出现重试）。"""
-    import app.monitor.service as svc_mod
+    import app.monitor.channel_monitor as svc_mod
 
     async def _fast_sleep(_secs):
         pass
@@ -731,7 +731,7 @@ def test_flush_failure_rolls_back_seen(tmp_path, monkeypatch):
     h = link_hash(_LINK_OK)
 
     async def run():
-        from app.monitor.service import _Pending
+        from app.monitor.channel_monitor import _Pending
 
         item = parse_link(_LINK_OK)
         svc._pending[-100123] = _Pending(
@@ -759,7 +759,7 @@ def _pr(ok: bool, message: str = "", dup: bool = False):
 
 def _make_card_svc(tmp_path, results, fail: bool = False):
     """构造带 FakeProcessor 的监控服务（卡片模式）。"""
-    from app.monitor.service import MonitorService, _Pending
+    from app.monitor.channel_monitor import MonitorService, _Pending
 
     store = MonitorStore(str(tmp_path / "m.db"))
     container = _FakeContainer(fail)
@@ -777,7 +777,7 @@ def _make_card_svc(tmp_path, results, fail: bool = False):
 
 def test_flush_card_mode_uses_processor_pipeline(tmp_path, monkeypatch):
     """有 processor：逐链接走 process（与手动推送同一管线），不再发合并文本。"""
-    import app.monitor.service as svc_mod
+    import app.monitor.channel_monitor as svc_mod
 
     monkeypatch.setattr(svc_mod, "_PUSH_INTERVAL", 0)
     svc, store, container, processor = _make_card_svc(
@@ -836,7 +836,7 @@ def test_flush_card_mode_tmdb_miss_falls_back_to_text(tmp_path):
 
 def test_flush_card_mode_partial_failure_rolls_back(tmp_path, monkeypatch):
     """部分失败：成功的标记 seen，失败的回滚占位（可重试）。"""
-    import app.monitor.service as svc_mod
+    import app.monitor.channel_monitor as svc_mod
 
     async def _fast_sleep(_secs):
         pass

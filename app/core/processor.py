@@ -46,12 +46,13 @@ class PrepareResult:
 
 
 class ShareProcessor:
-    def __init__(self, pan115, ed2k, tmdb, cache, container) -> None:
+    def __init__(self, pan115, ed2k, tmdb, cache, pusher_provider) -> None:
         self.pan115 = pan115
         self.ed2k = ed2k
         self.tmdb = tmdb
         self.cache = cache
-        self.container = container  # 懒取 pusher（bot 启动后才就绪）
+        # pusher 懒取（bot 启动后才就绪）：() -> pusher | None
+        self.pusher_provider = pusher_provider
 
     def _select_provider(self, provider: str):
         """按 provider 名选网盘读取器。"""
@@ -154,7 +155,7 @@ class ShareProcessor:
             )
 
         # 6. 推送
-        pusher = self.container.pusher
+        pusher = self.pusher_provider()
         if pusher is None:
             return ProcessResult(
                 False, "推送器未就绪", file_count=pr.file_count, title=pr.media.title

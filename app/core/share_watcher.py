@@ -1,4 +1,4 @@
-"""网盘目录监控 → 自动创建永久分享 → 推送卡片。
+﻿"""网盘目录监控 → 自动创建永久分享 → 推送卡片。
 
 链路（用户决策：无转存环节，文件本就在自己网盘）：
 1. 遍历 /dir add 登记的监控目录（cache.share_dirs）
@@ -28,9 +28,9 @@ import time
 from dataclasses import dataclass, field
 
 from app.core.link_parser import ParsedShare
+from app.core.service_base import PollingService, retry_backoff_seconds
 from app.core.share_normalizer import ShareNormalizer
 from app.logging_config import make_trace_id, trace_id
-from app.media.service import retry_backoff_seconds
 from app.providers.exceptions import Pan115Error
 
 logger = logging.getLogger(__name__)
@@ -79,22 +79,34 @@ class WatchReport:
             s += f" · ⏭️ 已分享 {self.skipped}"
         return s
 
-    @property
     def has_events(self) -> bool:
         """本轮是否有值得通知的事件（静默轮不打扰）。"""
         return bool(self.items or self.failed_items or self.audit_items)
 
 
-class ShareWatcher:
-    """目录监控服务：run_once 单轮；start/stop 后台循环。"""
+class ShareWatcher(PollingService):
+    """目录监控服务：run_once 单轮；循环骨架见 PollingService。"""
+
+    name = "share_watch"
+    log_prefix = "目录监控"
+    interval_scale = 60.0      # interval 单位为分钟
+    startup_delay = 60.0       # 启动先歇 1 分钟（等 bot/巡检/监控就绪，避开启动高峰）
 
     def __init__(self, container, settings) -> None:
         self.container = container
         self.settings = settings
         self.interval = max(1.0, settings.share_watch_interval_minutes)
-        self._task: asyncio.Task | None = None
         self._archive_cid: int | None = None  # 归档目录 CID（进程内缓存）
         self._normalizer = ShareNormalizer(container, settings)
+
+    async def before_round(self) -> None:
+        # 每轮重读 cookie 文件：目录监控建分享需登录态，换 cookie 无需重启
+        self.container.refresh_cookie_file()
+
+    async def after_round(self, report) -> None:
+        # 静默轮（无成功/失败/审核事件）不打扰；详情推送成功与失败都通知
+        if report.has_events() and getattr(self.settings, "share_watch_notify", True):
+            await self.notify_admin(report)
 
     # ------------------------------------------------------------------ #
     async def run_once(self) -> WatchReport:
@@ -312,59 +324,48 @@ class ShareWatcher:
         return self._archive_cid
 
     # ------------------------------------------------------------------ #
-    async def start(self) -> None:
-        """后台循环（bot post_init 挂载）。"""
-        if self._task is not None and not self._task.done():
-            return
-        self._task = asyncio.create_task(self._loop())
-        logger.info("目录监控已启动（间隔 %.0f 分钟）", self.interval)
-
-    async def stop(self) -> None:
-        if self._task is not None and not self._task.done():
-            self._task.cancel()
-        self._task = None
-
-    # ------------------------------------------------------------------ #
     async def notify_admin(self, report: WatchReport) -> None:
-        """任务详情通知 admin：推送成功 + 失败明细（巡检器 notify_admin 同模式）。"""
+        """任务详情通知 admin：按 推送成功/审核中/失败 分组（层级分明）。
+
+        组间空行 + 组标题带计数；条目「名字 — 监控目录」缩进两格对齐，
+        失败原因跟在条目后（超长截断）。
+        """
         from app.telegram.notifier import format_round_report, notify_admins
 
         telegram = getattr(self.container, "telegram", None)
         admins = getattr(self.settings, "tg_admin_ids", []) or []
         if telegram is None or not admins:
             return
+
+        def _group(icon: str, label: str, items: list[dict],
+                   limit: int, render) -> list[str]:
+            if not items:
+                return []
+            lines = [f"{icon} {label}（{len(items)}）"]
+            lines.extend(f"  • {render(it)}" for it in items[:limit])
+            if len(items) > limit:
+                lines.append(f"  … 共 {len(items)} 个")
+            return lines
+
+        groups: list[list[str]] = [
+            _group("✅", "推送成功", report.items, 20,
+                   lambda it: f"{it['name']} — {it['dir']}"),
+            _group("⏳", "115 审核中（下轮复用码重试）", report.audit_items, 10,
+                   lambda it: f"{it['name']} — {it['dir']}"),
+            _group("⚠️", "失败", report.failed_items, 10,
+                   lambda it: f"{it['name']} — {it['dir']}：{it['reason'][:120]}"),
+        ]
         details: list[str] = []
-        for it in report.items[:20]:
-            details.append(f"✅ {it['name']}（{it['dir']}）")
-        if len(report.items) > 20:
-            details.append(f"… 共 {len(report.items)} 个")
-        for it in report.audit_items[:10]:
-            details.append(f"⏳ {it['name']}（{it['dir']}）审核中")
-        for it in report.failed_items[:10]:
-            reason = it["reason"]
-            if len(reason) > 120:
-                reason = reason[:120] + "…"
-            details.append(f"⚠️ {it['name']}（{it['dir']}）：{reason}")
-        if len(report.failed_items) > 10:
-            details.append(f"… 共 {len(report.failed_items)} 个失败")
+        for g in groups:
+            if g:
+                if details:
+                    details.append("")  # 组间空行
+                details.extend(g)
         text = format_round_report("📂", "目录监控扫描", report.summary(), details)
         await notify_admins(telegram.bot, admins, text)
 
-    async def _loop(self) -> None:
-        # 启动先歇 1 分钟（等 bot/巡检/监控全部就绪，避开启动高峰）
-        await asyncio.sleep(60)
-        while True:
-            try:
-                # 每轮重读 cookie 文件：目录监控建分享需登录态，换 cookie 无需重启
-                self.container.refresh_cookie_file()
-                report = await self.run_once()
-                # 静默轮（无成功/失败/审核事件）不打扰；详情推送成功与失败都通知
-                if report.has_events and getattr(
-                    self.settings, "share_watch_notify", True
-                ):
-                    await self.notify_admin(report)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("目录监控轮失败（下轮重试）")
-            await asyncio.sleep(self.interval * 60)
+    # ------------------------------------------------------------------ #
+    # 生命周期钩子（循环骨架见 PollingService）
+    # ------------------------------------------------------------------ #
+    def _on_start(self) -> None:
+        self.log.info("目录监控已启动（间隔 %.0f 分钟）", self.interval)

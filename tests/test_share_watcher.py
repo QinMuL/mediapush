@@ -581,7 +581,7 @@ class _NotifySettings(_FakeSettings):
 
 
 def test_notify_admin_success_and_failure_details():
-    """成功/审核/失败明细都进入通知文本，每个 admin 各发一条。"""
+    """成功/审核/失败按组呈现：组标题带计数 + 缩进条目 + 组间空行。"""
     from app.core.share_watcher import WatchReport
 
     r = WatchReport(dirs=1, new_items=2, shared=1, failed=1, auditing=1)
@@ -599,9 +599,16 @@ def test_notify_admin_success_and_failure_details():
     assert len(telegram.bot.sent) == 2  # 两个 admin 各一条
     text = telegram.bot.sent[0][1]
     assert text.startswith("📂 目录监控扫描 · ")  # 统一汇总模板头
-    assert "✅ 剧A（/待分享）" in text
-    assert "⏳ 剧B（/待分享）审核中" in text
-    assert "⚠️ 剧C（/待分享）：推送失败：超时" in text
+    # 分组标题（带计数）
+    assert "✅ 推送成功（1）" in text
+    assert "⏳ 115 审核中（下轮复用码重试）（1）" in text
+    assert "⚠️ 失败（1）" in text
+    # 缩进条目（名字 — 目录）
+    assert "  • 剧A — /待分享" in text
+    assert "  • 剧B — /待分享" in text
+    assert "  • 剧C — /待分享：推送失败：超时" in text
+    # 组间空行（层级分隔）
+    assert "✅ 推送成功（1）\n  • 剧A — /待分享\n\n⏳" in text
 
 
 def test_notify_admin_skipped_when_no_admin_or_telegram():
@@ -656,7 +663,7 @@ def test_run_once_collects_failure_details(monkeypatch):
     assert report.failed_items == [
         {"dir": "/媒体", "name": "剧C", "reason": "创建分享失败：风控"}
     ]
-    assert report.has_events
+    assert report.has_events()
 
 
 def test_run_once_quiet_round_has_no_events(monkeypatch):
@@ -669,40 +676,27 @@ def test_run_once_quiet_round_has_no_events(monkeypatch):
 
     report = asyncio.run(watcher.run_once())
 
-    assert not report.has_events
+    assert not report.has_events()
 
 
-def test_loop_notifies_when_enabled(monkeypatch):
-    """循环轮：有事件 + 通知开启 → notify_admin 被调用；关闭 → 不调用。"""
+def test_after_round_notifies_when_enabled(monkeypatch):
+    """after_round：有事件 + 通知开启 → notify_admin 被调用；关闭 → 不调用。"""
     from app.core.share_watcher import WatchReport
 
     r = WatchReport(shared=1, items=[{"dir": "/d", "name": "x"}])
     calls: list = []
 
-    real_sleep = asyncio.sleep  # 补丁前留存真实 sleep（补丁会替换全局模块属性）
-
-    async def fast_sleep(sec):
-        await real_sleep(0.001)  # 极短真实等待，避免忙转
-
-    monkeypatch.setattr("app.core.share_watcher.asyncio.sleep", fast_sleep)
-
-    class _LoopWatcher(ShareWatcher):
-        async def run_once(self):
-            return r
-
+    class _AfterWatcher(ShareWatcher):
         async def notify_admin(self, report):
             calls.append(report)
 
-    async def run(notify: bool):
-        settings = _NotifySettings() if notify else _OffSettings()
-        w = _LoopWatcher(_FakeContainer(None, None, None), settings)
-        task = asyncio.create_task(w._loop())
-        await real_sleep(0.05)  # 真实观察窗：等 _loop 跑过启动 sleep + run_once
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-
     class _OffSettings(_NotifySettings):
         share_watch_notify = False
+
+    async def run(notify: bool):
+        settings = _NotifySettings() if notify else _OffSettings()
+        w = _AfterWatcher(_FakeContainer(None, None, None), settings)
+        await w.after_round(r)
 
     asyncio.run(run(True))
     assert calls  # 已通知

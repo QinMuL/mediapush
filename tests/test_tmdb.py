@@ -4,6 +4,8 @@
 标成智利 CL），但 origin_country 正确（CN）。_normalize 应优先 origin_country。
 """
 
+import asyncio
+
 from app.tmdb.client import TMDBHelper
 
 
@@ -48,9 +50,6 @@ def test_normalize_movie_origin_country_preferred():
 
 
 # -------------------- C：search_best 匹配优先级（年份/标题/类型） -------------------- #
-import asyncio
-
-
 class _StubTMDB(TMDBHelper):
     """stub：search 返回预置候选，绕过网络。"""
 

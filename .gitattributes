@@ -1,0 +1,3 @@
+# protobuf/gRPC 生成码：标记为生成文件（GitHub 语言统计排除、diff 降噪）
+app/cd2/clouddrive_pb2.py linguist-generated=true
+app/cd2/clouddrive_pb2_grpc.py linguist-generated=true

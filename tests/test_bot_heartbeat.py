@@ -1,9 +1,9 @@
-"""bot.py 心跳自愈探活测试（模块级 _heartbeat_loop）。"""
+"""bot.py 心跳自愈探活 + 入站看门狗测试（模块级函数）。"""
 
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
-from app.telegram.bot import _heartbeat_loop
+from app.telegram.bot import _heartbeat_loop, _inbound_watchdog_tick, _recover_updater
 
 
 def _make_app(*, polling_task=None, polling_running=False, get_me_exc=None):
@@ -11,6 +11,9 @@ def _make_app(*, polling_task=None, polling_running=False, get_me_exc=None):
     app = MagicMock()
     app.updater = MagicMock()
     app.updater.running = polling_running
+    # 看门狗恢复动作（旧测试默认可恢复成功，不误杀）
+    app.updater.stop = AsyncMock()
+    app.updater.start_polling = AsyncMock()
     if polling_task is None:
         # 未启动场景：属性不存在（探活应跳过，不误杀）
         del app.updater._Updater__polling_task
@@ -131,3 +134,95 @@ def test_healthy_app_no_exit(monkeypatch):
 
     asyncio.run(run())
     assert not exits
+
+
+# ---------------------------------------------------------------------- #
+# 入站看门狗（"能发不能收"卡死检测与恢复）
+# ---------------------------------------------------------------------- #
+class _WebhookInfo:
+    def __init__(self, pending: int) -> None:
+        self.pending_update_count = pending
+
+
+def _wd_app(*, running=True, pending=0, start_raises=None):
+    """看门狗专用 fake：running 状态 + pending 计数 + 可恢复/可失败的 updater。"""
+    app = MagicMock()
+    app.updater.running = running
+    app.updater.stop = AsyncMock()
+    app.updater.start_polling = AsyncMock(side_effect=start_raises)
+    app.bot.get_webhook_info = AsyncMock(return_value=_WebhookInfo(pending))
+    return app
+
+
+def test_watchdog_strikes_accumulate_then_recover():
+    """网络正常但 pending 持续堆积：3 轮可疑 → 重启 Updater 并复位计数。"""
+    app = _wd_app(running=True, pending=2)
+    s = asyncio.run(_inbound_watchdog_tick(app, 0))
+    assert s == 1
+    s = asyncio.run(_inbound_watchdog_tick(app, s))
+    assert s == 2
+    s = asyncio.run(_inbound_watchdog_tick(app, s))
+    assert s == 0  # 触发恢复并复位
+    app.updater.stop.assert_awaited_once()
+    app.updater.start_polling.assert_awaited_once()
+    assert app.updater.start_polling.await_args.kwargs.get("timeout") == 10
+
+
+def test_watchdog_pending_cleared_resets_strikes():
+    """堆积清零（下轮长轮询取走）：计数复位，不触发恢复。"""
+    app = _wd_app(running=True, pending=1)
+    s = asyncio.run(_inbound_watchdog_tick(app, 0))
+    assert s == 1
+    app.bot.get_webhook_info = AsyncMock(return_value=_WebhookInfo(0))
+    s = asyncio.run(_inbound_watchdog_tick(app, s))
+    assert s == 0
+    app.updater.stop.assert_not_awaited()
+
+
+def test_watchdog_probe_failure_keeps_strikes():
+    """探针失败（网络抖动）：计数保持不变（既不误清零也不误累积）。"""
+    app = _wd_app(running=True, pending=1)
+    s = asyncio.run(_inbound_watchdog_tick(app, 0))
+    assert s == 1
+    app.bot.get_webhook_info = AsyncMock(side_effect=RuntimeError("net"))
+    s = asyncio.run(_inbound_watchdog_tick(app, s))
+    assert s == 1
+
+
+def test_watchdog_updater_not_running_triggers_recover():
+    """updater.running=False（轮询已停但应用还活着）：同样可疑 → 恢复。"""
+    app = _wd_app(running=False)
+    asyncio.run(_inbound_watchdog_tick(app, 0))
+    asyncio.run(_inbound_watchdog_tick(app, 1))
+    s = asyncio.run(_inbound_watchdog_tick(app, 2))
+    assert s == 0
+    app.updater.start_polling.assert_awaited_once()
+
+
+def test_watchdog_recover_failure_exits(monkeypatch):
+    """恢复失败（start_polling 抛错）→ os._exit(1) 交 Docker 重启。"""
+    exits: list[int] = []
+    monkeypatch.setattr("app.telegram.bot.os._exit", lambda code: exits.append(code))
+    app = _wd_app(running=True, pending=5, start_raises=RuntimeError("boom"))
+    asyncio.run(_inbound_watchdog_tick(app, 0))
+    asyncio.run(_inbound_watchdog_tick(app, 1))
+    asyncio.run(_inbound_watchdog_tick(app, 2))
+    assert 1 in exits
+
+
+def test_recover_updater_stop_failure_still_restarts():
+    """stop() 失败也要尝试 start_polling（恢复优先于清理）。"""
+    app = _wd_app(running=True)
+    app.updater.stop = AsyncMock(side_effect=RuntimeError("stop boom"))
+    asyncio.run(_recover_updater(app))
+    app.updater.start_polling.assert_awaited_once()
+
+
+def test_watchdog_via_heartbeat_loop_end_to_end(monkeypatch):
+    """端到端：心跳循环内 pending 持续堆积 → 自动重启 Updater，不退出进程。"""
+    exits = _patch_fast(monkeypatch)
+    app = _make_app(polling_task=None, polling_running=True)
+    app.bot.get_webhook_info = AsyncMock(return_value=_WebhookInfo(3))
+    _run_for(app, 0.05)
+    assert app.updater.start_polling.await_count >= 1
+    assert not exits  # 恢复成功，无需进程级重启

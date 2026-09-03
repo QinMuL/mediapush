@@ -130,20 +130,27 @@ class _SanitizeFilter(logging.Filter):
         return True
 
 
+def _is_media_logger(name: str) -> bool:
+    """本地媒体流水线模块：pipeline.*（统一流水线）与 media.*/ed2k.*（历史路由兼容）。"""
+    return (
+        name == "app.pipeline" or name.startswith("app.pipeline.")
+        or name == "app.media" or name.startswith("app.media.")
+        or name == "app.ed2k" or name.startswith("app.ed2k.")
+    )
+
+
 class _MediaLogFilter(logging.Filter):
-    """只放行本地媒体流水线（app.media.*）日志 → media.log。"""
+    """只放行本地媒体流水线（app.media.* / app.ed2k.*）日志 → media.log。"""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        name = record.name or ""
-        return name == "app.media" or name.startswith("app.media.")
+        return _is_media_logger(record.name or "")
 
 
 class _ExcludeMediaFilter(logging.Filter):
     """排除本地媒体流水线日志 → 核心日志只记系统内容，双文件互不重复。"""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        name = record.name or ""
-        return not (name == "app.media" or name.startswith("app.media."))
+        return not _is_media_logger(record.name or "")
 
 
 def set_console_level(level: str) -> bool:
