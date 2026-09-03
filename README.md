@@ -41,23 +41,42 @@
 - **频道监控**（`/mon`）：用 Telegram 用户账号监控指定频道，自动捕获 ed2k 链接推送
 - **失效巡检**（`/inspect`）：定期检查已推送分享，失效自动**撤卡**（删除频道死链卡片）并告警
 
-### 链路 B：本地媒体处理全流水线
+### 链路 B：统一媒体流水线（方案二整合）
+
+**一个服务（`app/pipeline/service.py`）+ 两个目录跑完全链**，替代原四段服务与 A/B/C 三目录：
 
 ```
-目录A → 稳定检测 → TMDB高置信匹配 + ffprobe探测 → 统一命名模板重命名 → 移入B
-目录B → 稳定检测 → MD4分块哈希 → ed2k链接 → 写JSONL → 移入C
-目录C → 读JSONL → 转分享卡片 → 推TG频道
-目录C → CloudDrive2 gRPC跨云复制 → 115网盘 → 删源
+目录A（下载落地）→ 稳定检测 → TMDB高置信匹配 + ffprobe探测 → 重命名 → 移入B
+目录B（资源库）  → MD4分块哈希 → 记JSONL账本 → 转分享卡片 → 推TG频道
+                → CloudDrive2 gRPC跨云复制 → 115网盘 → 删源（视频+伴行）
 ```
 
-| 阶段 | 总开关 | 默认 | 说明 |
-|---|---|---|---|
-| ① A→B 重命名 | `LOCAL_MEDIA_ENABLED` | false | 监控目录A，TMDB 高置信匹配 + ffprobe 实时探测质量标签，统一命名模板 |
-| ② B→C 哈希 | `ED2K_ENABLED` | false | MD4 分块哈希（9.72MB 块），2.4GB 文件 ~5 秒，生成 ed2k 链接写 JSONL |
-| ③ C→频道推送 | `ED2K_PUSH_ENABLED` | false | JSONL 增量追读，卡片+TMDB 元数据推频道 |
-| ④ C→115 上传 | `CD2_ENABLED` | false | CloudDrive2 gRPC 跨云复制（串行+退避+完成删源） |
+| 项目 | 说明 |
+|---|---|
+| 总开关 | `PIPELINE_ENABLED`（替代原 4 个 `*_ENABLED`） |
+| 目录 | `PIPELINE_INPUT_DIR`（A）+ `PIPELINE_LIBRARY_DIR`（B，兼 CD2 上传源） |
+| 稳定判定 | 仅 A 侧一处（原 A/B/C 三处 → 全链等待 ~4 分钟 → ~30 秒） |
+| 上传 | 串行约束保留（一个 CopyFile 任务一时刻），重启自动从 CD2 恢复追踪 |
+| JSONL | `data/ed2k_results.jsonl` 保留为追加式审计账本（重启按存在性重建） |
 
-**模拟模式（DRY-RUN）安全保证**：每个阶段都有独立 `xxx_DRY_RUN` 开关（默认 true）。模拟结果只记在**内存**中，不写入任何持久化状态——从模拟切到实际模式后，所有资源会被正常处理，不会因模拟期间的标记而被跳过。
+**模拟模式（DRY-RUN）**：三个阶段开关各管一段（默认 true）。模拟去重只记**内存**，改 `.env` 后 `/reload` 切实际，所有条目（含模拟过的）立即正常处理，无需重启。
+
+**注意模拟的"深度"并不相同**——不是所有模拟都只出日志：
+
+| 开关 | 管哪段 | 模拟时真实发生 |
+|---|---|---|
+| `PIPELINE_RENAME_DRY_RUN` | ① A→B 重命名 | 调 TMDB API 匹配，只出"拟移动"日志 |
+| `PIPELINE_PUSH_DRY_RUN` | ② B→卡片 | **真哈希 + 真写 JSONL 账本**，不推频道 |
+| `PIPELINE_UPLOAD_DRY_RUN` | ③ B→115 | **真列 115 目录查重**，不提交上传任务 |
+| `SHARE_NORMALIZE_DRY_RUN` | 分享目录标准化（旁路功能） | 只出"拟重命名"日志 |
+
+#### 从旧四段链路迁移
+
+1. **合并目录**：原目录C 的待上传内容移入 B（流水线会自动对账哈希）；docker-compose 卷映射去掉 C
+2. **改 .env**：删除 `LOCAL_MEDIA_* / ED2K_* / ED2K_PUSH_* / CD2_ENABLED` 等旧键，换 `PIPELINE_*`（见上表与 .env.example）；`CD2_UPLOAD_SRC` 改为 B 的 CD2 路径
+3. **重启容器**：启动日志若检测到旧四段开关仍为 true 会提示迁移
+4. **灰度**：先三段全 dry 观察日志，再逐段切实际（每段 /reload 即时生效）
+5. 进行中的退避/上传状态属瞬态数据，迁移后从头开始（已推送去重在 cache.db 不受影响）
 
 ### 命令菜单总览（17 个）
 
@@ -254,23 +273,22 @@ Bot 回复卡片预览 + 按钮：`✏️ 追加画质`（输入自定义推荐�
 
 登录态保存 `data/monitor.session`（随数据卷持久化），切勿泄露。建议使用小号。
 
-### 本地媒体流水线（A→B→C→频道→115）
+### 媒体流水线（A→B 资源库→频道+115）
 
-1. **准备目录**：`.env` 填容器内路径，`docker-compose.yml` 做宿主机→容器映射：
+1. **准备目录**：`.env` 填容器内路径，`docker-compose.yml` 做宿主机→容器映射（B 须同时挂进 CloudDrive2）：
 
    ```yaml
    volumes:
      - ./data:/app/data
-     - /nas/media/A:/media/A    # 目录A：待处理
-     - /nas/media/B:/media/B    # 目录B：已重命名
-     - /nas/media/C:/media/C    # 目录C：已哈希归档
+     - /nas/media/A:/media/A    # 目录A：下载落地（手动投喂也放这里）
+     - /nas/media/B:/media/B    # 目录B：资源库（重命名+哈希+待上传，CD2 上传源）
    ```
 
-   `.env` 对应填 `LOCAL_MEDIA_INPUT_DIR=/media/A` 等。
+   `.env` 对应填 `PIPELINE_INPUT_DIR=/media/A`、`PIPELINE_LIBRARY_DIR=/media/B`、`CD2_UPLOAD_SRC=<B 在 CD2 里的路径>`。
 
-2. **先模拟观察**：四个阶段 `*_DRY_RUN` 默认 true，日志出"拟命名/将上传"结果
-3. **逐步放开**：确认命名质量后逐阶段改 `false`（A→B 重命名 → B→C 哈希 → C→频道 → C→115）
-4. **监控进度**：`/status` 看 4 阶段队列深度/退避/最近一轮，`/ed2k_status` `/upload_status` 看详情
+2. **先模拟观察**：三个阶段 `PIPELINE_*_DRY_RUN` 默认 true，日志出"拟命名/将推送/将上传"结果
+3. **逐步放开**：确认命名质量后逐阶段改 `false`（重命名 → 推卡片 → 上传；每步 `/reload` 即时生效）
+4. **监控进度**：`/status` 看三阶段队列/退避/传输中，`/ed2k_status` `/upload_status` 看两侧详情
 
 **命名规范**（高置信度硬门槛）：片名 (年份) - 画质标签 {tmdb-ID}.ext；必须同时匹配 TMDB 片名+年份（剧集额外 SxxExx）才放行；质量标签从 ffprobe 实时探测；文件名末尾 `{tmdb-<id>}` 保证 Emby/飞牛 100% 刮削；低置信进入指数退避（1h→2h→…→24h），TMDB 补全后自动命中。
 
@@ -357,56 +375,27 @@ Bot 回复卡片预览 + 按钮：`✏️ 追加画质`（输入自定义推荐�
 
 ### 本地媒体流水线（链路 B）
 
-#### ① A→B 重命名
+#### 统一媒体流水线（含 CD2 上传连接）
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `LOCAL_MEDIA_ENABLED` | `false` | 总开关 |
-| `LOCAL_MEDIA_INPUT_DIR` | 空 | 目录 A：待处理资源（递归监控含子目录） |
-| `LOCAL_MEDIA_OUTPUT_DIR` | 空 | 目录 B：规范化输出（须在 A 之外；电影平铺，剧集按"片名 (年份)/Sxx/"分夹） |
-| `LOCAL_MEDIA_DRY_RUN` | `true` | 模拟模式（只出日志不实际移动） |
-| `LOCAL_MEDIA_INTERVAL_SECONDS` | `10` | 扫描周期秒 |
-| `LOCAL_MEDIA_STABLE_ROUNDS` | `3` | 稳定判定轮数（连续 N 轮 size/mtime 无变化，约 30s） |
-| `LOCAL_MEDIA_BATCH_MOVE_MAX` | `5` | 单轮最多处理文件数（防打爆 IO/TMDB） |
-| `LOCAL_MEDIA_STUCK_DAYS` | `7` | 低置信卡死告警阈值天 |
-
-#### ② B→C ed2k 哈希
-
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `ED2K_ENABLED` | `false` | 总开关 |
-| `ED2K_INPUT_DIR` | 空 | 目录 B（通常 = `LOCAL_MEDIA_OUTPUT_DIR`） |
-| `ED2K_OUTPUT_DIR` | 空 | 目录 C：哈希后归档（须在 B 之外） |
-| `ED2K_DRY_RUN` | `true` | 模拟模式（只哈希+写 JSONL 不移动） |
-| `ED2K_INTERVAL_SECONDS` | `30` | 扫描周期秒（哈希重，30s 起步） |
-| `ED2K_STABLE_ROUNDS` | `3` | 稳定判定轮数（约 1.5 分钟，防哈希半截文件） |
-| `ED2K_STUCK_DAYS` | `7` | 哈希失败卡死告警阈值天 |
-
-#### ③ C→频道推送
-
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `ED2K_PUSH_ENABLED` | `false` | 总开关 |
-| `ED2K_PUSH_DRY_RUN` | `true` | 模拟模式（只日志不实际推送） |
-| `ED2K_PUSH_INTERVAL_SECONDS` | `60` | 推送扫描周期秒 |
-| `ED2K_PUSH_STUCK_DAYS` | `7` | 推送失败卡死告警阈值天 |
-| `ED2K_PUSH_REPORT_ADMIN` | `true` | 每轮汇总私信 admin |
-| `ED2K_PUSH_REPORT_CHANNEL` | `false` | 汇总同步到目标频道（开了会刷频道） |
-
-#### ④ C→115 CD2 上传
-
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `CD2_ENABLED` | `false` | 总开关 |
+| `PIPELINE_ENABLED` | `false` | 总开关（替代原 4 个 `*_ENABLED`） |
+| `PIPELINE_INPUT_DIR` | 空 | 目录 A：下载落地（递归监控 + 稳定判定；手动投喂也放这里） |
+| `PIPELINE_LIBRARY_DIR` | 空 | 目录 B：资源库（重命名+哈希+待上传；须挂在 CD2，勿手动投放） |
+| `PIPELINE_RENAME_DRY_RUN` | `true` | ① 模拟：只出"拟移动"日志（仍真调 TMDB） |
+| `PIPELINE_PUSH_DRY_RUN` | `true` | ② 模拟：真哈希+记 JSONL，不推频道 |
+| `PIPELINE_UPLOAD_DRY_RUN` | `true` | ③ 模拟：真查重 115 目标，不提交任务 |
+| `PIPELINE_INTERVAL_SECONDS` | `10` | 轮询周期秒（哈希/推送/上传同轮进行） |
+| `PIPELINE_STABLE_ROUNDS` | `3` | A 侧稳定判定轮数（全链唯一一处，约 30s） |
+| `PIPELINE_BATCH_MAX` | `5` | 单轮最多重命名文件数（防打爆 IO/TMDB） |
+| `PIPELINE_STUCK_DAYS` | `7` | 各阶段失败卡死告警阈值天 |
+| `PIPELINE_MIN_SIZE_MB` | `10` | 体积守门（MB）；设 0 关闭 |
+| `PIPELINE_REPORT_ADMIN` | `true` | 有动作轮次汇总+明细私信 admin（旧键 `CD2_REPORT_ADMIN` 兼容） |
 | `CD2_ADDRESS` | `192.168.1.202:19798` | CloudDrive2 gRPC 地址 |
 | `CD2_TOKEN` | 空 | CD2 API 令牌（推荐，Web UI → 设置 → API 令牌创建） |
 | `CD2_USERNAME` / `CD2_PASSWORD` | 空 | 或账号密码（token 优先） |
-| `CD2_UPLOAD_SRC` | 空 | 目录 C 在 CD2 里的路径（本地磁盘挂载后） |
+| `CD2_UPLOAD_SRC` | 空 | 目录 B 在 CD2 里的路径（本地磁盘挂载后） |
 | `CD2_UPLOAD_DST` | 空 | 115 在 CD2 里的目标目录 |
-| `CD2_UPLOAD_DRY_RUN` | `true` | 模拟模式（只查重+日志不提交任务） |
-| `CD2_UPLOAD_INTERVAL_SECONDS` | `60` | 扫描周期秒 |
-| `CD2_STUCK_DAYS` | `7` | 上传失败卡死告警阈值天 |
-| `CD2_REPORT_ADMIN` | `true` | 有动作的轮次汇总+明细私信 admin（可热加载） |
 
 ### 日志与存储
 
@@ -415,11 +404,11 @@ Bot 回复卡片预览 + 按钮：`✏️ 追加画质`（输入自定义推荐�
 | `LOG_LEVEL` | `INFO` | 控制台日志级别（文件恒为 DEBUG 全量；`/loglevel` 运行时可调） |
 | `LOG_COLOR` | `true` | 控制台彩色日志 |
 | `LOG_FILE` | `./data/logs/mediapush.log` | 核心日志文件（系统内容，排除媒体流水线） |
-| `LOG_MEDIA_FILE` | `./data/logs/media.log` | 媒体流水线日志文件（只记 `app.media.*`，与核心日志互不重复） |
+| `LOG_MEDIA_FILE` | `./data/logs/media.log` | 媒体流水线日志文件（只记 `app.pipeline.*`，与核心日志互不重复） |
 | `LOG_MAX_BYTES` | `5242880`（5MB） | 单日志文件轮转阈值（达到即刻轮转 + gzip 压缩） |
 | `LOG_RETENTION_DAYS` | `7` | 轮转归档保留天数（按文件 mtime 到期即删） |
 | `DB_PATH` | `./data/cache.db` | 业务数据库（TMDB 缓存 + 推送去重 + 分享登记） |
-| `STATE_DB_PATH` | `./data/state.db` | 流水线统一状态存储（local_media/ed2k/ed2k_push/cd2 一行一服务） |
+| `STATE_DB_PATH` | `./data/state.db` | 服务统一状态存储（pipeline/share_watch 等一行一服务） |
 
 **热加载说明**：改 `.env` 后发 `/reload` 即时生效的字段包括各类间隔、通知开关、DRY_RUN 开关、日志级别、cookie 文件等（见 `config.py` 的 `HOT_RELOAD_FIELDS`）；`TG_BOT_TOKEN`、`TG_CHAT_ID`、`PROXY_URL`、`TMDB_API_KEY`、目录路径等连接层变更需重启容器。
 
@@ -439,7 +428,7 @@ Bot 回复卡片预览 + 按钮：`✏️ 追加画质`（输入自定义推荐�
 | 文件 | 内容 |
 |------|------|
 | `mediapush.log` | 核心系统日志（Bot/TMDB/115/巡检/监控），**不含**媒体流水线 |
-| `media.log` | 本地媒体流水线（`app.media.*`：重命名/哈希/推送/上传），**只含**流水线 |
+| `media.log` | 统一媒体流水线（`app.pipeline.*`：重命名/哈希/推送/上传），**只含**流水线 |
 
 两文件互不重复，按 logger 名自动分流；控制台两份内容都输出。
 
@@ -501,7 +490,7 @@ docker inspect mediapush --format '{{.State.Health.Status}}'
 | 文件 | 类型 | 说明 |
 |---|---|---|
 | `cache.db` | 业务数据库 | TMDB 缓存（24h TTL）+ 推送去重（pushed_shares）+ 分享登记（shared_items）+ 监控目录配置（share_dirs） |
-| `state.db` | 状态数据库 | 流水线统一状态：一行一服务（local_media/ed2k/ed2k_push/cd2），含 completed/offset/退避 |
+| `state.db` | 状态数据库 | 服务统一状态：一行一服务（pipeline 为主），含 failures/completed/pushed |
 | `monitor.db` | 监控数据库 | 频道监控配置（监控频道/过滤规则/去重/消息水位） |
 | `monitor.session` | 登录态 | Telethon 用户账号登录态（**切勿泄露**） |
 | `115cookie.txt` | 凭证 | 115 cookie 文件（`PAN115_COOKIE_FILE`，热加载） |
@@ -532,20 +521,20 @@ app/
 │   └── pan115.py        # 115 封装（share_snap 预检 + margin/快照渐进重试）
 ├── parser/
 │   └── media_parser.py  # guessit + 噪音清洗 + 分享聚合 + {tmdb-XXX} 标签提取
+├── matching.py          # 标题归一化/匹配唯一实现（全/半角标点折叠，全项目复用）
 ├── tmdb/
 │   └── client.py        # TMDB API（搜索带年回退/跨语种别名兜底/详情 translations+AKA/缓存）
-├── media/               # 本地媒体处理流水线（链路 B）
-│   ├── service.py       # ① A→B：监控 + 稳定检测 + namer 高置信匹配 + 移入 B
-│   ├── namer.py         # 命名引擎：TMDB 高置信匹配 + 统一命名模板 + 标点折叠
-│   ├── probe.py         # ffprobe 探测：分辨率/编码/帧率/比特率/HDR/DV
-│   ├── ed2k.py          # MD4 分块哈希（pycryptodome C 实现，兼容 OpenSSL 3）
-│   ├── ed2k_service.py  # ② B→C：监控 + 稳定检测 + 哈希 + JSONL + 移入 C
-│   ├── ed2k_pusher.py   # ③ C→频道：JSONL 增量追读 + 卡片推送 + 进度条通知
-│   └── cd2_uploader.py  # ④ C→115：CD2 gRPC 跨云复制 + 任务追踪 + 删源 + 退避
+├── pipeline/            # 统一媒体流水线（方案二：A→重命名→B→哈希/推卡片→CD2上传115）
+│   └── service.py       # PipelineService：单服务单轮询跑完全链（含 CD2 gRPC 层）
+├── media/
+│   ├── namer.py         # 命名引擎：TMDB 高置信匹配 + 统一命名模板
+│   └── probe.py         # ffprobe 探测：分辨率/编码/帧率/比特率/HDR/DV
+├── ed2k/
+│   └── hasher.py        # MD4 分块哈希（pycryptodome C 实现，兼容 OpenSSL 3）
 ├── cd2/                 # CloudDrive2 gRPC 生成代码（含 protobuf 兼容性预加载）
 ├── telegram/
 │   ├── bot.py           # PTB Application（代理 + 心跳自愈 + 服务启停编排）
-│   ├── handlers.py      # 17 个命令 + 裸链接处理 + 批处理 + 编辑模式 + /mon 管理
+│   ├── handlers/        # 命令处理器（按领域拆分：push/status/admin/edit_flow/...）
 │   ├── edit_session.py  # /edit 编辑会话状态（推荐语/精品标记）
 │   ├── inspector.py     # 分享失效巡检（撤卡/告警 + cookie 热加载）
 │   ├── pusher.py        # 卡片渲染 + 推送（返回消息引用供撤卡）
@@ -553,12 +542,12 @@ app/
 ├── monitor/             # 频道监控（Telethon 用户账号）
 │   ├── store.py         # 监控配置持久化（monitor.db）
 │   ├── watcher.py       # ed2k 提取/验证/过滤/渲染（纯函数）
-│   ├── service.py       # Telethon 封装 + 实时事件 + 补扫 + 推送
+│   ├── channel_monitor.py  # Telethon 封装 + 实时事件 + 补扫 + 推送
 │   └── login.py         # 登录 CLI（备选；推荐 Bot 内 /mon login）
 └── db/
     ├── cache.py         # aiosqlite 业务库（tmdb_cache/pushed_shares/shared_items/share_dirs）
     └── state.py         # StateStore 统一状态库（state.db，一行一服务 + 旧 JSON 迁移）
-tests/                   # 24 个测试文件（state_store/logging/ed2k_pusher/cd2_uploader/...）
+tests/                   # 测试套件（pipeline/service_base/handlers/watchdog/...，pytest -q 全绿）
 ```
 
 ---
@@ -572,8 +561,8 @@ tests/                   # 24 个测试文件（state_store/logging/ed2k_pusher/
 - **频道收不到**：确认 Bot 是频道管理员且有发送权限；确认 `TG_CHAT_ID` 正确（分流时检查 `TG_CHAT_ID_115` / `TG_CHAT_ID_ED2K`）。
 - **cookie 失效告警**：仅影响 `/status` 健康检查和目录监控，匿名读取分享不受影响。更新：改 cookie 文件内容（自动热加载）或 `/cookie <串>`。
 - **目录监控没反应**：需已配置 115 cookie；`/dir list` 确认已登记；`/share` 手动触发看报错。
-- **本地媒体流水线不工作**：确认 `LOCAL_MEDIA_ENABLED=true` 且 `LOCAL_MEDIA_DRY_RUN=false`；确认 A/B/C 目录在 `.env` 和 `docker-compose.yml` 都配了且不重叠；`/status` 看各阶段状态。
-- **CD2 上传卡住**：`/upload_status` 看退避详情。CD2 传输中显示 0% 属正常（单文件不报字节进度，完成才更新）；CD2 里手动取消 + 移出 C 目录即可停止。
+- **媒体流水线不工作**：确认 `PIPELINE_ENABLED=true` 且各阶段 `*_DRY_RUN=false`；确认 A/B 目录在 `.env` 和 `docker-compose.yml` 都配了且不嵌套；B 已挂进 CD2 且 `CD2_UPLOAD_SRC` 正确；`/status` 看三阶段状态。
+- **CD2 上传卡住**：`/upload_status` 看退避详情。CD2 传输中显示 0% 属正常（单文件不报字节进度，完成才更新）；CD2 里手动取消 + 移出 B 目录即可停止。
 - **违规资源一直刷屏**：`/dir del` + `/dir add` 重新添加监控目录可清除 blocked 记录。
 - **想全部重来**：`/reset 确认` 一键清空业务数据（配置保留，服务自动重启）。
 

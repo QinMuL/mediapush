@@ -34,19 +34,24 @@ services:
 
     volumes:
       # 数据持久化：cache.db / state.db / monitor.db / monitor.session /
-      # 115cookie.txt / ed2k_results.jsonl / logs（双文件 + gzip 归档）
+      # 115cookie.txt（首次启动自动创建空文件）/ ed2k_results.jsonl /
+      # logs（双文件 + gzip 归档）
       - ./data:/app/data
-      # 本地媒体流水线（链路 B）三级目录挂载：
-      #   本容器把宿主机 /vol1/1000/media 挂为 /media，A/B/C 即其下三个子目录。
-      #   .env 填容器内路径：目录A=/media/A（待处理）→ B=/media/B（已重命名）
-      #   → C=/media/C（已哈希，待上传）；A/B/C 互不重叠，B 是①的输出也是②的输入。
+      # 统一媒体流水线（链路 B）目录挂载：
+      #   本容器把宿主机 /vol1/1000/media 挂为 /media，A/B 即其下两个子目录：
+      #     .env 填容器内路径：
+      #       PIPELINE_INPUT_DIR=/media/A    （下载落地/手动投喂，稳定判定在此）
+      #       PIPELINE_LIBRARY_DIR=/media/B  （资源库：重命名+哈希+待上传）
+      #   A/B 不得互相嵌套。原三级目录的 C 已随四段链路整合取消——
+      #   旧部署迁移时把原 C 的待上传内容移入 B 即可（流水线自动对账补哈希）。
       #
       #   CD2 上传源路径的"双层 media"说明：CD2 容器把宿主机 /vol1/1000 挂为
-      #   自己的 /media，所以同一个物理目录 C 的两容器视角不同——
-      #     物理位置 /vol1/1000/media/C
-      #       本容器视角 → LOCAL_MEDIA_INPUT/OUTPUT、ED2K_*_DIR 用 /media/C
-      #       CD2 容器视角 → CD2_UPLOAD_SRC 填 /media/media/C
-      #   若 CD2 挂载点不同，按其实际视角填 CD2_UPLOAD_SRC 即可。
+      #   自己的 /media，同一个物理目录 B 的两容器视角不同——
+      #     物理位置 /vol1/1000/media/B
+      #       本容器视角 → PIPELINE_LIBRARY_DIR=/media/B
+      #       CD2 容器视角 → CD2_UPLOAD_SRC=/media/media/B
+      #   前提：宿主机 /vol1/1000/media 已挂进 CD2 容器（CD2 必须能读到 B 才能
+      #   跨云复制）。若 CD2 挂载点不同，按其实际视角填 CD2_UPLOAD_SRC 即可。
       - /vol1/1000/media:/media
 
     # 健康检查：应用每 30s 写 /tmp/.heartbeat 心跳文件，
