@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from app.config import Settings, _env_bool_alias
+from app.config import Settings, _env_bool_alias, find_env_file
 
 
 def test_alias_new_key_wins(monkeypatch):
@@ -105,3 +105,36 @@ def test_cookie_file_existing_not_overwritten(tmp_path, monkeypatch):
 
     assert ck.read_text(encoding="utf-8") == "UID=1;CID=2;"
     assert s.pan115_cookie == "UID=1;CID=2;"
+
+
+# ---------------------------------------------------------------------- #
+# .env 文件数据源（回归：容器内无 .env → /reload 永远假报无变更）
+# ---------------------------------------------------------------------- #
+def test_find_env_file_search_order(tmp_path, monkeypatch):
+    """按 _ENV_FILE_SEARCH 顺序取第一个存在的；都不存在返回 None。"""
+    a, b = tmp_path / "a.env", tmp_path / "b.env"
+    b.write_text("X=1\n", encoding="utf-8")
+    monkeypatch.setattr("app.config._ENV_FILE_SEARCH", (a, b))
+    assert find_env_file() == b
+    monkeypatch.setattr("app.config._ENV_FILE_SEARCH", (a,))
+    assert find_env_file() is None
+
+
+def test_load_env_file_source_semantics(tmp_path, monkeypatch):
+    """核心回归：/reload（override=True）用挂载 .env 的值覆盖容器注入的
+    创建时快照；启动（override=False）快照优先——这是热加载能感知宿主机
+    .env 修改的机制基础。"""
+    env = tmp_path / ".env"
+    env.write_text("PIPELINE_CLEAN_DRY_RUN=false\n", encoding="utf-8")
+    monkeypatch.setattr("app.config._ENV_FILE_SEARCH", (env,))
+    monkeypatch.delenv("PIPELINE_CLEAN_DRY_RUN", raising=False)
+
+    # 启动语义：env 变量（env_file 注入快照）优先，文件不覆盖
+    monkeypatch.setenv("PIPELINE_CLEAN_DRY_RUN", "true")
+    s = Settings.load(dotenv_override=False)
+    assert s.pipeline_clean_dry_run is True
+
+    # /reload 语义：文件值覆盖快照
+    monkeypatch.setenv("PIPELINE_CLEAN_DRY_RUN", "true")
+    s = Settings.load(dotenv_override=True)
+    assert s.pipeline_clean_dry_run is False

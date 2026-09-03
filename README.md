@@ -78,6 +78,11 @@
 4. **灰度**：先三段全 dry 观察日志，再逐段切实际（每段 /reload 即时生效）
 5. 进行中的退避/上传状态属瞬态数据，迁移后从头开始（已推送去重在 cache.db 不受影响）
 
+> **/reload 热加载前提**：docker-compose 需挂载项目目录（`- .:/app/deploy:ro`，
+> 新版 compose 已内置）。`env_file:` 注入的是容器创建时的快照——不挂载时
+> 改宿主机 `.env` 后 `/reload` 无法感知，只能 `docker compose up -d` 重建生效
+> （旧部署 `/reload` 会如实提示未找到 .env）。
+
 ### 命令菜单总览（17 个）
 
 | 命令 | 功能 |

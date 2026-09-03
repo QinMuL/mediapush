@@ -9,6 +9,24 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# .env 文件搜索顺序（/reload 热加载的唯一数据源）：
+# 1) 容器部署：docker-compose 把项目目录只读挂到 /app/deploy——宿主机改
+#    .env 后容器内即时可见（env_file: 注入的是创建时快照，改文件不感知）
+# 2) 本地开发：cwd 的 .env
+_ENV_FILE_SEARCH: tuple[Path, ...] = (Path("/app/deploy/.env"), Path(".env"))
+
+
+def find_env_file() -> Path | None:
+    """返回第一个存在的 .env 路径；都不存在返回 None。
+
+    None = /reload 无数据源（旧部署未挂载项目目录）：此时改宿主机 .env
+    只能 docker compose up -d 重建生效，cmd_reload 会如实警告。
+    """
+    for cand in _ENV_FILE_SEARCH:
+        if cand.is_file():
+            return cand
+    return None
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -142,16 +160,19 @@ class Settings:
 
     @classmethod
     def load(cls, *, dotenv_override: bool = False) -> Settings:
-        """从环境变量加载；dotenv 仅在本地存在 .env 时生效。
+        """从环境变量加载；dotenv 读 find_env_file() 找到的 .env（无则跳过）。
 
         dotenv_override=True 供 /reload 用：重读 .env 时覆盖进程内已有
         变量（否则 load_dotenv 默认不覆盖启动时的值，改文件永远不生效）。
-        容器内 env_file 注入的变量不受影响（无 .env 文件时为 no-op）。
+        容器内 env_file 注入的是创建时快照——/reload 能否感知宿主机 .env
+        修改，取决于项目目录是否挂载进容器（见 find_env_file）。
         """
-        try:  # 本地开发：读 .env；生产容器由 env_file 注入，无需 dotenv
+        try:
             from dotenv import load_dotenv
 
-            load_dotenv(override=dotenv_override)
+            env_file = find_env_file()
+            if env_file is not None:
+                load_dotenv(env_file, override=dotenv_override)
         except Exception:  # noqa: S110, BLE001 - dotenv 可选，失败静默
             pass
 

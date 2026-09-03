@@ -14,6 +14,7 @@ from app.telegram.handlers import (
     _set_session,
     cmd_cookie,
     cmd_edit,
+    cmd_reload,
     cmd_status,
     coordinator,
     on_edit_callback,
@@ -752,3 +753,60 @@ def test_processing_ttl_expires():
         assert "115:xyz" not in coordinator._processing  # 已被清理
     finally:
         coordinator._processing.clear()
+
+
+# ---------------------------------------------------------------------- #
+# /reload：.env 文件数据源（回归：容器内无 .env → 假报"无变更"）
+# ---------------------------------------------------------------------- #
+class _ReloadContainer(_FakeContainer):
+    """带 reload_config 的假容器（返回给定热加载/需重启字段）。"""
+
+    def __init__(self, hot, restart):
+        super().__init__()
+        self._hot, self._restart = hot, restart
+
+    def reload_config(self, new_settings):
+        return self._hot, self._restart
+
+    def refresh_cookie_file(self):
+        pass
+
+
+def test_cmd_reload_reports_change_from_env_file(tmp_path, monkeypatch):
+    """挂载的 .env 与容器注入快照不同：/reload 报告热加载字段（不再假报无变更）。"""
+    env = tmp_path / ".env"
+    env.write_text("PIPELINE_CLEAN_DRY_RUN=false\n", encoding="utf-8")
+    monkeypatch.setattr("app.config._ENV_FILE_SEARCH", (env,))
+    monkeypatch.delenv("PIPELINE_CLEAN_DRY_RUN", raising=False)
+    monkeypatch.setenv("PIPELINE_CLEAN_DRY_RUN", "true")  # 模拟 env_file 注入旧快照
+
+    container = _ReloadContainer(hot=["pipeline_clean_dry_run"], restart=[])
+    ctx = _make_context(container)
+    msg = _make_message("/reload")
+    update = _make_update(message=msg)
+
+    asyncio.run(cmd_reload(update, ctx))
+
+    text = msg.reply_text.await_args.args[0]
+    assert "已热加载生效" in text and "pipeline_clean_dry_run" in text
+    assert str(env) in text  # 回显实际读取的文件路径
+
+
+def test_cmd_reload_warns_when_env_file_missing(tmp_path, monkeypatch):
+    """容器内无 .env（旧部署未挂载）：如实警告 + 给出解决路径，而非假报无变更。"""
+    monkeypatch.setattr(
+        "app.config._ENV_FILE_SEARCH", (tmp_path / "nope.env",)
+    )
+    monkeypatch.delenv("PIPELINE_CLEAN_DRY_RUN", raising=False)
+
+    container = _ReloadContainer(hot=[], restart=[])
+    ctx = _make_context(container)
+    msg = _make_message("/reload")
+    update = _make_update(message=msg)
+
+    asyncio.run(cmd_reload(update, ctx))
+
+    text = msg.reply_text.await_args.args[0]
+    assert "未找到 .env" in text
+    assert "up -d" in text
+    assert "无变更" not in text  # 不能再假报

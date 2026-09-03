@@ -37,6 +37,13 @@ services:
       # 115cookie.txt（首次启动自动创建空文件）/ ed2k_results.jsonl /
       # logs（双文件 + gzip 归档）
       - ./data:/app/data
+      # /reload 热加载源：把项目目录（含 .env）只读挂进容器。env_file:
+      # 注入的是容器创建时的快照，改宿主机 .env 不会感知；挂载后 app 的
+      # find_env_file() 读 /app/deploy/.env，/reload 即时生效。
+      # 注意必须挂目录而非单个 .env 文件：sed -i / vim 等编辑器是 rename
+      # 替换文件（换 inode），单文件 bind mount 会永久滞留旧内容；
+      # 目录挂载每次按路径重新解析，始终读到最新文件。
+      - .:/app/deploy:ro
       # 统一媒体流水线（链路 B）目录挂载：
       #   本容器把宿主机 /vol1/1000/media 挂为 /media，A/B 即其下两个子目录：
       #     .env 填容器内路径：

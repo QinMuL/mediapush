@@ -66,7 +66,7 @@ async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not _is_admin(update, context):
         await update.message.reply_text(_DENY_TEXT)
         return
-    from app.config import Settings
+    from app.config import Settings, find_env_file
 
     try:
         new_settings = Settings.load(dotenv_override=True)
@@ -76,16 +76,27 @@ async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     hot, restart = _container(context).reload_config(new_settings)
 
-    lines = ["🔄 配置已重读（.env）"]
-    if hot:
-        lines.append("✅ 已热加载生效：\n" + "\n".join(f"  • {n}" for n in hot))
-    if restart:
-        lines.append(
-            "⚠️ 以下变更需重启容器才生效：\n"
-            + "\n".join(f"  • {n}" for n in restart)
-        )
-    if not hot and not restart:
-        lines.append("ℹ️ 无变更（与当前运行配置一致）")
+    env_file = find_env_file()
+    if env_file is None:
+        # 容器内无 .env（旧部署未挂载项目目录）：环境变量是 env_file 注入的
+        # 创建时快照，/reload 永远读不到宿主机的修改——如实说明而非假报无变更
+        lines = [
+            "⚠️ 容器内未找到 .env 文件，/reload 无法感知宿主机 .env 的修改",
+            "解决办法（二选一）：",
+            "  • docker-compose.yml 挂载项目目录（新版已内置：- .:/app/deploy:ro）",
+            "  • docker compose up -d 重建容器（每次改 .env 都需要）",
+        ]
+    else:
+        lines = [f"🔄 配置已重读（{env_file}）"]
+        if hot:
+            lines.append("✅ 已热加载生效：\n" + "\n".join(f"  • {n}" for n in hot))
+        if restart:
+            lines.append(
+                "⚠️ 以下变更需重启容器才生效：\n"
+                + "\n".join(f"  • {n}" for n in restart)
+            )
+        if not hot and not restart:
+            lines.append("ℹ️ 无变更（与当前运行配置一致）")
     lines.append("\nℹ️ cookie 文件（PAN115_COOKIE_FILE）内容变化已即时生效")
     await update.message.reply_text("\n".join(lines))
 
