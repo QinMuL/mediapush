@@ -38,6 +38,8 @@ class _FakeSettings:
     pipeline_rename_dry_run = True
     pipeline_push_dry_run = True
     pipeline_upload_dry_run = True
+    pipeline_clean_enabled = False
+    pipeline_clean_dry_run = True
     pipeline_report_admin = False
     cd2_address = "127.0.0.1:19798"
     cd2_token = "test-token"
@@ -353,6 +355,23 @@ def test_clean_gate_dry_run_reports_but_moves(dirs, monkeypatch):
     assert report.has_events()  # 纯检测轮也触发汇总
     assert "🧹 检测到垃圾 1" in report.summary()
     assert "🧹 检测到垃圾（1）" in report.grouped_details()
+
+
+def test_clean_gate_clean_file_shows_checked(dirs, monkeypatch):
+    """干净文件：原样移动 + 轮汇总显示'检测 N（干净）'（可见性：证明闸门跑了）。"""
+    a, b = dirs
+    f = a / "clean.mkv"
+    f.write_bytes(b"raw-bytes")
+    _patch_cleaner(monkeypatch, report=CleanReport())  # 无垃圾
+    svc = _mk_service(a, b, pipeline_rename_dry_run=False,
+                      pipeline_clean_enabled=True, pipeline_clean_dry_run=True)
+    report = PipelineReport()
+    assert asyncio.run(svc._maybe_clean(f, b / "out.mkv", report))
+    assert (b / "out.mkv").read_bytes() == b"raw-bytes"
+    assert not f.exists()
+    assert report.clean_checked == 1
+    assert not report.cleaned_lines and not report.clean_dry_lines
+    assert "🧹 检测 1（干净）" in report.summary()
 
 
 def test_clean_gate_clean_success_replaces_file(dirs, monkeypatch):

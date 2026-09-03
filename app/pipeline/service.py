@@ -156,6 +156,7 @@ class PipelineReport:
     cleaned_lines: list[str] = field(default_factory=list)      # 🧹 已清洗
     clean_dry_lines: list[str] = field(default_factory=list)    # 🧹 检测到（未清洗）
     cleaned_count: int = 0
+    clean_checked: int = 0      # 闸门实际检测过的文件数（含干净，可见性用）
 
     def summary(self) -> str:
         s = f"A 扫描 {self.scanned}"
@@ -167,6 +168,9 @@ class PipelineReport:
                 s += f" · 🧹 清洗 {self.cleaned_count}"
             else:
                 s += f" · 🧹 检测到垃圾 {len(self.clean_dry_lines)}"
+        elif self.clean_checked:
+            # 闸门跑了但全干净（可见性：区分"启用+干净"与"未启用"）
+            s += f" · 🧹 检测 {self.clean_checked}（干净）"
         if self.hashed:
             s += f" · 哈希 {self.hashed}"
         if self.pushed or self.dry_pushed or self.skipped_dup:
@@ -508,6 +512,7 @@ class PipelineService(PollingService):
             logger.warning("元数据检测失败（按原样移动）：%s", f.name)
             fast_move(f, dest)
             return True
+        report.clean_checked += 1
         if not rpt.has_junk:
             fast_move(f, dest)
             return True
@@ -1364,12 +1369,17 @@ class PipelineService(PollingService):
             await self._send_report(report)
 
     def _on_start(self) -> None:
+        clean_mode = (
+            "关闭" if not self.settings.pipeline_clean_enabled
+            else "模拟" if self.settings.pipeline_clean_dry_run else "实际"
+        )
         self.log.info(
-            "媒体流水线启动：A=%s → B=%s（重命名%s · 推送%s · 上传%s，%.0fs/轮）",
+            "媒体流水线启动：A=%s → B=%s（重命名%s · 推送%s · 上传%s · 清洗%s，%.0fs/轮）",
             self.input_dir, self.library_dir,
             "模拟" if self.settings.pipeline_rename_dry_run else "实际",
             "模拟" if self.settings.pipeline_push_dry_run else "实际",
             "模拟" if self.settings.pipeline_upload_dry_run else "实际",
+            clean_mode,
             self.interval,
         )
 

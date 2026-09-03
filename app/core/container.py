@@ -1,4 +1,4 @@
-﻿"""DI 容器：懒加载所有服务单例。
+"""DI 容器：懒加载所有服务单例。
 
 - 空配置（缺 token/cookie/key）时不阻塞启动，对应服务为 None
 - pusher 懒取：bot 启动（build）后才就绪
@@ -154,13 +154,18 @@ class Container:
             from app.pipeline.service import PipelineService
 
             self.pipeline = PipelineService(self, self.settings)
+            clean_mode = (
+                "关闭" if not self.settings.pipeline_clean_enabled
+                else "模拟" if self.settings.pipeline_clean_dry_run else "实际"
+            )
             logger.info(
-                "统一媒体流水线已创建：A=%s → B=%s（重命名%s · 推送%s · 上传%s）",
+                "统一媒体流水线已创建：A=%s → B=%s（重命名%s · 推送%s · 上传%s · 清洗%s）",
                 self.settings.pipeline_input_dir,
                 self.settings.pipeline_library_dir,
                 "模拟" if self.settings.pipeline_rename_dry_run else "实际",
                 "模拟" if self.settings.pipeline_push_dry_run else "实际",
                 "模拟" if self.settings.pipeline_upload_dry_run else "实际",
+                clean_mode,
             )
         else:
             logger.info("PIPELINE_ENABLED=false，统一媒体流水线未启用")
