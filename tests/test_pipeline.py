@@ -17,6 +17,7 @@ import pytest
 
 import app.pipeline.service as pipeline_mod
 from app.core.processor import ProcessResult
+from app.media.cleaner import CleanError, CleanReport
 from app.media.namer import NamingResult
 from app.parser.media_parser import MediaData
 from app.pipeline.service import PipelineReport, PipelineService
@@ -303,6 +304,114 @@ def test_rename_conflict_no_overwrite(dirs, monkeypatch):
 
 
 # ---------------------------------------------------------------------- #
+# ① 重命名阶段 · 元数据清洗闸门（monkeypatch cleaner，不依赖 ffmpeg）
+# ---------------------------------------------------------------------- #
+def _patch_cleaner(monkeypatch, *, report=None, clean_impl=None):
+    async def inspect_(path, keywords=()):
+        return report
+    monkeypatch.setattr("app.media.cleaner.inspect", inspect_)
+    if clean_impl is not None:
+        monkeypatch.setattr("app.media.cleaner.clean", clean_impl)
+
+
+def test_clean_gate_disabled_moves_raw(dirs, monkeypatch):
+    """开关关闭：原样 fast_move，cleaner 完全不被调用。"""
+    a, b = dirs
+    f = a / "dirty.mkv"
+    f.write_bytes(b"raw-bytes")
+
+    async def boom(path, keywords=()):  # 任何调用都视为失败
+        raise AssertionError("cleaner 不应被调用")
+    monkeypatch.setattr("app.media.cleaner.inspect", boom)
+
+    svc = _mk_service(a, b, pipeline_rename_dry_run=False)
+    report = PipelineReport()
+    assert asyncio.run(svc._maybe_clean(f, b / "out.mkv", report))
+    assert (b / "out.mkv").read_bytes() == b"raw-bytes"
+    assert not f.exists()
+    assert not report.cleaned_lines and not report.clean_dry_lines
+
+
+def test_clean_gate_dry_run_reports_but_moves(dirs, monkeypatch):
+    """CLEAN_DRY_RUN：报告垃圾但文件照常移动（不清洗）。"""
+    a, b = dirs
+    f = a / "dirty.mkv"
+    f.write_bytes(b"raw-bytes")
+    _patch_cleaner(monkeypatch, report=CleanReport(
+        junk_tags=["title=ad www.x.com"], junk_chapters=["广告章节"],
+    ))
+    svc = _mk_service(a, b, pipeline_rename_dry_run=False,
+                      pipeline_clean_enabled=True, pipeline_clean_dry_run=True)
+    report = PipelineReport()
+    assert asyncio.run(svc._maybe_clean(f, b / "out.mkv", report))
+    assert (b / "out.mkv").read_bytes() == b"raw-bytes"  # 未清洗
+    assert not f.exists()
+    assert len(report.clean_dry_lines) == 1
+    assert "CLEAN_DRY_RUN" in report.clean_dry_lines[0]
+    assert "容器标签×1" in report.clean_dry_lines[0]
+    assert report.cleaned_count == 0
+    assert report.has_events()  # 纯检测轮也触发汇总
+    assert "🧹 检测到垃圾 1" in report.summary()
+    assert "🧹 检测到垃圾（1）" in report.grouped_details()
+
+
+def test_clean_gate_clean_success_replaces_file(dirs, monkeypatch):
+    """实清洗：clean() 产物落 B，A 原件删除，报告计入已清洗。"""
+    a, b = dirs
+    f = a / "dirty.mkv"
+    f.write_bytes(b"raw-bytes")
+    dest = b / "out.mkv"
+
+    async def fake_clean(src, dst, rpt):
+        Path(dst).write_bytes(Path(src).read_bytes() + b"-cleaned")
+    _patch_cleaner(monkeypatch, report=CleanReport(junk_tracks=[
+        {"index": 2, "kind": "音轨", "title": "promo"},
+    ]), clean_impl=fake_clean)
+    svc = _mk_service(a, b, pipeline_rename_dry_run=False,
+                      pipeline_clean_enabled=True, pipeline_clean_dry_run=False)
+    report = PipelineReport()
+    assert asyncio.run(svc._maybe_clean(f, dest, report))
+    assert dest.read_bytes() == b"raw-bytes-cleaned"  # B 是清洗产物
+    assert not f.exists()                              # 原件已删
+    assert report.cleaned_count == 1
+    assert "🧹 清洗 1" in report.summary()
+    assert "🧹 已清洗（1）" in report.grouped_details()
+
+
+def test_clean_gate_clean_failure_backoff(dirs, monkeypatch):
+    """清洗失败：原件保留 A、无半成品、计失败退避。"""
+    a, b = dirs
+    f = a / "dirty.mkv"
+    f.write_bytes(b"raw-bytes")
+
+    async def fail_clean(src, dst, rpt):
+        raise CleanError("ffmpeg remux 失败")
+    _patch_cleaner(monkeypatch, report=CleanReport(junk_tags=["title=ad"]),
+                   clean_impl=fail_clean)
+    svc = _mk_service(a, b, pipeline_rename_dry_run=False,
+                      pipeline_clean_enabled=True, pipeline_clean_dry_run=False)
+    report = PipelineReport()
+    assert not asyncio.run(svc._maybe_clean(f, b / "out.mkv", report))
+    assert f.exists()                       # 原件保留待重试
+    assert not (b / "out.mkv").exists()     # 无半成品
+    assert report.failed == 1
+
+
+def test_clean_gate_inspect_fail_degrades(dirs, monkeypatch):
+    """检测失败（ffprobe 不可用）：按干净降级原样移动，不阻塞流水线。"""
+    a, b = dirs
+    f = a / "dirty.mkv"
+    f.write_bytes(b"raw-bytes")
+    _patch_cleaner(monkeypatch, report=None)  # inspect 返回 None
+    svc = _mk_service(a, b, pipeline_rename_dry_run=False,
+                      pipeline_clean_enabled=True, pipeline_clean_dry_run=False)
+    report = PipelineReport()
+    assert asyncio.run(svc._maybe_clean(f, b / "out.mkv", report))
+    assert (b / "out.mkv").read_bytes() == b"raw-bytes"
+    assert not report.cleaned_lines and not report.clean_dry_lines
+
+
+# ---------------------------------------------------------------------- #
 # ② 哈希 + 推送
 # ---------------------------------------------------------------------- #
 def test_full_flow_hash_push_submit(dirs, monkeypatch):
@@ -487,7 +596,7 @@ def test_upload_dry_then_flip_submits(dirs, monkeypatch):
 
 
 def test_upload_dedup_skips_existing_in_115(dirs, monkeypatch):
-    """115 目标已有同名：记完成跳过（不提交任务）。"""
+    """115 目标已有同名：删本地源 + 记完成跳过（不提交任务）。"""
     a, b = dirs
     video = a / "Furious.S01E04.2026.2160p.mkv"
     video.write_bytes(b"0" * 640_000)
@@ -503,6 +612,27 @@ def test_upload_dedup_skips_existing_in_115(dirs, monkeypatch):
     asyncio.run(svc.run_once())
     assert svc.submitted == []
     assert str(dest) in svc._completed
+    assert not dest.exists()          # 本地源冗余已删
+    assert svc.deleted == [str(dest)]  # 删除走 _cd2_path 映射后的路径
+
+
+def test_upload_dedup_skip_dry_keeps_file(dirs, monkeypatch):
+    """DRY 模式查重命中：仅记完成，不动文件（DRY 不删源）。"""
+    a, b = dirs
+    video = a / "Furious.S01E04.2026.2160p.mkv"
+    video.write_bytes(b"0" * 640_000)
+    dest = b / "狂怒追缉.2026.S01E04.第04集.2160p.WEB-DL.H.265.mkv"
+    svc = _mk_service(a, b,
+                      pipeline_rename_dry_run=False,
+                      pipeline_push_dry_run=True,
+                      pipeline_upload_dry_run=True)
+    svc.dst_files = [_FakeFile(dest.name)]
+    _patch_high_conf(monkeypatch)
+    asyncio.run(svc.run_once())
+    asyncio.run(svc.run_once())
+    assert str(dest) in svc._completed
+    assert dest.exists()               # 文件未动
+    assert svc.deleted == []
 
 
 def test_upload_complete_deletes_source_with_sidecars(dirs, monkeypatch):
@@ -534,6 +664,75 @@ def test_upload_complete_deletes_source_with_sidecars(dirs, monkeypatch):
     svc.settings.pipeline_push_dry_run = False
     r4 = asyncio.run(svc.run_once())
     assert r4.pushed == 1  # 文件已删仍能按 URL 推卡片
+
+
+def test_upload_delete_uses_cd2_namespace_path(dirs, monkeypatch):
+    """回归（NAS 实发 bug）：删源必须经 _cd2_path 映射——本地路径直传 CD2 会
+    NOT_FOUND（上传成功但删除必失败，文件永久残留 B）。"""
+    a, b = dirs
+    video = a / "Furious.S01E04.2026.2160p.mkv"
+    video.write_bytes(b"0" * 640_000)
+    svc = _mk_service(a, b,
+                      pipeline_rename_dry_run=False,
+                      pipeline_push_dry_run=True,
+                      pipeline_upload_dry_run=False)
+    # 非恒等映射：本地 B 路径 → CD2 命名空间 /cd2ns/ 前缀（真实部署即如此）
+    svc._cd2_path = lambda local: "/cd2ns/" + Path(local).name
+    _patch_high_conf(monkeypatch)
+    asyncio.run(svc.run_once())
+    asyncio.run(svc.run_once())  # rename+hash+submit（cd2_src 已是 /cd2ns/ 名字）
+    dest = b / "狂怒追缉.2026.S01E04.第04集.2160p.WEB-DL.H.265.mkv"
+    svc.tasks_result = [_FakeCd2Task(status=3, sourcePath="/cd2ns/" + dest.name,
+                                     destPath=svc.cd2_dst)]
+
+    r3 = asyncio.run(svc.run_once())
+    assert r3.completed == 1
+    # 删除收到的是 CD2 命名空间路径（bug 时这里是本地路径 str(dest)）
+    assert svc.deleted == [f"/cd2ns/{dest.name}"]
+
+
+def test_upload_complete_delete_failure_not_completed(dirs, monkeypatch):
+    """上传完成但删源失败：不记 completed（防 B 静默残留），计失败退避。"""
+    a, b = dirs
+    video = a / "Furious.S01E04.2026.2160p.mkv"
+    video.write_bytes(b"0" * 640_000)
+    svc = _mk_service(a, b,
+                      pipeline_rename_dry_run=False,
+                      pipeline_push_dry_run=True,
+                      pipeline_upload_dry_run=False)
+    _patch_high_conf(monkeypatch)
+    asyncio.run(svc.run_once())
+    asyncio.run(svc.run_once())  # rename+hash+submit
+    dest = b / "狂怒追缉.2026.S01E04.第04集.2160p.WEB-DL.H.265.mkv"
+    svc.tasks_result = [_FakeCd2Task(status=3, sourcePath=str(dest),
+                                     destPath=svc.cd2_dst)]
+    svc._delete_file = lambda p: False  # 删除恒失败（不 unlink）
+
+    r3 = asyncio.run(svc.run_once())
+    assert r3.completed == 0 and r3.failed == 1
+    assert dest.exists()                       # 源未删
+    assert str(dest) not in svc._completed     # 未记完成 → 下轮查重路径兜底
+    assert svc._failures.get(f"upload:{dest}")["failures"] == 1
+
+
+def test_upload_skip_delete_failure_backoff(dirs, monkeypatch):
+    """查重跳过路径删源失败：计失败退避，不记完成（下轮重试删源）。"""
+    a, b = dirs
+    video = a / "Furious.S01E04.2026.2160p.mkv"
+    video.write_bytes(b"0" * 640_000)
+    dest = b / "狂怒追缉.2026.S01E04.第04集.2160p.WEB-DL.H.265.mkv"
+    svc = _mk_service(a, b,
+                      pipeline_rename_dry_run=False,
+                      pipeline_push_dry_run=True,
+                      pipeline_upload_dry_run=False)
+    svc.dst_files = [_FakeFile(dest.name)]  # 115 已存在同名
+    svc._delete_file = lambda p: False
+    _patch_high_conf(monkeypatch)
+    asyncio.run(svc.run_once())
+    r2 = asyncio.run(svc.run_once())
+    assert r2.upload_skipped == 0 and r2.failed == 1
+    assert dest.exists()
+    assert str(dest) not in svc._completed
 
 
 def test_upload_failure_backoff(dirs, monkeypatch):

@@ -114,6 +114,14 @@ def _fmt_dur(seconds: float) -> str:
     return f"{mins // 60:.0f} 小时 {mins % 60:.0f} 分"
 
 
+def _remove_file(path: Path) -> None:
+    """删文件（清洗成功后删 A 原件；失败仅日志）。"""
+    try:
+        path.unlink()
+    except OSError as exc:
+        logger.warning("删除文件失败 %s：%s", path, exc)
+
+
 @dataclass
 class PipelineReport:
     """一轮流水线结果。"""
@@ -145,12 +153,20 @@ class PipelineReport:
     upload_dry_lines: list[str] = field(default_factory=list)   # 🔍 将上传
     upload_skip_lines: list[str] = field(default_factory=list)  # ⏭️ 115 已存在跳过
     fail_lines: list[str] = field(default_factory=list)         # ⏳ 失败（全阶段）
+    cleaned_lines: list[str] = field(default_factory=list)      # 🧹 已清洗
+    clean_dry_lines: list[str] = field(default_factory=list)    # 🧹 检测到（未清洗）
+    cleaned_count: int = 0
 
     def summary(self) -> str:
         s = f"A 扫描 {self.scanned}"
         if self.renamed or self.dry_renamed:
             tag = "🔍 [DRY-RUN] " if not self.renamed and self.dry_renamed else ""
             s += f"：{tag}重命名 {self.renamed or self.dry_renamed}"
+        if self.cleaned_count or self.clean_dry_lines:
+            if self.cleaned_count:
+                s += f" · 🧹 清洗 {self.cleaned_count}"
+            else:
+                s += f" · 🧹 检测到垃圾 {len(self.clean_dry_lines)}"
         if self.hashed:
             s += f" · 哈希 {self.hashed}"
         if self.pushed or self.dry_pushed or self.skipped_dup:
@@ -184,6 +200,7 @@ class PipelineReport:
             or self.submitted or self.dry_submitted or self.upload_skipped
             or self.completed or self.low_conf or self.conflict
             or self.failed or self.stuck
+            or self.cleaned_count or self.clean_dry_lines
         )
 
     def grouped_details(self) -> list[str]:
@@ -192,6 +209,8 @@ class PipelineReport:
         组标题带计数 + 缩进条目（  • xxx）+ 组间空行；空组不渲染。
         """
         groups: list[tuple[str, list[str]]] = [
+            ("🧹 已清洗", self.cleaned_lines),
+            ("🧹 检测到垃圾", self.clean_dry_lines),
             ("✅ 推送成功", self.pushed_titles),
             ("🔍 模拟推送", self.dry_push_names),
             ("⏭️ 已推送过", self.dup_names),
@@ -458,7 +477,8 @@ class PipelineService(PollingService):
             return dest  # 返回拟移动目标（计入单轮批量；不实际移动）
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
-            fast_move(f, dest)
+            if not await self._maybe_clean(f, dest, report):
+                return None  # 清洗失败已记退避；原件保留 A 待重试
             for s in subs:
                 fast_move(s, dest.with_suffix(s.suffix))
             report.renamed += 1
@@ -468,6 +488,47 @@ class PipelineService(PollingService):
         self._failures.clear(f"rename:{f}")
         logger.info("流水线重命名 %s → %s（字幕伴行 %d 个）", f.name, dest, len(subs))
         return dest
+
+    async def _maybe_clean(self, f: Path, dest: Path,
+                           report: PipelineReport) -> bool:
+        """移入 B 前的元数据清洗闸门：干净→fast_move；脏→remux 清洗直落 B。
+
+        返回 False = 本次流转失败（已记退避，原件保留 A）。
+        - PIPELINE_CLEAN_ENABLED=false：原样 fast_move（零开销）
+        - PIPELINE_CLEAN_DRY_RUN=true：只检测报告，文件照常 fast_move 进 B
+        - 检测失败（ffprobe 不可用等）：按"干净"降级 fast_move，不阻塞流水线
+        """
+        if not getattr(self.settings, "pipeline_clean_enabled", False):
+            fast_move(f, dest)
+            return True
+        from app.media import cleaner
+
+        rpt = await cleaner.inspect(str(f))
+        if rpt is None:
+            logger.warning("元数据检测失败（按原样移动）：%s", f.name)
+            fast_move(f, dest)
+            return True
+        if not rpt.has_junk:
+            fast_move(f, dest)
+            return True
+        # 命中垃圾
+        line = f"{f.name}：{rpt.summary()}"
+        if getattr(self.settings, "pipeline_clean_dry_run", True):
+            report.clean_dry_lines.append(f"{line}（未清洗，CLEAN_DRY_RUN）")
+            logger.info("[DRY-RUN] 元数据清洗 %s", line)
+            fast_move(f, dest)
+            return True
+        try:
+            await cleaner.clean(str(f), str(dest), rpt)
+        except cleaner.CleanError as exc:
+            logger.error("元数据清洗失败 %s：%s（原件保留待重试）", f.name, exc)
+            self._failures.record(f"rename:{f}", time.time())
+            report.failed += 1
+            return False
+        report.cleaned_lines.append(line)
+        report.cleaned_count += 1
+        _remove_file(f)  # 清洗成功删 A 原件（B 已是干净版）
+        return True
 
     def _hold(self, f: Path, result: NamingResult,
               report: PipelineReport, now: float) -> None:
@@ -641,13 +702,37 @@ class PipelineService(PollingService):
                 None, lambda: self._ensure_conn() and self._login()
             ):
                 return
-            # 查重：115 目标已存在同名 → 记完成跳过
+            # 查重：115 目标已存在同名 → 本地源冗余，删源后记完成跳过
+            # （也是 _finish 删源失败的兜底重试入口）
             names_dst = await self._dst_names(loop)
             if names_dst is not None and src.name in names_dst:
-                self._completed.add(key)
-                report.upload_skipped += 1
-                report.upload_skip_lines.append(src.name)
-                logger.info("流水线上传跳过 %s：115 目标已存在同名", src.name)
+                if dry:
+                    # 模拟模式不动文件：仅记完成（查重本身是真实动作，沿用旧语义）
+                    self._completed.add(key)
+                    report.upload_skipped += 1
+                    report.upload_skip_lines.append(src.name)
+                    logger.info("流水线上传跳过 %s：115 目标已存在同名", src.name)
+                    continue
+                deleted = True
+                for p in [src] + pick_upload_sidecars(src):
+                    cd2_p = self._cd2_path(str(p))
+                    ok = await loop.run_in_executor(
+                        None, lambda q=cd2_p: self._delete_file(q)
+                    )
+                    if p == src:
+                        deleted = ok
+                if deleted:
+                    self._completed.add(key)
+                    report.upload_skipped += 1
+                    report.upload_skip_lines.append(src.name)
+                    logger.info(
+                        "流水线上传跳过 %s：115 目标已存在同名（本地源已删）", src.name
+                    )
+                else:
+                    await self._record_failure(
+                        "upload", key, src.name,
+                        "115 已存在但删除本地源失败", report, now,
+                    )
                 continue
             sidecars = pick_upload_sidecars(src)
             if dry:
@@ -769,17 +854,30 @@ class PipelineService(PollingService):
 
     async def _finish(self, info: _TaskInfo, report: PipelineReport, now: float) -> None:
         """任务完成：删源（视频+伴行）+ 状态清理 + 进度收尾。"""
+        loop = asyncio.get_running_loop()
+        # 删源：视频 + 伴行（此时文件仍在 B，按 stem 重找）。
+        # 必须经 _cd2_path 转命名空间路径——本地路径直传 CD2 会 NOT_FOUND
+        src = Path(info.src_path)
+        deleted = True
+        for p in [src] + pick_upload_sidecars(src):
+            cd2_p = self._cd2_path(str(p))
+            ok = await loop.run_in_executor(
+                None, lambda q=cd2_p: self._delete_file(q)
+            )
+            if p == src:
+                deleted = ok  # 视频删失败为门槛；伴行失败仅日志（孤儿字幕无碍）
+        if not deleted:
+            # 删源失败不记 completed（防 B 静默残留）：退避重试，
+            # 下轮查重发现 115 已存在 → 走跳过路径兜底删源
+            await self._record_failure(
+                "upload", info.src_path, info.name,
+                "上传完成但删除本地源失败", report, now,
+            )
+            return
         self._tasks.pop(info.src_path, None)
         self._failures.clear(f"upload:{info.src_path}")
         self._completed.add(info.src_path)
         report.completed += 1
-        loop = asyncio.get_running_loop()
-        # 删源：视频 + 伴行（此时文件仍在 B，按 stem 重找）
-        src = Path(info.src_path)
-        for p in [src] + pick_upload_sidecars(src):
-            await loop.run_in_executor(
-                None, lambda q=str(p): self._delete_file(q)
-            )
         took = now - info.submitted_at
         speed = info.size / max(0.1, took) / 1024**2
         note = "，疑似 115 秒传" if took < 60 else ""
@@ -1133,8 +1231,14 @@ class PipelineService(PollingService):
             if self._stable.get(k, 0) >= self.settings.pipeline_stable_rounds
         )
         failure_keys = list(self._failures.dump())
+        clean_note = ""
+        if getattr(self.settings, "pipeline_clean_enabled", False):
+            clean_note = (
+                " · 清洗模拟" if getattr(self.settings, "pipeline_clean_dry_run", True)
+                else " · 清洗实际"
+            )
         lines = [
-            f"① A→B 重命名：{'模拟' if self.settings.pipeline_rename_dry_run else '实际'}"
+            f"① A→B 重命名：{'模拟' if self.settings.pipeline_rename_dry_run else '实际'}{clean_note}"
             f" · A 待处理 {a_queue} · 低置信退避 "
             f"{sum(1 for k in failure_keys if k.startswith('rename:'))}",
             f"② B→卡片：{'模拟' if self.settings.pipeline_push_dry_run else '实际'}"
