@@ -391,6 +391,8 @@ Bot 回复卡片预览 + 按钮：`✏️ 追加画质`（输入自定义推荐�
 | `PIPELINE_STUCK_DAYS` | `7` | 各阶段失败卡死告警阈值天 |
 | `PIPELINE_MIN_SIZE_MB` | `10` | 体积守门（MB）；设 0 关闭 |
 | `PIPELINE_REPORT_ADMIN` | `true` | 有动作轮次汇总+明细私信 admin（旧键 `CD2_REPORT_ADMIN` 兼容） |
+| `PIPELINE_CLEAN_ENABLED` | `false` | 元数据清洗（L1 保守档：广告标签/垃圾章节/广告轨，remux 零重编码） |
+| `PIPELINE_CLEAN_DRY_RUN` | `true` | 清洗模拟：只检测报告不动文件（轮汇总"🧹 检测到垃圾"组） |
 | `CD2_ADDRESS` | `192.168.1.202:19798` | CloudDrive2 gRPC 地址 |
 | `CD2_TOKEN` | 空 | CD2 API 令牌（推荐，Web UI → 设置 → API 令牌创建） |
 | `CD2_USERNAME` / `CD2_PASSWORD` | 空 | 或账号密码（token 优先） |

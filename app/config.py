@@ -130,6 +130,8 @@ class Settings:
     pipeline_min_size_mb: float = 10.0       # 体积守门（MB）：低于视为下载残缺拦截
     pipeline_stuck_days: float = 7.0         # 各阶段失败卡死告警阈值（天）
     pipeline_report_admin: bool = True       # 有动作的轮次把汇总+明细发给 TG_ADMIN_IDS
+    pipeline_clean_enabled: bool = False     # 元数据清洗（L1 保守档，app/media/cleaner.py）
+    pipeline_clean_dry_run: bool = True      # 清洗模拟：只检测报告不动文件
     # CD2 连接与路径（上传阶段用；src = 目录B 在 CD2 里的路径）
     cd2_address: str = "192.168.1.202:19798"       # CD2 gRPC 地址
     cd2_token: str = ""                           # API 令牌（推荐，UI 创建）
@@ -228,6 +230,8 @@ class Settings:
             pipeline_rename_dry_run=_env_bool("PIPELINE_RENAME_DRY_RUN", True),
             pipeline_push_dry_run=_env_bool("PIPELINE_PUSH_DRY_RUN", True),
             pipeline_upload_dry_run=_env_bool("PIPELINE_UPLOAD_DRY_RUN", True),
+            pipeline_clean_enabled=_env_bool("PIPELINE_CLEAN_ENABLED", False),
+            pipeline_clean_dry_run=_env_bool("PIPELINE_CLEAN_DRY_RUN", True),
             pipeline_interval_seconds=max(
                 1.0, _env_float("PIPELINE_INTERVAL_SECONDS", 10.0)
             ),
@@ -353,4 +357,6 @@ HOT_RELOAD_FIELDS: frozenset[str] = frozenset({
     "pipeline_min_size_mb",
     "pipeline_batch_max",
     "pipeline_report_admin",
+    "pipeline_clean_enabled",
+    "pipeline_clean_dry_run",
 })
