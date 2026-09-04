@@ -484,6 +484,51 @@ def test_clean_gate_clean_success_replaces_file(dirs, monkeypatch):
     assert "🧹 已清洗（1）" in report.grouped_details()
 
 
+def test_clean_gate_aborts_when_source_growing(dirs, monkeypatch):
+    """remux 期间 A 原件仍在写（下载器恢复补数据）：作废本次清洗——
+    B 半成品删除、A 原件保留、计失败退避。半截状态不被 remux 新 inode
+    锁死（修复盲区：哈希闭环/上传复核对静态 remux 产物失效）。"""
+    a, b = dirs
+    f = a / "dirty.mkv"
+    f.write_bytes(b"raw-bytes")
+    dest = b / "out.mkv"
+
+    async def growing_clean(src, dst, rpt):
+        Path(dst).write_bytes(Path(src).read_bytes() + b"-cleaned")
+        with open(src, "ab") as fh:  # remux 期间下载器继续写 A
+            fh.write(b"-more-data")
+    _patch_cleaner(monkeypatch, report=CleanReport(junk_tags=["title=ad"]),
+                   clean_impl=growing_clean)
+    svc = _mk_service(a, b, pipeline_rename_dry_run=False,
+                      pipeline_clean_enabled=True, pipeline_clean_dry_run=False)
+    report = PipelineReport()
+    assert not asyncio.run(svc._maybe_clean(f, dest, report))
+    assert f.exists()                        # 原件保留待重试
+    assert not dest.exists()                 # B 半成品已删
+    assert report.failed == 1 and report.cleaned_count == 0
+    assert svc._failures.get(f"rename:{f}")["failures"] == 1
+
+
+def test_clean_gate_stable_source_cleans_normally(dirs, monkeypatch):
+    """remux 期间 A 原件尺寸稳定（正常下载完成场景）：照常清洗删源。"""
+    a, b = dirs
+    f = a / "dirty.mkv"
+    f.write_bytes(b"raw-bytes")
+    dest = b / "out.mkv"
+
+    async def stable_clean(src, dst, rpt):
+        Path(dst).write_bytes(Path(src).read_bytes() + b"-cleaned")
+    _patch_cleaner(monkeypatch, report=CleanReport(junk_tags=["title=ad"]),
+                   clean_impl=stable_clean)
+    svc = _mk_service(a, b, pipeline_rename_dry_run=False,
+                      pipeline_clean_enabled=True, pipeline_clean_dry_run=False)
+    report = PipelineReport()
+    assert asyncio.run(svc._maybe_clean(f, dest, report))
+    assert dest.read_bytes() == b"raw-bytes-cleaned"
+    assert not f.exists()
+    assert report.cleaned_count == 1
+
+
 def test_clean_gate_clean_failure_backoff(dirs, monkeypatch):
     """清洗失败：原件保留 A、无半成品、计失败退避。"""
     a, b = dirs

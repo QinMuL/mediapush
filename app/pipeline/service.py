@@ -535,6 +535,17 @@ class PipelineService(PollingService):
             logger.info("[DRY-RUN] 元数据清洗 %s", line)
             fast_move(f, dest)
             return True
+        # remux 前后双 stat A 原件：半截文件 remux 会生成全新 inode 锁死
+        # 残缺状态（下载器恢复后写的是被删的幽灵 inode），且 B 侧闸门
+        # （哈希闭环/上传复核）对静态 remux 产物失效——尺寸变了说明下载
+        # 器仍在写，作废本次清洗退避重试，原件留 A
+        try:
+            size_before = f.stat().st_size
+        except OSError as exc:
+            logger.error("元数据清洗失败 %s：%s（原件保留待重试）", f.name, exc)
+            self._failures.record(f"rename:{f}", time.time())
+            report.failed += 1
+            return False
         try:
             await cleaner.clean(str(f), str(dest), rpt)
         except cleaner.CleanError as exc:
@@ -542,6 +553,19 @@ class PipelineService(PollingService):
             self._failures.record(f"rename:{f}", time.time())
             report.failed += 1
             return False
+        try:
+            if f.stat().st_size != size_before:
+                logger.warning(
+                    "清洗期间 A 原件仍在写入（%d → %d），作废本次清洗"
+                    "（B 半成品已删，原件保留待重试）：%s",
+                    size_before, f.stat().st_size, f.name,
+                )
+                _remove_file(dest)
+                self._failures.record(f"rename:{f}", time.time())
+                report.failed += 1
+                return False
+        except OSError:
+            pass  # 原件不可访（极端）：B 已有校验过的清洗产物，按成功走
         report.cleaned_lines.append(line)
         report.cleaned_count += 1
         _remove_file(f)  # 清洗成功删 A 原件（B 已是干净版）
