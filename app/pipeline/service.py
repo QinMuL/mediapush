@@ -423,6 +423,18 @@ class PipelineService(PollingService):
                 continue
             if self._stable.get(key, 0) < stable_rounds:
                 continue
+            # mtime 静默年龄守门：下载器（TG 分片/flood wait 等）停顿可骗过
+            # 30s 快照对比，但骗不过"最近 N 分钟内仍有写入"——mtime 随写
+            # 持续更新，写完才静止。rename 走半截文件会中断下载器后续写入
+            # （NAS 实发：E01/E02 半截 1.06/0.93GB 上传 115）。
+            min_age = max(
+                0.0, getattr(self.settings, "pipeline_min_age_minutes", 5.0) * 60
+            )
+            try:
+                if now - f.stat().st_mtime < min_age:
+                    continue
+            except OSError:
+                continue
             # 体积守门：下载失败留下的 0 字节/残缺占位文件（空文件天然"稳定"）
             min_bytes = getattr(self.settings, "pipeline_min_size_mb", 10.0) * 1024 * 1024
             try:
@@ -579,10 +591,21 @@ class PipelineService(PollingService):
                               now: float) -> bool:
         key = str(dest)
         try:
+            # 哈希闭环：前后双 stat——TG 下载器分片停顿可骗过 30s 稳定判定，
+            # 半截文件 rename 进 B 后下载器仍凭句柄继续写 B 路径 inode；
+            # 前后 size 不一致 = 文件仍在写入，哈希作废等 _scan_b 下轮重试
+            size_before = dest.stat().st_size
             root, size = await ed2k_hash_file(dest)
+            size_after = dest.stat().st_size
         except (OSError, ValueError) as exc:
             await self._record_failure("hash", key, dest.name, f"哈希失败: {exc}", report, now)
             return False
+        if size_before != size_after or size != size_after:
+            logger.warning(
+                "哈希期间文件仍在写入（%d→%d→%d），作废本次哈希：%s",
+                size_before, size, size_after, dest.name,
+            )
+            return False  # 不入账、不记退避；_scan_b 快照稳定后自动重哈希
         rec = {
             "path": key,
             "name": dest.name,
@@ -625,6 +648,10 @@ class PipelineService(PollingService):
             if self._b_seen.get(key) != snap:
                 self._b_seen[key] = snap
                 continue  # 首见：下轮快照一致才哈希
+            # 体积守门（与 A 侧同阈值）：0 字节/残缺占位不对账哈希
+            min_bytes = getattr(self.settings, "pipeline_min_size_mb", 10.0) * 1024 * 1024
+            if stat.st_size < min_bytes:
+                continue
             if not self._failures.due(f"hash:{key}", now):
                 continue
             await self._hash_to_ledger(f, report, now)
@@ -702,6 +729,21 @@ class PipelineService(PollingService):
             src = Path(key)
             if not src.is_file():
                 continue  # 已被删（异常路径），下轮对账清理
+            # 上传前复核：哈希后文件仍在增长（稳定判定被下载停顿骗过的
+            # 残余场景）→ 作废账本重新哈希，绝不把半截文件传上 115
+            try:
+                cur_size = src.stat().st_size
+                rec_size = self._ledger[key]["size_bytes"]
+                if cur_size != rec_size:
+                    logger.warning(
+                        "上传前复核发现文件已变化（哈希 %d → 当前 %d），"
+                        "作废账本重新哈希：%s",
+                        rec_size, cur_size, src.name,
+                    )
+                    self._ledger.pop(key, None)
+                    continue
+            except OSError:
+                continue
             # 连接 + 登录（幂等；失败只影响上传阶段，不阻塞其他阶段）
             if not await loop.run_in_executor(
                 None, lambda: self._ensure_conn() and self._login()

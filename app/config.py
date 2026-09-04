@@ -146,6 +146,7 @@ class Settings:
     pipeline_stable_rounds: int = 3          # A 侧稳定判定轮数（×周期，唯一一处）
     pipeline_batch_max: int = 5              # 单轮最多重命名的文件数（防打爆 IO/TMDB）
     pipeline_min_size_mb: float = 10.0       # 体积守门（MB）：低于视为下载残缺拦截
+    pipeline_min_age_minutes: float = 5.0    # mtime 静默年龄（分）：下载器停顿防误判
     pipeline_stuck_days: float = 7.0         # 各阶段失败卡死告警阈值（天）
     pipeline_report_admin: bool = True       # 有动作的轮次把汇总+明细发给 TG_ADMIN_IDS
     pipeline_clean_enabled: bool = False     # 元数据清洗（L1 保守档，app/media/cleaner.py）
@@ -259,6 +260,9 @@ class Settings:
             pipeline_stable_rounds=max(1, _env_int("PIPELINE_STABLE_ROUNDS", 3)),
             pipeline_batch_max=max(1, _env_int("PIPELINE_BATCH_MAX", 5)),
             pipeline_min_size_mb=max(0.0, _env_float("PIPELINE_MIN_SIZE_MB", 10.0)),
+            pipeline_min_age_minutes=max(
+                0.0, _env_float("PIPELINE_MIN_AGE_MINUTES", 5.0)
+            ),
             pipeline_stuck_days=max(1.0, _env_float("PIPELINE_STUCK_DAYS", 7.0)),
             pipeline_report_admin=_env_bool_alias(
                 "PIPELINE_REPORT_ADMIN", "CD2_REPORT_ADMIN", True
@@ -376,6 +380,7 @@ HOT_RELOAD_FIELDS: frozenset[str] = frozenset({
     "pipeline_stable_rounds",
     "pipeline_stuck_days",
     "pipeline_min_size_mb",
+    "pipeline_min_age_minutes",
     "pipeline_batch_max",
     "pipeline_report_admin",
     "pipeline_clean_enabled",

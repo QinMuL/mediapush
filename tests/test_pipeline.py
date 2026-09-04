@@ -34,6 +34,7 @@ class _FakeSettings:
     pipeline_stable_rounds = 2
     pipeline_batch_max = 5
     pipeline_min_size_mb = 0.0
+    pipeline_min_age_minutes = 0.0  # 测试文件 mtime 太新，关闭年龄守门
     pipeline_stuck_days = 7.0
     pipeline_rename_dry_run = True
     pipeline_push_dry_run = True
@@ -245,6 +246,92 @@ def test_rename_dry_flip_processes_immediately(dirs, monkeypatch):
     assert r3.renamed == 1 and r3.hashed == 1
     assert (b / "狂怒追缉.2026.S01E04.第04集.2160p.WEB-DL.H.265.mkv").is_file()
     assert not video.exists()
+
+
+def test_rename_min_age_gate_blocks_fresh_mtime(dirs, monkeypatch):
+    """mtime 静默年龄守门：稳定轮数够了但最近仍有写入 → 不动（NAS 实发
+    E01/E02 半截上传 115 的根因修复）。"""
+    a, b = dirs
+    video = a / "Furious.S01E04.2026.2160p.mkv"
+    video.write_bytes(b"0" * 64)
+    svc = _mk_service(a, b, pipeline_rename_dry_run=False,
+                      pipeline_min_age_minutes=5)
+    _patch_high_conf(monkeypatch)
+
+    asyncio.run(svc.run_once())
+    r2 = asyncio.run(svc.run_once())  # 2 轮稳定达成，但 mtime 太新
+    assert r2.renamed == 0
+    assert video.exists()
+
+    # 模拟下载完成：mtime 静止 5 分钟前 → 快照重置后再稳定 2 轮即放行
+    import os as _os
+    old = time.time() - 301
+    _os.utime(video, (old, old))
+    asyncio.run(svc.run_once())       # mtime 变化重置稳定计数
+    r4 = asyncio.run(svc.run_once())  # 稳定 + 年龄双达标
+    assert r4.renamed == 1
+    assert (b / "狂怒追缉.2026.S01E04.第04集.2160p.WEB-DL.H.265.mkv").is_file()
+
+
+def test_hash_aborted_when_file_growing(dirs, monkeypatch):
+    """哈希闭环：哈希期间文件仍被写（size 前后不一致）→ 不入账等下轮重哈希。"""
+    a, b = dirs
+    video = a / "Furious.S01E04.2026.2160p.mkv"
+    video.write_bytes(b"0" * 640_000)
+    svc = _mk_service(a, b, pipeline_rename_dry_run=False)
+    _patch_high_conf(monkeypatch)
+    asyncio.run(svc.run_once())
+
+    dest = b / "狂怒追缉.2026.S01E04.第04集.2160p.WEB-DL.H.265.mkv"
+
+    async def growing_hash(path, chunk_size=1):
+        # 模拟哈希期间下载器继续写：读一半时文件追加
+        with open(path, "ab") as fh:
+            fh.write(b"x" * 4096)
+        return b"\x11" * 16, 640_000
+    monkeypatch.setattr(pipeline_mod, "ed2k_hash_file", growing_hash)
+
+    r2 = asyncio.run(svc.run_once())
+    assert r2.renamed == 1 and r2.hashed == 0       # 移动成功但哈希作废
+    assert str(dest) not in svc._ledger             # 未入账
+    assert str(dest) not in svc._pushed             # 自然也不会推半截 ed2k
+
+
+def test_upload_submit_rehash_when_size_changed(dirs, monkeypatch):
+    """上传前复核：账本 size 与当前文件不一致（哈希后仍在写）→ 作废账本
+    重新哈希，不提交上传。"""
+    a, b = dirs
+    video = a / "Furious.S01E04.2026.2160p.mkv"
+    video.write_bytes(b"0" * 640_000)
+    svc = _mk_service(a, b, pipeline_rename_dry_run=False,
+                      pipeline_push_dry_run=True,
+                      pipeline_upload_dry_run=True)  # 先 dry 挡住真实提交
+    _patch_high_conf(monkeypatch)
+    asyncio.run(svc.run_once())
+    asyncio.run(svc.run_once())  # rename + hash（640_000 字节入账）
+
+    dest = b / "狂怒追缉.2026.S01E04.第04集.2160p.WEB-DL.H.265.mkv"
+    with open(dest, "ab") as fh:  # 模拟哈希后下载器补完剩余部分
+        fh.write(b"y" * 100_000)
+
+    svc.settings.pipeline_upload_dry_run = False
+    r3 = asyncio.run(svc.run_once())
+    assert r3.submitted == 0 and svc.submitted == []   # 未提交
+    assert str(dest) not in svc._ledger                # 账本作废
+
+
+def test_scan_b_min_size_gate_skips_tiny(dirs, monkeypatch):
+    """B 侧对账守门：0 字节/残缺文件不走对账哈希（浮生之白蛇前缘 0 字节
+    账本记录的产生路径封堵）。"""
+    a, b = dirs
+    tiny = b / "tiny.mkv"
+    tiny.write_bytes(b"0")  # 1 字节，稳定不变
+    svc = _mk_service(a, b)  # min_size_mb=0 in fake → 用真实阈值覆盖
+    svc.settings.pipeline_min_size_mb = 10.0
+
+    asyncio.run(svc.run_once())
+    asyncio.run(svc.run_once())  # 2 轮快照稳定，但体积不过门
+    assert str(tiny) not in svc._ledger
 
 
 def test_rename_subtitle_companion_and_empty_dir_cleanup(dirs, monkeypatch):

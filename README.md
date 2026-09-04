@@ -395,6 +395,7 @@ Bot 回复卡片预览 + 按钮：`✏️ 追加画质`（输入自定义推荐�
 | `PIPELINE_BATCH_MAX` | `5` | 单轮最多重命名文件数（防打爆 IO/TMDB） |
 | `PIPELINE_STUCK_DAYS` | `7` | 各阶段失败卡死告警阈值天 |
 | `PIPELINE_MIN_SIZE_MB` | `10` | 体积守门（MB）；设 0 关闭 |
+| `PIPELINE_MIN_AGE_MINUTES` | `5` | mtime 静默年龄守门（分）：最近有写入不动，防下载器停顿骗过快照稳定判定 |
 | `PIPELINE_REPORT_ADMIN` | `true` | 有动作轮次汇总+明细私信 admin（旧键 `CD2_REPORT_ADMIN` 兼容） |
 | `PIPELINE_CLEAN_ENABLED` | `false` | 元数据清洗（L1 保守档：广告标签/垃圾章节/广告轨，remux 零重编码） |
 | `PIPELINE_CLEAN_DRY_RUN` | `true` | 清洗模拟：只检测报告不动文件（轮汇总"🧹 检测到垃圾"组） |
