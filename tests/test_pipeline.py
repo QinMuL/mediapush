@@ -334,6 +334,61 @@ def test_scan_b_min_size_gate_skips_tiny(dirs, monkeypatch):
     assert str(tiny) not in svc._ledger
 
 
+def test_hash_refeed_ejects_stale_done_records(dirs):
+    """重投喂自愈核心：同路径重新哈希 → 逐出旧 pushed/completed/退避记录。"""
+    a, b = dirs
+    dest = b / "out.mkv"
+    dest.write_bytes(b"0" * 640_000)
+    svc = _mk_service(a, b)
+    key = str(dest)
+    # 模拟此前一轮已完成推送+上传（state.db 里的旧路径记录）
+    svc._pushed.add(key)
+    svc._completed.add(key)
+    svc._failures.record(f"push:{key}", time.time())
+    svc._failures.record(f"upload:{key}", time.time())
+
+    report = PipelineReport()
+    assert asyncio.run(svc._hash_to_ledger(dest, report, time.time()))
+    assert key not in svc._pushed and key not in svc._completed
+    assert svc._failures.get(f"push:{key}") is None     # 退避一并清除
+    assert svc._failures.get(f"upload:{key}") is None
+    assert key in svc._ledger and report.hashed == 1
+
+
+def test_refeed_same_path_reruns_full_chain(dirs, monkeypatch):
+    """重投喂端到端（NAS 实发回归）：完整版替换半截版同路径落 B →
+    逐出旧记录 → 新 ed2k 重推卡片 + 重新提交上传。"""
+    a, b = dirs
+    dest = b / "狂怒追缉.2026.S01E04.第04集.2160p.WEB-DL.H.265.mkv"
+    proc = _FakeProcessor()
+    svc = _mk_service(a, b, processor=proc,
+                      pipeline_rename_dry_run=False,
+                      pipeline_push_dry_run=False,
+                      pipeline_upload_dry_run=False)
+    _patch_high_conf(monkeypatch)
+
+    # 首轮（坏文件）：全链完成 → 推过 + 传完 + B 源删
+    video = a / "Furious.S01E04.2026.2160p.mkv"
+    video.write_bytes(b"0" * 640_000)
+    asyncio.run(svc.run_once())
+    asyncio.run(svc.run_once())   # rename+hash+push+submit
+    svc.tasks_result = [_FakeCd2Task(status=3, sourcePath=str(dest),
+                                     destPath=svc.cd2_dst)]
+    r = asyncio.run(svc.run_once())   # 上传完成 → 删源
+    assert r.completed == 1 and not dest.exists()
+    assert str(dest) in svc._pushed and str(dest) in svc._completed
+    assert len(proc.calls) == 1
+
+    # 重投喂完整版（同路径）
+    video.write_bytes(b"0" * 740_000)
+    asyncio.run(svc.run_once())       # 快照重置
+    r2 = asyncio.run(svc.run_once())  # rename+hash(逐出)+push+submit
+    assert r2.renamed == 1 and r2.hashed == 1
+    assert r2.pushed == 1             # 新 ed2k 重推卡片（未卡在旧 pushed）
+    assert r2.submitted == 1          # 重新提交上传（未卡在旧 completed）
+    assert len(proc.calls) == 2
+
+
 def test_rename_subtitle_companion_and_empty_dir_cleanup(dirs, monkeypatch):
     """实际移动：字幕伴行 + A 内空目录清理。"""
     a, b = dirs

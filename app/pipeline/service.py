@@ -630,6 +630,16 @@ class PipelineService(PollingService):
                 size_before, size, size_after, dest.name,
             )
             return False  # 不入账、不记退避；_scan_b 快照稳定后自动重哈希
+        # 重投喂自愈：同路径重新哈希 = 新版本文件落位（完整版替换半截版等）。
+        # 旧 pushed/completed 按路径标记已成，会让推送/上传对该路径永久跳过
+        # （NAS 实发：重投喂的 E01/E02 哈希后无后续）→ 逐出旧记录重走全链，
+        # 由下游真去重兜底（processor 按分享码 / 上传按 115 目标同名查重）
+        if key in self._pushed or key in self._completed:
+            self._pushed.discard(key)
+            self._completed.discard(key)
+            self._failures.clear(f"push:{key}")
+            self._failures.clear(f"upload:{key}")
+            logger.info("路径重新哈希，逐出旧推送/上传记录（重投喂）：%s", dest.name)
         rec = {
             "path": key,
             "name": dest.name,
